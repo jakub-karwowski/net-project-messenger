@@ -20,6 +20,9 @@ if [ ! -d "$BUILD_DIR" ]; then
     cmake -B "$BUILD_DIR" -S .
 fi
 
+echo "==> Configuring CMake..."
+cmake -B "$BUILD_DIR" -S .
+
 # Automatically keep clangd's compilation database in sync at project root
 if [ -f "$BUILD_DIR/compile_commands.json" ]; then
     ln -sf "$BUILD_DIR/compile_commands.json" compile_commands.json

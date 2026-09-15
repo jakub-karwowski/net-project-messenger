@@ -9,7 +9,12 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+add_subdirectory(TcpSocket)
+
 add_executable(app main.cpp)
 
 add_executable(test_queue test_queue.cpp)
 target_link_libraries(test_queue PRIVATE Threads::Threads)
+
+add_executable(test_socket test_socket.cpp)
+target_link_libraries(test_socket PRIVATE Threads::Threads TcpSocket)
