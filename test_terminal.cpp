@@ -5,11 +5,12 @@
 
 struct Dummy : public Renderable {
     std::vector<Renderable::DrawCommand> commands;
-    DrawCommand get_command(TerminalSize win) override {
+    DrawCommand get_command() override {
         auto obj = commands.back();
         commands.pop_back();
         return obj;
     }
+    void resize(int, int) override {}
     bool empty() const noexcept override {
         return commands.empty();
     }

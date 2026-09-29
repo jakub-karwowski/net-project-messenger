@@ -1,8 +1,11 @@
 #include "TerminalUI.hpp"
+#include "Utils.hpp"
+#include <cerrno>
 #include <iostream>
 #include <stdexcept>
 #include <memory>
 #include <optional>
+#include <poll.h>
 #include <termios.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -27,7 +30,11 @@ TerminalUI::TerminalUI() : originalTermState(std::make_unique<TerminalUI::TermIm
     }
 
     termios raw_termios{originalTermState->obj};
-    raw_termios.c_lflag &= ~(ICANON | ECHO);
+    // ISIG is cleared as well, so Ctrl+C arrives as the byte 0x03 instead of
+    // raising SIGINT. A SIGINT would terminate the process before ~TerminalUI()
+    // could restore the terminal (leaving it in raw mode); as a byte it flows
+    // through the normal input path and shutdown stays orderly.
+    raw_termios.c_lflag &= ~(ICANON | ECHO | ISIG);
     if (tcsetattr(STDIN_FILENO, TCSANOW, &raw_termios) < 0) {
         throw std::runtime_error("Failed to configure Termios");
     }
@@ -37,15 +44,15 @@ TerminalUI::~TerminalUI() {
     if (originalTermState) {
         tcsetattr(STDIN_FILENO, TCSANOW, &originalTermState->obj);
     }
-    std::cout << ansi::show_cursor << std::flush;
+    std::cout << ansi::clear_screen << ansi::show_cursor << std::flush;
 }
 
-std::optional<Renderable::TerminalSize> TerminalUI::get_terminal_size() const noexcept {
+std::optional<TerminalUI::TerminalSize> TerminalUI::get_terminal_size() const noexcept {
     winsize win;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &win) < 0) {
         return std::nullopt;
     }
-    return Renderable::TerminalSize{win.ws_row, win.ws_col};
+    return TerminalUI::TerminalSize{win.ws_col, win.ws_row};
 }
 
 void TerminalUI::clear() const noexcept {
@@ -55,11 +62,47 @@ void TerminalUI::clear() const noexcept {
         << std::flush;
 }
 
+namespace {
+    // poll(2) that retries on EINTR so a signal does not masquerade as a timeout.
+    int poll_input(int timeout_ms) noexcept {
+        pollfd descriptor{STDIN_FILENO, POLLIN, 0};
+        int result = 0;
+        do {
+            result = ::poll(&descriptor, 1, timeout_ms);
+        } while (result < 0 && errno == EINTR);
+        return result;
+    }
+}
+
+TerminalUI::ReadResult TerminalUI::read_byte(unsigned char& byte, int timeout_ms) const noexcept {
+    const int ready = poll_input(timeout_ms);
+    if (ready == 0) { return ReadResult::Timeout; }
+    if (ready < 0) { return ReadResult::Eof; }
+
+    ssize_t count = 0;
+    do {
+        count = ::read(STDIN_FILENO, &byte, 1);
+    } while (count < 0 && errno == EINTR);
+    return (count == 1) ? ReadResult::Byte : ReadResult::Eof;
+}
+
+std::string TerminalUI::read_utf8_char(unsigned char lead, int timeout_ms) const noexcept {
+    std::string text(1, static_cast<char>(lead));
+    const size_t length = utils::utf8::sequence_length(lead);
+    for (size_t i = 1; i < length; ++i) {
+        unsigned char continuation = 0;
+        if (read_byte(continuation, timeout_ms) != ReadResult::Byte) { break; }
+        text.push_back(static_cast<char>(continuation));
+    }
+    return text;
+}
+
 bool TerminalUI::render(Renderable& renderable) {
     auto win = get_terminal_size();
     if (!win) { return false; }
+    renderable.resize(win->width, win->height);
     while (!renderable.empty()) {
-        auto comm = renderable.get_command(*win);
+        auto comm = renderable.get_command();
         switch (comm.action) {
             case Renderable::DrawCommand::Action::ClearScreen:
                 std::cout 
