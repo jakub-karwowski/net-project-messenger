@@ -34,8 +34,9 @@ struct ConversationStore {
 };
 
 // Selects which update kinds a subscriber receives for one conversation. The
-// flags are combinable: Message_Copy is `Message` with a count, Message_UseDelta
-// is `Message | UseDelta`, and ALL is all three content flags.
+// flags combine: `Message` with a count is a full copy, `Message | UseDelta`
+// streams only what is appended after that copy, and all three content flags
+// together are AllSubscriptions.
 //
 // Notification is the odd one out: a notification subscription receives no message
 // content at all -- every new message is announced with an
@@ -108,6 +109,11 @@ struct EventPeerConnected {
     uint64_t peer_id{};
     uint64_t assigned_peer_id{};
     std::vector<wire::Endpoint> endpoints;
+    // True when the peer re-presented an id we already knew: this is a reconnect,
+    // so the sender re-establishes the write connection fresh instead of reusing the
+    // socket left over from the previous session (inbound + outbound are one logical
+    // connection, and a stale write socket would swallow the next send).
+    bool adopted{false};
 };
 
 // RenderWorker -> StoreWorker -> SenderWorker: dial a peer known only by address.
@@ -125,6 +131,16 @@ struct EventDialPeer {
 // {conversation_id, peer_id} to the render, which then subscribes to it. A failed
 // dial is reported with EventPeerDisconnected instead.
 struct EventPeerDialed {
+    uint64_t conversation_id{};
+    uint64_t peer_id{};
+};
+
+// RenderWorker -> StoreWorker -> SenderWorker: re-dial the peer of an existing
+// conversation, reusing its peer_id instead of minting a new identity. The render
+// fills `conversation_id` (peer_id 0); the store resolves that conversation's peer
+// and forwards it. The sender dials the remembered address, re-presenting the
+// assigned id so the peer adopts the same peer_id and resumes the conversation.
+struct EventReconnectPeer {
     uint64_t conversation_id{};
     uint64_t peer_id{};
 };
@@ -225,6 +241,7 @@ using Event = std::variant<
     EventPeerConnected,
     EventDialPeer,
     EventPeerDialed,
+    EventReconnectPeer,
     EventPeerConnection,
     EventError,
     EventSubscribe,
@@ -234,4 +251,4 @@ using Event = std::variant<
     EventConversationSnapshot,
     EventConversationDelta,
     EventConversationNotification,
-    EventConversationList>; 
+    EventConversationList>;

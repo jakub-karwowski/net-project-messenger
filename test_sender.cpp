@@ -495,6 +495,196 @@ void test_message_after_dial_reuses_connection() {
     worker.join();
 }
 
+// A message for a peer whose connection was closed (as after its unused reader is
+// pruned) reconnects automatically: the stale cached socket is dropped and the
+// message goes out on a fresh dial.
+void test_message_after_disconnect_reconnects() {
+    constexpr unsigned kPort = 9981;
+    constexpr uint64_t kPeerId = 51;
+
+    TcpListener listener("127.0.0.1", kPort, 2);
+    ThreadQueue<Event> store_queue;
+    ThreadQueue<Event> sender_queue;
+    p2p::PeerTable peers;
+    peers.insert(kPeerId, {"127.0.0.1", kPort});
+
+    p2p::SenderWorker sender{store_queue, sender_queue, peers,
+                             LocalEndpoints{{{"127.0.0.1", kPort}}}};
+    std::thread worker{std::ref(sender)};
+
+    check(sender_queue.emplace(EventMessage{kPeerId, kPeerId, "first"}),
+          "reconnect: first message queued");
+    auto first = listener.accept_client();
+    check(first.has_value(), "reconnect: first dial accepted");
+    if (!first) {
+        sender_queue.graceful_shutdown();
+        worker.join();
+        return;
+    }
+    first->with_receive_timeout(std::chrono::milliseconds{50});
+    wire::Decoder first_decoder;
+    check(receive_message(*first, first_decoder, std::chrono::seconds{2}).has_value(),
+          "reconnect: first handshake received");
+    check(receive_message(*first, first_decoder, std::chrono::seconds{2}).has_value(),
+          "reconnect: first message received");
+
+    // The peer goes away (its unused reader was pruned) while the cached socket is
+    // still held: the next send must reconnect rather than reuse it.
+    peers.mark_disconnected(kPeerId);
+    check(sender_queue.emplace(EventMessage{kPeerId, kPeerId, "second"}),
+          "reconnect: second message queued");
+
+    auto leaked = receive_message(*first, first_decoder, std::chrono::milliseconds{300});
+    check(!leaked.has_value(), "reconnect: the stale connection was not reused");
+    if (leaked.has_value()) {
+        sender_queue.graceful_shutdown();
+        worker.join();
+        return;
+    }
+
+    auto second = listener.accept_client();
+    check(second.has_value(), "reconnect: the sender dialled afresh");
+    if (second) {
+        second->with_receive_timeout(std::chrono::milliseconds{50});
+        wire::Decoder second_decoder;
+        check(receive_message(*second, second_decoder, std::chrono::seconds{2}).has_value(),
+              "reconnect: handshake received on the new connection");
+        auto frame = receive_message(*second, second_decoder, std::chrono::seconds{2});
+        const auto* chat = frame ? wire::as_message(*frame) : nullptr;
+        check(chat != nullptr && chat->body == "second",
+              "reconnect: the message was delivered after reconnecting");
+    }
+
+    const auto entry = peers.lookup(kPeerId);
+    check(entry.has_value() && entry->status == p2p::PeerTable::Status::Connected,
+          "reconnect: the peer is marked connected again");
+
+    sender_queue.graceful_shutdown();
+    worker.join();
+}
+
+// A manual reconnect re-dials an existing peer reusing its id: the handshake
+// re-presents the assigned id so the peer can adopt the same peer_id.
+void test_reconnect_peer_reuses_identity() {
+    constexpr unsigned kPort = 9980;
+    constexpr uint64_t kPeerId = 61;
+    constexpr uint64_t kAssignedId = 911;
+
+    TcpListener listener("127.0.0.1", kPort, 1);
+    ThreadQueue<Event> store_queue;
+    ThreadQueue<Event> sender_queue;
+    p2p::PeerTable peers;
+    peers.insert(kPeerId, {"127.0.0.1", kPort});
+    peers.set_assigned_id(kPeerId, kAssignedId);
+
+    p2p::SenderWorker sender{store_queue, sender_queue, peers,
+                             LocalEndpoints{{{"127.0.0.1", kPort}}}};
+    std::thread worker{std::ref(sender)};
+
+    check(sender_queue.emplace(EventReconnectPeer{5, kPeerId}), "recon: request queued");
+
+    auto server = listener.accept_client();
+    check(server.has_value(), "recon: the sender dialled");
+    if (server) {
+        server->with_receive_timeout(std::chrono::milliseconds{50});
+        wire::Decoder decoder;
+        auto hello = receive_message(*server, decoder, std::chrono::seconds{2});
+        const auto* connect = hello ? wire::as_connect(*hello) : nullptr;
+        check(connect != nullptr, "recon: handshake received");
+        if (connect) {
+            check(connect->peer_id == kPeerId,
+                  "recon: the peer id is reused, not re-minted");
+            check(connect->assigned_peer_id == kAssignedId,
+                  "recon: the assigned id is re-presented");
+        }
+    }
+
+    auto report = store_queue.pop();
+    check(report.has_value(), "recon: outcome reported to the store");
+    if (report) {
+        const auto* dialed = std::get_if<EventPeerDialed>(&*report);
+        check(dialed != nullptr, "recon: reported as EventPeerDialed");
+        check(dialed && dialed->peer_id == kPeerId, "recon: the peer id is carried");
+        check(dialed && dialed->conversation_id == 5, "recon: the conversation is carried");
+    }
+
+    sender_queue.graceful_shutdown();
+    worker.join();
+}
+
+// A reconnect (the peer re-presented its assigned id) re-establishes the write
+// connection fresh instead of reusing the socket the previous session left behind:
+// the stale socket is released and a new dial is made. Without this, the next send
+// goes out on the dead socket and surfaces as a spurious "peer disconnected".
+void test_reconnect_reestablishes_connection() {
+    constexpr unsigned kPort = 9973;
+    constexpr uint64_t kPeerId = 81;
+    constexpr uint64_t kAssignedId = 900;
+
+    TcpListener listener("127.0.0.1", kPort, 2);
+    ThreadQueue<Event> store_queue;
+    ThreadQueue<Event> sender_queue;
+    p2p::PeerTable peers;
+    peers.insert(kPeerId, {"127.0.0.1", kPort});
+    peers.set_assigned_id(kPeerId, kAssignedId);
+
+    p2p::SenderWorker sender{store_queue, sender_queue, peers,
+                             LocalEndpoints{{{"127.0.0.1", kPort}}}};
+    std::thread worker{std::ref(sender)};
+
+    // First session: a message opens and caches the write connection.
+    check(sender_queue.emplace(EventMessage{kPeerId, kPeerId, "first"}),
+          "reest: first message queued");
+    auto server1 = listener.accept_client();
+    check(server1.has_value(), "reest: first connection accepted");
+    if (!server1) {
+        sender_queue.graceful_shutdown();
+        worker.join();
+        return;
+    }
+    server1->with_receive_timeout(std::chrono::milliseconds{100});
+    wire::Decoder decoder1;
+    check(receive_message(*server1, decoder1, std::chrono::seconds{2}).has_value(),
+          "reest: first handshake received");
+    check(receive_message(*server1, decoder1, std::chrono::seconds{2}).has_value(),
+          "reest: first message received");
+
+    // The peer reconnects (it re-presented the id we assigned it): re-establish.
+    check(sender_queue.emplace(EventPeerConnected{
+              kPeerId, kAssignedId, {{"127.0.0.1", kPort}}, true}),
+          "reest: reconnect queued");
+    auto server2 = listener.accept_client();
+    check(server2.has_value(), "reest: the sender re-dialled");
+    if (server2) {
+        server2->with_receive_timeout(std::chrono::milliseconds{100});
+        wire::Decoder decoder2;
+        auto hello = receive_message(*server2, decoder2, std::chrono::seconds{2});
+        const auto* ack = hello ? wire::as_connect_ack(*hello) : nullptr;
+        check(ack != nullptr, "reest: the reconnect answers with a ConnectInfoAck");
+        if (ack) {
+            check(ack->peer_id == kPeerId, "reest: the ack names the peer");
+            check(ack->ack_peer_id == kAssignedId, "reest: the ack echoes the assigned id");
+        }
+    }
+
+    // The stale first connection was released, not reused.
+    std::array<std::byte, 64> scratch{};
+    bool released = false;
+    for (int i = 0; i < 100 && !released; ++i) {
+        auto got = server1->receive(std::span<std::byte>{scratch.data(), scratch.size()});
+        if (!got) {
+            if (got.error() == SocketError::WouldBlock) { continue; }
+            released = true;
+            break;
+        }
+        released = (*got == 0);
+    }
+    check(released, "reest: the stale connection is released");
+
+    sender_queue.graceful_shutdown();
+    worker.join();
+}
+
 } // namespace
 
 int main() {
@@ -507,6 +697,9 @@ int main() {
     test_dial_peer_opens_and_reports();
     test_dial_peer_reports_failure();
     test_message_after_dial_reuses_connection();
+    test_message_after_disconnect_reconnects();
+    test_reconnect_peer_reuses_identity();
+    test_reconnect_reestablishes_connection();
 
     std::cout << (g_checks - g_failures) << '/' << g_checks << " checks passed\n";
     return g_failures == 0 ? 0 : 1;

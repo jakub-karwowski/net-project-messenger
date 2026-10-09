@@ -144,6 +144,17 @@ void test_commands_emit_store_events() {
         check(request && request->peer_id == 0, "render: /connect leaves the peer id unset");
     }
 
+    // /reconnect <id> asks the store to re-dial that conversation's existing peer.
+    type(render_queue, "/reconnect 7");
+    auto reconnect = wait_for(store_queue, timeout);
+    check(reconnect.has_value(), "render: /reconnect emitted an event");
+    if (reconnect) {
+        const auto* request = std::get_if<EventReconnectPeer>(&*reconnect);
+        check(request != nullptr, "render: /reconnect emits EventReconnectPeer");
+        check(request && request->conversation_id == 7, "render: /reconnect keeps the id");
+        check(request && request->peer_id == 0, "render: /reconnect leaves the peer id unset");
+    }
+
     // /switch <id> subscribes to the conversation with every flag.
     type(render_queue, "/switch 7");
     auto subscribe = wait_for(store_queue, timeout);

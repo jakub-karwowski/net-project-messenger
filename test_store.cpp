@@ -475,6 +475,27 @@ void test_disconnect_resolves_local_id() {
     }
 }
 
+// A reader-style disconnect ({0, peer_id}) is passed through the store to the
+// sender, so the sender closes its cached write connection for that peer (the
+// reader only knows the peer, not the conversation, so the id is still unresolved
+// when it reaches the sender).
+void test_disconnect_forwarded_to_sender() {
+    Harness harness;
+
+    check(harness.store.emplace(EventPeerDisconnected{0, 123}),
+          "propagate: reader-style disconnect queued");
+
+    auto forward = harness.sender.pop();
+    check(forward.has_value(), "propagate: forwarded to the sender");
+    if (forward) {
+        const auto* gone = std::get_if<EventPeerDisconnected>(&*forward);
+        check(gone != nullptr, "propagate: forwarded event is a disconnect");
+        check(gone && gone->peer_id == 123, "propagate: the peer id is preserved");
+        check(gone && gone->conversation_id == 0,
+              "propagate: the unresolved conversation id is preserved");
+    }
+}
+
 // A peer connection report is passed through to the sender so it can dial back.
 void test_peer_connected_forwarded_to_sender() {
     Harness harness;
@@ -802,6 +823,50 @@ void test_notification_flag_drops_content_flags() {
     }
 }
 
+// A reconnect request reuses the conversation's existing peer id instead of minting
+// a new one, and is forwarded to the sender.
+void test_reconnect_peer_resolves_and_forwards() {
+    Harness harness;
+
+    // Prepare a conversation bound to a peer with a dial request.
+    check(harness.store.emplace(EventDialPeer{"10.0.0.1", 5000, 0}), "recon: dial queued");
+    auto dial_event = harness.sender.pop();
+    const auto* dial = dial_event ? std::get_if<EventDialPeer>(&*dial_event) : nullptr;
+    check(dial != nullptr, "recon: dial forwarded");
+    if (dial == nullptr) { return; }
+
+    check(harness.store.emplace(EventListConversations{}), "recon: list queued");
+    auto list_event = harness.render.pop();
+    const auto* list = list_event ? std::get_if<EventConversationList>(&*list_event) : nullptr;
+    check(list != nullptr && list->conversations.size() == 1, "recon: one conversation");
+    if (list == nullptr || list->conversations.empty()) { return; }
+    const uint64_t conversation_id = list->conversations.front().conversation_id;
+
+    check(harness.store.emplace(EventReconnectPeer{conversation_id, 0}), "recon: request queued");
+    auto forwarded = harness.sender.pop();
+    check(forwarded.has_value(), "recon: forwarded to the sender");
+    if (forwarded) {
+        const auto* recon = std::get_if<EventReconnectPeer>(&*forwarded);
+        check(recon != nullptr, "recon: forwarded event is an EventReconnectPeer");
+        check(recon && recon->peer_id == dial->peer_id, "recon: the peer id is reused");
+        check(recon && recon->conversation_id == conversation_id,
+              "recon: the conversation is preserved");
+    }
+}
+
+// A reconnect for a conversation with no bound peer is reported to the render.
+void test_reconnect_peer_without_peer_reports_error() {
+    Harness harness;
+
+    check(harness.store.emplace(EventReconnectPeer{77, 0}), "recon-miss: request queued");
+    auto reply = harness.render.pop();
+    check(reply.has_value(), "recon-miss: render notified");
+    if (reply) {
+        check(std::get_if<EventError>(&*reply) != nullptr,
+              "recon-miss: reported as EventError");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -817,6 +882,7 @@ int main() {
     test_inbound_allocates_local_id();
     test_reconnect_resumes_conversation();
     test_disconnect_resolves_local_id();
+    test_disconnect_forwarded_to_sender();
     test_peer_connected_forwarded_to_sender();
     test_peer_connected_binds_conversation();
     test_peer_reconnect_reuses_conversation();
@@ -828,6 +894,8 @@ int main() {
     test_peer_dialed_reports_conversation_to_render();
     test_dial_failure_reports_disconnect_to_render();
     test_dial_failure_keeps_non_empty_conversation();
+    test_reconnect_peer_resolves_and_forwards();
+    test_reconnect_peer_without_peer_reports_error();
     test_error_forwarded_to_render();
 
     std::cout << (g_checks - g_failures) << '/' << g_checks << " checks passed\n";

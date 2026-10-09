@@ -6,6 +6,7 @@
 #include "TcpSocket.hpp"
 #include "Wire.hpp"
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <iosfwd>
 #include <memory>
@@ -159,6 +160,10 @@ private:
     bool on_dial_peer(const EventDialPeer& dial);
     // Reports a successful dial to the render, which then subscribes to it.
     bool on_peer_dialed(const EventPeerDialed& dialed);
+    // Re-dials an existing conversation's peer without minting a new identity:
+    // resolves the conversation to its peer id and forwards the request to the
+    // sender (an error to the render when the conversation has no peer).
+    bool on_reconnect_peer(const EventReconnectPeer& reconnect);
     // Surfaces a worker error to the render as a system message.
     bool on_error(const EventError& error);
     // Answers a list request with the current conversations and their peers.
@@ -167,9 +172,9 @@ private:
     ThreadQueue<Event>& render_queue_;
     ThreadQueue<Event>& store_queue_;
     ThreadQueue<Event>& sender_queue_;
-    uint64_t next_conversation_id_{1};                            // next local id to hand out
-    std::unordered_set<uint64_t> pending_dials_;                  // dials awaiting an outcome
-    std::unordered_map<uint64_t, uint64_t> peer_to_conversation_; // peer_id -> local id
+    uint64_t next_conversation_id_{1};                              // next local id to hand out
+    std::unordered_set<uint64_t> pending_dials_;                    // dials awaiting an outcome
+    std::unordered_map<uint64_t, uint64_t> peer_to_conversation_;   // peer_id -> local id
     std::unordered_map<uint64_t, ConversationStore> conversations_; // owned history
     std::unordered_map<uint64_t, Subscription> subscriptions_;      // one per conversation
     Logger logger_;
@@ -230,11 +235,25 @@ struct PeerTable {
     bool mark_disconnected(uint64_t peer_id);
     bool mark_connected(uint64_t peer_id);
 
+    // Registers `connection_id` (a reader) as the owner of `peer_id`'s inbound
+    // connection and marks the peer connected. A later connection from the same
+    // peer -- e.g. a reconnect that reused the peer id -- replaces the owner.
+    bool set_connection(uint64_t peer_id, uint64_t connection_id);
+    // Releases ownership when a reader exits: marks the peer disconnected and
+    // returns true only while `connection_id` is still the owner. A superseded
+    // reader (whose connection a newer one replaced) gets false, so it must not
+    // report the still-live peer as gone.
+    bool release_connection(uint64_t peer_id, uint64_t connection_id);
+
     bool erase(uint64_t peer_id);
 
 private:
     mutable std::mutex mutex_;
     std::unordered_map<uint64_t, Entry> peers_;
+    // Which reader currently owns each peer's inbound connection (peer_id ->
+    // connection_id). Kept apart from `peers_` so ownership is independent of
+    // whether an address is known and so `insert` never disturbs it.
+    std::unordered_map<uint64_t, uint64_t> owners_;
 };
 
 // Builds and runs the whole application on the main thread: it owns the
@@ -242,9 +261,9 @@ private:
 // / listener threads, runs the render loop here, and shuts everything down in
 // order once the render loop returns.
 struct MainWorker {
-    MainWorker(std::string local_address = "127.0.0.1",
-               unsigned port = 9000,
-               std::string log_path = "app.log");
+    MainWorker(std::string local_address,
+               unsigned port,
+               std::string log_path);
     void operator()();
 private:
     std::string local_address_;
@@ -252,16 +271,22 @@ private:
     std::string log_path_;
 };
 
-// Monotonic heartbeat that a reader ticks as it makes progress. The watchdog
-// compares successive snapshots, so a stalled reader (unchanged counter past a
-// deadline) is distinguishable from a healthy one -- unlike a plain bool.
-using ReaderTick = std::atomic<uint64_t>;
+// Heartbeat shared between a reader and the watchdog. `tick` is a monotonic counter
+// the reader bumps as it makes progress: the watchdog compares successive snapshots,
+// so a stalled reader (unchanged counter past a deadline) is distinguishable from a
+// healthy one -- unlike a plain bool. `last_read_ns` is the steady-clock time of the
+// last bytes the reader actually received, so the watchdog can rank readers by
+// idleness and prune the least recently active ones first when over the reader cap.
+struct ReaderActivity {
+    std::atomic<uint64_t> tick{0};
+    std::atomic<int64_t> last_read_ns{0};
+};
 
 struct ReaderWorker {
     ReaderWorker(
         ThreadQueue<Event>& store_queue,
         std::shared_ptr<TcpConnection> connection,
-        std::shared_ptr<ReaderTick> tick,
+        std::shared_ptr<ReaderActivity> activity,
         PeerTable& peers,
         Logger logger = {}
     );
@@ -269,11 +294,14 @@ struct ReaderWorker {
 private:
     ThreadQueue<Event>& store_queue_;
     std::shared_ptr<TcpConnection> connection_; // reader owns the live connection while it reads
-    std::shared_ptr<ReaderTick> tick_;           // reader owns the flag: freed only once the reader is done
+    std::shared_ptr<ReaderActivity> activity_;  // reader owns the heartbeat while it reads
     PeerTable& peers_;
     Logger logger_;
     wire::Decoder decoder_;
     uint64_t peer_id_{0}; // our name for the peer: minted on handshake, or the id it re-presents
+    // Unique owner id of this reader's inbound connection. A reader that a newer
+    // connection superseded must not report the (still live) peer as gone on exit.
+    uint64_t connection_id_{next_local_peer_id()};
 
     // Keeps the name the peer uses for us, so the next ConnectInfo we send it
     // re-presents that name and it recognises us after a reconnect.
@@ -282,19 +310,27 @@ private:
 
 struct WatchdogWorker {
     WatchdogWorker() = default;
-    void register_reader(const std::shared_ptr<ReaderTick>& tick,
+    // Shares the listener's prune-request counter with the watchdog: the listener
+    // increments it when it spawns a reader past the cap, and the watchdog drains it
+    // and shuts down that many least-recently-active readers. A watchdog that was
+    // never configured holds no counter and never prunes.
+    void configure(std::atomic<std::size_t>& prune_requests, Logger logger = {}) noexcept;
+    void register_reader(const std::shared_ptr<ReaderActivity>& activity,
                          const std::shared_ptr<TcpConnection>& connection);
     void stop() noexcept;
-    void operator()(); //scans registrations, reaps finished readers, stops stalled ones
+    void operator()(); // scans registrations, reaps finished readers, prunes stalled and idle ones
 private:
     struct Entry {
-        std::weak_ptr<ReaderTick> tick;          // never owns: the reader controls the flag's lifetime
-        std::weak_ptr<TcpConnection> connection; // used to shut down a stalled reader
+        std::weak_ptr<ReaderActivity> activity;  // never owns: the reader controls the heartbeat's lifetime
+        std::weak_ptr<TcpConnection> connection; // used to shut down a stalled or pruned reader
         uint64_t last_seen = 0;
         unsigned stalled_scans = 0;              // scans since the tick last changed
+        int64_t last_read_ns = 0;                // snapshot at scan time: the sort key (stable, lock-free)
     };
     std::mutex mutex_;
     std::vector<Entry> watch_;
+    std::atomic<std::size_t>* prune_requests_{nullptr}; // listener-owned; null means never prune
+    Logger logger_;
     std::atomic<bool> running_{true};
 };
 
@@ -304,12 +340,13 @@ struct ListenerWorker {
         unsigned port,
         ThreadQueue<Event>& store_queue,
         PeerTable& peers,
+        std::size_t max_readers,
         int backlog = 16,
         Logger logger = {}
     );
     ~ListenerWorker();
     void stop() noexcept; // unblocks accept(), stops the watchdog
-    void operator()();    //internally spawns watchdog
+    void operator()();    // spawns the watchdog internally
 private:
     struct ReaderHandle {
         std::thread thread;
@@ -320,6 +357,7 @@ private:
 
     std::string local_address_;
     unsigned port_;
+    std::size_t max_readers_; // hard cap on concurrently running readers (>= 1)
     int backlog_;
     ThreadQueue<Event>& store_queue_;
     PeerTable& peers_;
@@ -327,6 +365,7 @@ private:
     std::thread watchdog_thread_;
     std::mutex readers_mutex_;
     std::vector<ReaderHandle> readers_;
+    std::atomic<std::size_t> n_prune_{0}; // readers the watchdog should drop to get back under the cap
     Logger logger_;
     std::atomic<bool> running_{true};
 };
@@ -358,13 +397,24 @@ private:
     // Answers a peer's ConnectInfo: dials its advertised `endpoints` unless a
     // write connection already exists, and replies with a ConnectInfoAck carrying
     // this node's name for the peer (`peer_id`) and the peer's name for this node
-    // (`assigned_peer_id`).
+    // (`assigned_peer_id`). `reestablish` forces a fresh dial (dropping whatever
+    // socket the previous session left), used when the peer is a reconnect: reusing
+    // a stale socket would swallow the next send and look like a disconnect.
     void establish_ack(uint64_t peer_id,
                        uint64_t assigned_peer_id,
-                       const std::vector<wire::Endpoint>& endpoints);
+                       const std::vector<wire::Endpoint>& endpoints,
+                       bool reestablish);
     // Reports an unreachable peer: flips it to Disconnected (if known) and tells
     // the store worker the conversation's peer went away.
     void report_unreachable(uint64_t conversation_id, uint64_t peer_id);
+    // Closes and forgets the cached write connection for `peer_id`. Returns false
+    // when none was held. Used when a peer goes away and, before a send, to force a
+    // fresh dial for a peer whose connection was closed.
+    bool drop_connection(uint64_t peer_id);
+    // Re-dials an existing peer (identity reused, no new id minted): drops any
+    // cached socket, dials the remembered address re-presenting the assigned id,
+    // and reports the outcome to the store (EventPeerDialed / EventPeerDisconnected).
+    void reconnect_peer(const EventReconnectPeer& reconnect);
 
     ThreadQueue<Event>& store_queue_;
     ThreadQueue<Event>& sender_queue_;

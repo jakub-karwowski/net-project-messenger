@@ -7,10 +7,12 @@
 // down, and the worker returns.
 //
 // One TCP connection is one conversation. ListenerWorker accepts peers and spawns
-// a WatchdogWorker plus one ReaderWorker per connection. Each reader owns its
-// TcpConnection and a monotonic ReaderTick; the watchdog holds weak references to
-// both, reaps readers whose tick expired (thread finished) and shuts down the
-// socket of a reader whose tick stopped advancing (thread wedged).
+// a WatchdogWorker plus one ReaderWorker per connection, capped at the listener's
+// max_readers. Each reader owns its TcpConnection and a shared ReaderActivity; the
+// watchdog holds weak references to both, reaps a reader that has finished (its
+// heartbeat is gone) and shuts down the socket of a reader whose tick stopped
+// advancing (thread wedged). When the listener spawns past its cap it raises a
+// prune request, and the watchdog drops the least-recently-read readers to make room.
 
 #include "ThreadWorkers.hpp"
 
@@ -158,6 +160,18 @@ namespace {
     constexpr auto kReaderTickPeriod = std::chrono::milliseconds{200};
 
     constexpr std::size_t kReadChunk = 4096;
+
+    // The application's hard cap on concurrently running reader threads (the
+    // ListenerWorker receives it as a constructor argument).
+    constexpr std::size_t kMaxReaderThreads = 8;
+
+    // Monotonic nanoseconds on the steady clock, used to stamp and rank a reader's
+    // last real read (see ReaderActivity).
+    int64_t steady_now_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
 }
 
 namespace p2p {
@@ -207,6 +221,31 @@ bool PeerTable::mark_connected(uint64_t peer_id) {
     return true;
 }
 
+bool PeerTable::set_connection(uint64_t peer_id, uint64_t connection_id) {
+    if (peer_id == 0 || connection_id == 0) { return false; }
+    std::lock_guard lock(mutex_);
+    // A newer connection for the same peer takes over ownership; whoever held it
+    // before is superseded and must not report the peer gone when it exits.
+    owners_[peer_id] = connection_id;
+    if (const auto it = peers_.find(peer_id); it != peers_.end()) {
+        it->second.status = Status::Connected;
+    }
+    return true;
+}
+
+bool PeerTable::release_connection(uint64_t peer_id, uint64_t connection_id) {
+    std::lock_guard lock(mutex_);
+    const auto it = owners_.find(peer_id);
+    if (it == owners_.end() || it->second != connection_id) {
+        return false; // superseded by a newer connection (or never owned it)
+    }
+    owners_.erase(it);
+    if (const auto peer = peers_.find(peer_id); peer != peers_.end()) {
+        peer->second.status = Status::Disconnected;
+    }
+    return true;
+}
+
 bool PeerTable::erase(uint64_t peer_id) {
     std::lock_guard lock(mutex_);
     return peers_.erase(peer_id) > 0;
@@ -217,12 +256,12 @@ bool PeerTable::erase(uint64_t peer_id) {
 ReaderWorker::ReaderWorker(
     ThreadQueue<Event>& store_queue,
     std::shared_ptr<TcpConnection> connection,
-    std::shared_ptr<ReaderTick> tick,
+    std::shared_ptr<ReaderActivity> activity,
     PeerTable& peers,
     Logger logger)
     : store_queue_(store_queue),
       connection_(std::move(connection)),
-      tick_(std::move(tick)),
+      activity_(std::move(activity)),
       peers_(peers),
       logger_(std::move(logger)) {}
 
@@ -247,7 +286,7 @@ void ReaderWorker::operator()() {
     while (!stop) {
         // Heartbeat first: an idle-but-healthy reader still proves liveness each
         // iteration, so only a genuinely wedged thread stops ticking.
-        tick_->fetch_add(1, std::memory_order_relaxed);
+        activity_->tick.fetch_add(1, std::memory_order_relaxed);
 
         auto received = connection_->receive(std::span<std::byte>{scratch.data(), scratch.size()});
         if (!received) {
@@ -257,6 +296,9 @@ void ReaderWorker::operator()() {
             break; // EOF, reset, or the watchdog shut the connection down
         }
         if (*received == 0) { continue; }
+
+        // A real read: stamp the reader so the watchdog ranks it above idle ones.
+        activity_->last_read_ns.store(steady_now_ns(), std::memory_order_relaxed);
 
         decoder_.feed(std::span<const std::byte>{scratch.data(), *received});
 
@@ -278,7 +320,8 @@ void ReaderWorker::operator()() {
                 // way, remember its endpoints and ask the sender to open our own
                 // write channel and acknowledge (echoing the peer's name for us).
                 const uint64_t returning = connect->assigned_peer_id;
-                if (returning != 0 && peers_.lookup(returning)) {
+                const bool adopted = returning != 0 && peers_.lookup(returning).has_value();
+                if (adopted) {
                     peer_id_ = returning;
                     logger_.info("peer returned as #" + std::to_string(peer_id_));
                 } else {
@@ -289,9 +332,10 @@ void ReaderWorker::operator()() {
                 for (const wire::Endpoint& endpoint : connect->endpoints) {
                     peers_.insert(peer_id_, PeerTable::Address{endpoint.address, endpoint.port});
                 }
+                peers_.set_connection(peer_id_, connection_id_);
                 remember_assigned_id(peer_id_, connect->peer_id);
                 if (!store_queue_.emplace(EventPeerConnected{
-                        peer_id_, connect->peer_id, connect->endpoints})) {
+                        peer_id_, connect->peer_id, connect->endpoints, adopted})) {
                     stop = true; // consumer gone: nothing left to deliver to
                     break;
                 }
@@ -301,6 +345,7 @@ void ReaderWorker::operator()() {
                 // `peer_id` is the name it gave us, kept to re-present later.
                 peer_id_ = ack->ack_peer_id;
                 logger_.info("handshake complete: peer#" + std::to_string(peer_id_));
+                peers_.set_connection(peer_id_, connection_id_);
                 remember_assigned_id(peer_id_, ack->peer_id);
             } else if (const auto* chat = wire::as_message(message)) {
                 // The conversation is local to this node, so the wire's
@@ -319,25 +364,32 @@ void ReaderWorker::operator()() {
         }
     }
 
-    if (peer_id_ != 0) {
+    if (peer_id_ != 0 && peers_.release_connection(peer_id_, connection_id_)) {
         // Keep the peer in the table so its address stays usable for a later
         // reconnect; only the status records that it is gone. The store worker
         // resolves the local conversation and routes the error to its subscriber.
+        // A superseded reader (a newer connection adopted the same peer id) stays
+        // silent: the peer is still live on that newer connection.
         logger_.info("peer#" + std::to_string(peer_id_) + " disconnected");
-        peers_.mark_disconnected(peer_id_);
         (void)store_queue_.emplace(EventPeerDisconnected{0, peer_id_});
     }
 }
 
 // --- WatchdogWorker ---------------------------------------------------------
 
-void WatchdogWorker::register_reader(const std::shared_ptr<ReaderTick>& tick,
+void WatchdogWorker::configure(std::atomic<std::size_t>& prune_requests, Logger logger) noexcept {
+    std::lock_guard lock(mutex_);
+    prune_requests_ = &prune_requests;
+    logger_ = std::move(logger);
+}
+
+void WatchdogWorker::register_reader(const std::shared_ptr<ReaderActivity>& activity,
                                      const std::shared_ptr<TcpConnection>& connection) {
     std::lock_guard lock(mutex_);
     Entry entry;
-    entry.tick = tick;
+    entry.activity = activity;
     entry.connection = connection;
-    entry.last_seen = tick->load(std::memory_order_relaxed);
+    entry.last_seen = activity->tick.load(std::memory_order_relaxed);
     watch_.push_back(std::move(entry));
 }
 
@@ -346,28 +398,66 @@ void WatchdogWorker::stop() noexcept {
 }
 
 void WatchdogWorker::operator()() {
+    // Shuts a watched connection down and forgets it in the same step: a reader on
+    // its way out is no longer monitored, so a later pass can never pick it again.
+    const auto shutdown = [](const std::weak_ptr<TcpConnection>& connection) {
+        if (auto live = connection.lock()) {
+            std::ignore = live->shutdown(TcpConnection::Shutdown::Both);
+        }
+    };
+
     while (running_.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(kWatchdogScan);
 
         std::lock_guard lock(mutex_);
-        for (Entry& entry : watch_) {
-            auto tick = entry.tick.lock();
-            if (!tick) { continue; } // reader gone; reaped below
 
-            const uint64_t now = tick->load(std::memory_order_relaxed);
+        // Stall pass: drop readers whose heartbeat has not advanced for a full
+        // window, and cache each survivor's last read so the prune pass can rank it
+        // without touching the weak_ptrs again. erase_if applies the predicate
+        // exactly once per element, so each stalled shutdown is counted once. A reader
+        // that already exited frees a slot too, so both are subtracted from the
+        // listener's prune request below.
+        std::size_t n_stalled = 0;
+        std::size_t n_gone = 0;
+        std::erase_if(watch_, [&](Entry& entry) {
+            auto activity = entry.activity.lock();
+            if (!activity) { ++n_gone; return true; } // reader gone: its slot is free
+            entry.last_read_ns = activity->last_read_ns.load(std::memory_order_relaxed);
+            const uint64_t now = activity->tick.load(std::memory_order_relaxed);
             if (now != entry.last_seen) {
                 entry.last_seen = now;
                 entry.stalled_scans = 0;
-                continue;
+                return false;
             }
-
-            if (++entry.stalled_scans < kStallScanLimit) { continue; }
+            if (++entry.stalled_scans < kStallScanLimit) { return false; }
             entry.stalled_scans = 0;
-            if (auto connection = entry.connection.lock()) {
-                std::ignore = connection->shutdown(TcpConnection::Shutdown::Both);
+            shutdown(entry.connection);
+            ++n_stalled;
+            logger_.warn("watchdog: stalled reader shut down");
+            return true;
+        });
+
+        // Prune pass: the listener asks for `n` readers to go when it spawns past its
+        // cap. Stalls already freed `n_stalled` of them, so only the remainder is
+        // taken. Sorting the watch list in place (its cached timestamps are a stable
+        // key, so the comparator never locks and the order cannot shift mid-sort)
+        // puts the newest reads first and the oldest at the tail.
+        const std::size_t requested = prune_requests_ != nullptr
+            ? prune_requests_->exchange(0, std::memory_order_relaxed)
+            : 0;
+        const std::size_t freed = n_stalled + n_gone;
+        const std::size_t need = requested > freed ? requested - freed : 0;
+        if (need != 0) {
+            std::sort(watch_.begin(), watch_.end(), [](const Entry& a, const Entry& b) {
+                return a.last_read_ns > b.last_read_ns; // most recent first
+            });
+            const std::size_t count = std::min(need, watch_.size());
+            for (std::size_t index = watch_.size() - count; index < watch_.size(); ++index) {
+                shutdown(watch_[index].connection);
+                logger_.info("watchdog: pruned idle reader");
             }
+            watch_.resize(watch_.size() - count); // drop the oldest (tail)
         }
-        std::erase_if(watch_, [](const Entry& entry) { return entry.tick.expired(); });
     }
 }
 
@@ -378,14 +468,18 @@ ListenerWorker::ListenerWorker(
     unsigned port,
     ThreadQueue<Event>& store_queue,
     PeerTable& peers,
+    std::size_t max_readers,
     int backlog,
     Logger logger)
     : local_address_(std::move(local_address)),
       port_(port),
+      max_readers_(max_readers == 0 ? 1 : max_readers),
       backlog_(backlog),
       store_queue_(store_queue),
       peers_(peers),
-      logger_(std::move(logger)) {}
+      logger_(std::move(logger)) {
+    watchdog_.configure(n_prune_, logger_);
+}
 
 ListenerWorker::~ListenerWorker() {
     stop();
@@ -453,11 +547,14 @@ void ListenerWorker::operator()() {
                 .with_tcp_nodelay(true);
 
         auto connection = std::make_shared<TcpConnection>(std::move(*accepted));
-        auto tick = std::make_shared<ReaderTick>(0);
-        watchdog_.register_reader(tick, connection);
+        auto activity = std::make_shared<ReaderActivity>();
+        // A connection that never reads still needs an ordering floor, so start its
+        // stamp at accept time instead of 0.
+        activity->last_read_ns.store(steady_now_ns(), std::memory_order_relaxed);
+        watchdog_.register_reader(activity, connection);
 
         auto done = std::make_shared<std::atomic<bool>>(false);
-        ReaderWorker reader{store_queue_, connection, std::move(tick), peers_};
+        ReaderWorker reader{store_queue_, connection, std::move(activity), peers_};
         ReaderHandle handle{
             std::thread{[reader = std::move(reader), done]() mutable {
                 reader();
@@ -466,11 +563,27 @@ void ListenerWorker::operator()() {
             connection,
             done};
 
+        // Reap finished readers before counting: a reader that already exited (e.g.
+        // one dropped by a disconnect, with no accept since) has freed its slot, so
+        // its stale handle must not inflate the count and make the watchdog prune a
+        // live reader -- which tears the fresh connection straight back down.
+        reap_finished_readers();
         {
             std::lock_guard lock(readers_mutex_);
             readers_.push_back(std::move(handle));
+            // Count only live readers for the same reason: a handle whose reader has
+            // already finished does not occupy the cap even if it is not reaped yet.
+            std::size_t live = 0;
+            for (const ReaderHandle& existing : readers_) {
+                if (!existing.done->load(std::memory_order_acquire)) { ++live; }
+            }
+            // Past the cap: ask the watchdog to drop enough idle readers to make room
+            // for this one. It prunes asynchronously, so the thread count may overshoot
+            // by the arrivals within one scan window.
+            if (live > max_readers_) {
+                n_prune_.fetch_add(live - max_readers_, std::memory_order_relaxed);
+            }
         }
-        reap_finished_readers();
     }
 
     watchdog_.stop();
@@ -562,11 +675,16 @@ TcpConnection* SenderWorker::open(uint64_t peer_id,
 
 void SenderWorker::establish_ack(uint64_t peer_id,
                                  uint64_t assigned_peer_id,
-                                 const std::vector<wire::Endpoint>& endpoints) {
-    // A peer dialled us and named us: open our own write channel to it (unless we
-    // already hold one) and answer the handshake, telling it the name we gave it
-    // (`peer_id`) and echoing the name it gave us (`assigned_peer_id`).
+                                 const std::vector<wire::Endpoint>& endpoints,
+                                 bool reestablish) {
+    // A peer dialled us and named us: open our own write channel to it and answer
+    // the handshake, telling it the name we gave it (`peer_id`) and echoing the name
+    // it gave us (`assigned_peer_id`). On a reconnect (reestablish) the write side is
+    // re-established fresh: the inbound and outbound are one logical connection, so
+    // the socket the previous session left behind is dropped rather than reused (a
+    // stale socket would swallow the next send and surface as a spurious disconnect).
     if (peer_id == 0) { return; }
+    if (reestablish) { drop_connection(peer_id); }
     if (connections_.find(peer_id) != connections_.end()) { return; }
     if (endpoints.empty()) { return; }
     const wire::Endpoint& endpoint = endpoints.front();
@@ -604,6 +722,39 @@ void SenderWorker::dial_peer(const EventDialPeer& dial) {
     }
 }
 
+bool SenderWorker::drop_connection(uint64_t peer_id) {
+    const auto it = connections_.find(peer_id);
+    if (it == connections_.end()) { return false; }
+    std::ignore = it->second.shutdown(TcpConnection::Shutdown::Both);
+    connections_.erase(it);
+    return true;
+}
+
+void SenderWorker::reconnect_peer(const EventReconnectPeer& reconnect) {
+    // Re-dial an existing peer without minting a new identity: drop any cached socket
+    // so the dial is fresh, and re-present the assigned id so the peer adopts the
+    // same peer_id and resumes the conversation.
+    const auto entry = peers_.lookup(reconnect.peer_id);
+    if (!entry) {
+        logger_.warn("reconnect failed: peer#" + std::to_string(reconnect.peer_id)
+                     + " unknown");
+        report_unreachable(reconnect.conversation_id, reconnect.peer_id);
+        return;
+    }
+    drop_connection(reconnect.peer_id);
+    TcpConnection* connection =
+        open(reconnect.peer_id, entry->address.ip, entry->address.port,
+             wire::make_connect(reconnect.peer_id, entry->assigned_id, local_.endpoints));
+    if (connection != nullptr) {
+        peers_.mark_connected(reconnect.peer_id);
+        logger_.info("reconnected: peer#" + std::to_string(reconnect.peer_id));
+        (void)store_queue_.emplace(EventPeerDialed{reconnect.conversation_id, reconnect.peer_id});
+    } else {
+        logger_.warn("reconnect failed: peer#" + std::to_string(reconnect.peer_id));
+        report_unreachable(reconnect.conversation_id, reconnect.peer_id);
+    }
+}
+
 void SenderWorker::report_unreachable(uint64_t conversation_id, uint64_t peer_id) {
     logger_.warn("peer#" + std::to_string(peer_id) + " unreachable (conversation "
                  + std::to_string(conversation_id) + ")");
@@ -618,17 +769,20 @@ void SenderWorker::operator()() {
             continue;
         }
         if (const auto* connected = std::get_if<EventPeerConnected>(&*event)) {
-            establish_ack(connected->peer_id, connected->assigned_peer_id, connected->endpoints);
+            establish_ack(connected->peer_id, connected->assigned_peer_id,
+                          connected->endpoints, connected->adopted);
             continue;
         }
         if (const auto* gone = std::get_if<EventPeerDisconnected>(&*event)) {
             // A peer went away: forget its write connection so a returning peer is
             // dialled afresh instead of being answered through a dead socket.
-            if (const auto it = connections_.find(gone->peer_id); it != connections_.end()) {
-                std::ignore = it->second.shutdown(TcpConnection::Shutdown::Both);
-                connections_.erase(it);
+            if (drop_connection(gone->peer_id)) {
                 logger_.info("write connection dropped: peer#" + std::to_string(gone->peer_id));
             }
+            continue;
+        }
+        if (const auto* reconnect = std::get_if<EventReconnectPeer>(&*event)) {
+            reconnect_peer(*reconnect);
             continue;
         }
         const auto* message = std::get_if<EventMessage>(&*event);
@@ -636,9 +790,20 @@ void SenderWorker::operator()() {
 
         // No address means the peer was never learned (or was never reachable):
         // retrying cannot help, so fail immediately.
-        if (!peers_.lookup(message->peer_id)) {
+        const auto peer = peers_.lookup(message->peer_id);
+        if (!peer) {
             report_unreachable(message->conversation_id, message->peer_id);
             continue;
+        }
+
+        // A message on a conversation whose peer was closed (e.g. its unused reader
+        // was pruned) reconnects first: forget any cached socket so the dial below is
+        // fresh rather than writing into a dead one. The reconnect is silent -- the
+        // message is simply delivered on the new connection.
+        const bool reconnecting = peer->status == PeerTable::Status::Disconnected;
+        if (reconnecting && drop_connection(message->peer_id)) {
+            logger_.info("reconnect: dropped stale connection to peer#"
+                         + std::to_string(message->peer_id));
         }
 
         // The peer ignores the wire conversation_id and sender_id (conversations
@@ -651,16 +816,15 @@ void SenderWorker::operator()() {
             TcpConnection* connection = ensure_connection(message->peer_id);
             if (connection != nullptr && send_all(*connection, *frame)) {
                 peers_.mark_connected(message->peer_id);
+                if (reconnecting) {
+                    logger_.info("reconnected: peer#" + std::to_string(message->peer_id));
+                }
                 delivered = true;
                 break;
             }
             // The socket is suspect (or the dial failed): drop it so the next
             // attempt starts from a fresh connection.
-            if (const auto it = connections_.find(message->peer_id);
-                it != connections_.end()) {
-                std::ignore = it->second.shutdown(TcpConnection::Shutdown::Both);
-                connections_.erase(it);
-            }
+            drop_connection(message->peer_id);
             if (attempt + 1 < kSendAttempts) {
                 std::this_thread::sleep_for(kSendRetryDelay);
             }
@@ -700,7 +864,8 @@ void MainWorker::operator()() {
                                                        static_cast<uint16_t>(port_)}}},
                         logger};
     KeyboardListenerWorker keyboard{terminal, render_queue, logger};
-    ListenerWorker listener{local_address_, port_, store_queue, peers, 16, logger};
+    ListenerWorker listener{local_address_, port_, store_queue, peers,
+                            kMaxReaderThreads, 16, logger};
 
     logger.info("main: starting on " + local_address_ + ":" + std::to_string(port_));
 
@@ -737,7 +902,7 @@ void MainWorker::operator()() {
 
 } // namespace p2p
 
-// --- StoreWorker -----------------------------------------------------------
+// --- StoreWorker ------------------------------------------------------------
 
 namespace {
     // The last `n` messages of `messages` (all of them when n == 0).
@@ -1035,6 +1200,24 @@ bool StoreWorker::on_peer_dialed(const EventPeerDialed& dialed) {
     return render_queue_.emplace(EventPeerDialed{conversation_id, dialed.peer_id});
 }
 
+bool StoreWorker::on_reconnect_peer(const EventReconnectPeer& reconnect) {
+    // Re-dial an existing conversation's peer reusing its id: the render only knows
+    // the conversation, so resolve it here. No conversation (or no bound peer) means
+    // there is nothing to dial, which the render is told as an error.
+    const auto it = conversations_.find(reconnect.conversation_id);
+    if (it == conversations_.end() || it->second.peer_id.empty()) {
+        logger_.warn("reconnect: conversation " + std::to_string(reconnect.conversation_id)
+                     + " has no peer");
+        return render_queue_.emplace(EventError{
+            "conversation " + std::to_string(reconnect.conversation_id)
+            + " has no peer to reconnect"});
+    }
+    const uint64_t peer_id = it->second.peer_id.back();
+    logger_.info("reconnect request: conversation " + std::to_string(reconnect.conversation_id)
+                 + " -> peer#" + std::to_string(peer_id));
+    return sender_queue_.emplace(EventReconnectPeer{reconnect.conversation_id, peer_id});
+}
+
 bool StoreWorker::on_error(const EventError& error) {
     // Worker failures are surfaced to the render as-is.
     logger_.error(error.message);
@@ -1076,6 +1259,8 @@ void StoreWorker::operator()() {
                 return on_dial_peer(value);
             } else if constexpr (std::is_same_v<Value, EventPeerDialed>) {
                 return on_peer_dialed(value);
+            } else if constexpr (std::is_same_v<Value, EventReconnectPeer>) {
+                return on_reconnect_peer(value);
             } else if constexpr (std::is_same_v<Value, EventError>) {
                 return on_error(value);
             } else if constexpr (std::is_same_v<Value, EventListConversations>) {
@@ -1284,6 +1469,7 @@ namespace {
                 system_message("/notify-on <conversation id>  announce its new messages");
                 system_message("/notify-off <conversation id> stay silent about it");
                 system_message("/connect <ip> <port>       dial a new peer");
+                system_message("/reconnect <conversation id>  re-dial an existing peer");
                 system_message("/quit, /exit               leave");
             } else if (command == "/conv" || command == "/conversations") {
                 if (!store_queue_.emplace(EventListConversations{})) { running_ = false; }
@@ -1325,6 +1511,17 @@ namespace {
                     system_message("connecting to " + std::string(parts[1]) + ":"
                                    + std::string(parts[2]) + "...");
                     if (!store_queue_.emplace(EventDialPeer{std::string(parts[1]), port, 0})) {
+                        running_ = false;
+                    }
+                }
+            } else if (command == "/reconnect") {
+                uint64_t conversation_id = 0;
+                if (parts.size() < 2 || !parse_u64(parts[1], conversation_id)) {
+                    system_message("usage: /reconnect <conversation id>");
+                } else {
+                    system_message("reconnecting conversation "
+                                   + std::to_string(conversation_id) + "...");
+                    if (!store_queue_.emplace(EventReconnectPeer{conversation_id, 0})) {
                         running_ = false;
                     }
                 }
