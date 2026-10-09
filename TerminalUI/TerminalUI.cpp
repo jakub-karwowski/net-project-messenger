@@ -44,7 +44,7 @@ TerminalUI::~TerminalUI() {
     if (originalTermState) {
         tcsetattr(STDIN_FILENO, TCSANOW, &originalTermState->obj);
     }
-    std::cout << ansi::clear_screen << ansi::show_cursor << std::flush;
+    std::cout << ansi::clear_screen << ansi::show_cursor << ansi::move_to(1, 1) << std::flush;
 }
 
 std::optional<TerminalUI::TerminalSize> TerminalUI::get_terminal_size() const noexcept {

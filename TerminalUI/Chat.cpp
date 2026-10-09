@@ -21,6 +21,11 @@ void ChatModel::add_message(std::chrono::time_point<std::chrono::system_clock> r
     mutate_model();
 }
 
+void ChatModel::clear() noexcept {
+    msg_.clear();
+    mutate_model();
+}
+
 void ChatModel::expose(size_t pos_s, size_t n_msg) noexcept {
     exposed_pos_s = pos_s;
     exposed_n_msg = n_msg;
@@ -95,7 +100,7 @@ void ChatWindow::begin_render() {
     for (const auto& chat_msg : std::span{itr, messages.end()}) {
         std::format_to(
             std::back_inserter(frame_buffer_), 
-            "{}{}{:%Y%m%d%H%M}{}{}{}\n", 
+            "{}{}@{:%Y-%m-%d[%H:%M]}{}{}{}\n", 
             sep_color_, chat_msg.sender, chat_msg.recived_time, sep_, get_main_color(), chat_msg.message
         );
     }

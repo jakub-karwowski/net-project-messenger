@@ -47,6 +47,19 @@ class ThreadQueue {
             }
             return std::nullopt;
         }
+        // Non-blocking counterpart of pop(). Returns std::nullopt immediately when
+        // there is nothing to consume without mutating the queue's state, so the
+        // caller can drain a burst of work, run its post-processing, and then call
+        // pop() again to resume waiting exactly where it left off.
+        [[nodiscard]] std::optional<T> try_pop() {
+            std::scoped_lock lock(mutex_);
+            if (state_ == QueueState::ForceShutdown || queue_.empty()) {
+                return std::nullopt;
+            }
+            T value = std::move(queue_.front());
+            queue_.pop();
+            return value;
+        }
         void graceful_shutdown() noexcept { shutdown(ThreadQueue::QueueState::GracefulShutdown); }
         void force_shutdown() noexcept { shutdown( ThreadQueue::QueueState::ForceShutdown); }
     private:
