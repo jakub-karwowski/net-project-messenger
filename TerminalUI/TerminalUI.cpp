@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <poll.h>
 #include <termios.h>
 #include <unistd.h>
@@ -14,6 +15,7 @@ namespace ansi {
     inline std::string move_to(int row, int col) {
         return "\033[" + std::to_string(row) + ";" + std::to_string(col) + "H";
     }
+    inline constexpr std::string_view reset = "\033[0m";
     inline constexpr std::string_view clear_line = "\033[2K";
     inline constexpr std::string_view clear_screen = "\033[2J";
     inline constexpr std::string_view hide_cursor = "\033[?25l";
@@ -101,35 +103,40 @@ bool TerminalUI::render(Renderable& renderable) {
     auto win = get_terminal_size();
     if (!win) { return false; }
     renderable.resize(win->width, win->height);
-    while (!renderable.empty()) {
-        auto comm = renderable.get_command();
-        switch (comm.action) {
-            case Renderable::DrawCommand::Action::ClearScreen:
-                std::cout 
-                    << ansi::clear_screen 
-                    << ansi::move_to(1, 1);
-                break;
-        
-            case Renderable::DrawCommand::Action::ClearLineAndDraw:
-                std::cout 
-                    << ansi::move_to(comm.start_pos.row, 1)
-                    << ansi::clear_line
-                    << ansi::move_to(comm.start_pos.row, comm.start_pos.col)
-                    << comm.content;
-                break;
-        
-            case Renderable::DrawCommand::Action::DrawText:
-                std::cout 
-                    << ansi::move_to(comm.start_pos.row, comm.start_pos.col)
-                    << comm.content;
-                break;
-        }
-        
-        if (comm.end_pos) {
-            std::cout 
-                << ansi::move_to(comm.end_pos->row, comm.end_pos->col);
-        }
+    const std::optional<Renderable::Cursor> cursor = renderable.write_frame(frame_buffer);
+
+    // Repaint only the rows whose cells differ from the frame currently on
+    // screen. row_equal() also reports a mismatch when the size changed, so a
+    // resize repaints everything. Starting each row with a reset keeps a row
+    // self-contained: its cells carry the SGR prefixes they were rendered with,
+    // but the colour state left by the previous row is not reused.
+    std::string sequence;
+    bool redrawn = false;
+    for (int row = 0; row < frame_buffer.height; ++row) {
+        if (previous_frame.row_equal(frame_buffer, row)) { continue; }
+        redrawn = true;
+        sequence += ansi::move_to(row + 1, 1);
+        sequence += ansi::reset;
+        sequence += ansi::clear_line;
+        sequence += frame_buffer.row_text(row);
     }
-    std::cout << std::flush;
+
+    // Nothing to paint and the cursor is where it already was: stay silent.
+    if (!redrawn && cursor == previous_cursor) { return true; }
+
+    sequence += ansi::reset;
+    if (cursor && cursor->state == Renderable::Cursor::State::VISIBLE) {
+        sequence += ansi::show_cursor;
+        sequence += ansi::move_to(cursor->y, cursor->x);
+    } else {
+        sequence += ansi::hide_cursor;
+    }
+
+    std::cout << sequence << std::flush;
+
+    // write_frame() resizes (and therefore blanks) `frame_buffer` before filling
+    // it, so swapping is safe and avoids copying the whole grid every frame.
+    std::swap(previous_frame, frame_buffer);
+    previous_cursor = cursor;
     return true;
 }

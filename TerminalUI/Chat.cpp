@@ -234,8 +234,7 @@ void InputBox::end_render(std::vector<RenderCommand> &buffer) {
     }
     buffer.push_back(
         RenderCommand{
-            cursor_draw_x_, 
-            cursor_draw_y_, 
+            Position{cursor_draw_x_, cursor_draw_y_},
             {}, 
             RenderCommand::Type::CURSOR
         }

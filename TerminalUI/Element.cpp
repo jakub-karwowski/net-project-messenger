@@ -1,10 +1,119 @@
 #include "Element.hpp"
+#include "TerminalUI.hpp"
 #include "Utils.hpp"
 #include <algorithm>
 #include <cmath>
 #include <optional>
 #include <string_view>
 #include <utility>
+#include <vector>
+
+namespace {
+
+// Flattening writes into a FrameBuffer cell grid, addressed by display column
+// rather than byte offset: element text mixes UTF-8 glyphs (1-2 columns each)
+// with ANSI SGR sequences (0 columns), so a byte-based overlay would shift
+// everything to the right of a multi-byte character.
+
+// Blanks whatever occupies `column`, including the other half of a wide glyph,
+// so overwriting one column never leaves half a character behind.
+void detach_glyph(FrameBuffer& frame, int row, int column) {
+    if (!frame.contains(row, column)) { return; }
+    FrameBuffer::Cell& cell = frame.at(row, column);
+    if (cell.continuation) {
+        cell.text.clear();
+        cell.continuation = false;
+        if (column > 0) {
+            FrameBuffer::Cell& left = frame.at(row, column - 1);
+            left.text = " ";
+            left.continuation = false;
+        }
+        return;
+    }
+    if (frame.contains(row, column + 1) && frame.at(row, column + 1).continuation) {
+        FrameBuffer::Cell& right = frame.at(row, column + 1);
+        right.text.clear();
+        right.continuation = false;
+    }
+}
+
+// Overlays `text` starting at the 0-based cell (row, column). '\n' moves to the
+// next row and back to column 0; anything outside the frame is dropped. Colour
+// sequences are kept as a prefix of the glyph they decorate, and zero-width
+// codepoints stay attached to the glyph on their left.
+void write_text(FrameBuffer& frame, int row, int column, std::string_view text) {
+    std::string pending;  // escapes / combining marks awaiting a glyph
+    for (size_t i = 0; i < text.size();) {
+        const unsigned char byte = static_cast<unsigned char>(text[i]);
+        if (byte == '\n') {
+            ++row;
+            column = 0;
+            pending.clear();
+            ++i;
+            continue;
+        }
+        if (byte == '\r') {
+            column = 0;
+            pending.clear();
+            ++i;
+            continue;
+        }
+        // CSI sequence (SGR and friends): zero display columns, so it is parked
+        // until the next glyph is placed.
+        if (byte == '\033' && i + 1 < text.size() && text[i + 1] == '[') {
+            const size_t start = i;
+            i += 2;
+            while (i < text.size()
+                   && !(static_cast<unsigned char>(text[i]) >= 0x40
+                        && static_cast<unsigned char>(text[i]) <= 0x7E)) { ++i; }
+            if (i < text.size()) { ++i; }
+            pending.append(text.substr(start, i - start));
+            continue;
+        }
+
+        const size_t start = i;
+        i = utils::utf8::next(text, i);
+        const std::string_view glyph = text.substr(start, i - start);
+        size_t decode_at = start;
+        const int glyph_width =
+            utils::utf8::codepoint_width(utils::utf8::decode(text, decode_at));
+
+        if (glyph_width <= 0) {
+            // Combining mark: belongs to the glyph already drawn to its left.
+            if (column > 0 && frame.contains(row, column - 1)) {
+                frame.at(row, column - 1).text.append(glyph);
+            } else {
+                pending.append(glyph);
+            }
+            continue;
+        }
+
+        if (!frame.contains(row, column)) {
+            column += glyph_width;
+            pending.clear();  // the escapes decorated a dropped glyph
+            continue;
+        }
+
+        // Blow away the right half before the left one: detaching the right
+        // half blanks its left neighbour, which would otherwise erase the glyph
+        // written in the previous iteration.
+        detach_glyph(frame, row, column + 1);
+        detach_glyph(frame, row, column);
+        FrameBuffer::Cell& cell = frame.at(row, column);
+        cell.text = pending;
+        cell.text.append(glyph);
+        cell.continuation = false;
+        pending.clear();
+        if (glyph_width > 1 && frame.contains(row, column + 1)) {
+            FrameBuffer::Cell& right = frame.at(row, column + 1);
+            right.text.clear();
+            right.continuation = true;
+        }
+        column += glyph_width;
+    }
+}
+
+} // namespace
 
 Element::Element(Element::Position relative_position, int width, int height) 
     : relative_position_(relative_position)
@@ -162,13 +271,15 @@ void Element::render(std::vector<RenderCommand>& buffer) noexcept {
     const size_t end_render_command_buffer_start = buffer.size();
     this->end_render(buffer);
     for (size_t i = end_render_command_buffer_start; i < buffer.size(); ++i) {
-        auto& [x, y]  = buffer[i].anchor;
+        auto& [x, y, z]  = buffer[i].anchor;
+        (void)z;
         x += inner_offset_x;
         y += inner_offset_y;
     }
 
     for (size_t i = initial_buffer_size; i < buffer.size(); ++i) {
-        auto& [x, y]  = buffer[i].anchor;
+        auto& [x, y, z]  = buffer[i].anchor;
+        (void)z;
         x += relative_position_.x;
         y += relative_position_.y;
     }
@@ -201,72 +312,45 @@ void AbsoluteLayout::end_render(std::vector<RenderCommand>& buffer) {
     }
 }
 
-// Flattens the whole element tree into absolute DrawCommands. render() emits
-// anchors relative to the screen's content plane (0-based), while Renderable
-// coordinates are 1-based, hence the +1.
-void AbsoluteLayout::render_to_commands_() const {
-    std::vector<RenderCommand> buffer;
-    const_cast<AbsoluteLayout*>(this)->render(buffer);
+// Flattens the whole element tree into the frame grid. render() emits anchors
+// relative to the screen's content plane (0-based) and already folds the
+// element's margin/padding/border plus its relative position in, so the only
+// conversion left is the +1 to terminal (ANSI) coordinates for the cursor.
+std::optional<Renderable::Cursor> AbsoluteLayout::write_frame(FrameBuffer& frame) {
+    std::vector<RenderCommand> commands;
+    render(commands);
 
-    std::optional<Renderable::Position> cursor_position;
-    std::queue<DrawCommand> refreshed;
-    for (auto& command : buffer) {
-        const Renderable::Position anchor{
-            command.anchor.y + 1,
-            command.anchor.x + 1
-        };
+    // Element::render translates x/y but not z, and the tree is emitted depth
+    // first. A stable sort gives the requested paint order while ties (the
+    // layout's own blank rows before its children) keep their emission order.
+    std::stable_sort(
+        commands.begin(), commands.end(),
+        [](const RenderCommand& lhs, const RenderCommand& rhs) {
+            return lhs.anchor.z < rhs.anchor.z;
+        }
+    );
 
+    frame.resize(get_width(), get_height());
+    std::optional<Renderable::Cursor> cursor;
+    for (const auto& command : commands) {
         if (command.type == RenderCommand::Type::CURSOR) {
-            // A cursor is not drawn on its own. Remember the (last) requested
-            // position; it is bound to the final command below so the terminal
-            // cursor ends up there once the whole frame has been rendered.
-            cursor_position = anchor;
+            // A cursor is not drawn on its own; remember the (last) requested
+            // cell so the caller can park the terminal cursor there once the
+            // frame has been drawn. Clamped, since a stale cursor may sit
+            // outside the layout after a shrink.
+            cursor = Renderable::Cursor{
+                std::clamp(command.anchor.x + 1, 1, std::max(1, frame.width)),
+                std::clamp(command.anchor.y + 1, 1, std::max(1, frame.height)),
+                Renderable::Cursor::State::VISIBLE
+            };
             continue;
         }
-
-        DrawCommand draw_command;
-        draw_command.action = DrawCommand::Action::DrawText;
-        draw_command.content = std::move(command.data);
-        draw_command.start_pos = anchor;
-        refreshed.push(std::move(draw_command));
+        write_text(frame, command.anchor.y, command.anchor.x, command.data);
     }
 
-    if (cursor_position) {
-        if (!refreshed.empty()) {
-            refreshed.back().end_pos = cursor_position;
-        } else {
-            // Nothing was drawn; still move the cursor to the requested spot.
-            DrawCommand cursor_command;
-            cursor_command.action = DrawCommand::Action::DrawText;
-            cursor_command.start_pos = *cursor_position;
-            refreshed.push(std::move(cursor_command));
-        }
-    }
-    renderable_commands_.swap(refreshed);
+    return cursor;
 }
 
-bool AbsoluteLayout::empty() const noexcept {
-    if (!renderable_commands_.empty()) { return false; }
-    if (rendered_) {
-        // The last batch was fully drained: the frame is over. Re-arm so the
-        // next frame produces a fresh batch.
-        rendered_ = false;
-        return true;
-    }
-    rendered_ = true;
-    render_to_commands_();
-    if (renderable_commands_.empty()) {
-        rendered_ = false;
-        return true;
-    }
-    return false;
-}
-
-Renderable::DrawCommand AbsoluteLayout::get_command() {
-    DrawCommand command = std::move(renderable_commands_.front());
-    renderable_commands_.pop();
-    return command;
-}
 
 // Renderable entry point: forwards the new terminal size into the (virtual)
 // Element::set_size override below.

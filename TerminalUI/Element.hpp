@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <queue>
 #include <string>
 #include <vector>
@@ -12,6 +13,7 @@ struct Element {
     struct Position {
         int x{0};
         int y{0};
+        int z{0};
     };
     struct RenderCommand {
         enum struct Type { TEXT, CURSOR };
@@ -117,23 +119,20 @@ struct AbsoluteLayout : public Element, Renderable {
     void inner_content(int local_row, std::string& buffer) override;
     void end_render(std::vector<RenderCommand>& buffer) override;
 
-    // Renderable interface. Both operate in absolute (screen) coordinates.
-    bool empty() const noexcept override;
-    DrawCommand get_command() override;
+    // Renderable interface: flattens the whole tree into `frame`'s cell grid,
+    // resizing it to get_width() x get_height() (which also blanks it, so the
+    // frame is complete rather than a patch of the previous one). Overlaps are
+    // resolved here by z order, then emission order; a cell holds its own glyph
+    // (plus the SGR sequences that precede it) so the caller can diff two frames
+    // cell by cell. Returns the cursor's 1-based cell when the tree asked for one.
+    std::optional<Renderable::Cursor> write_frame(FrameBuffer& frame) override;
+
     void resize(int width, int height) override;
 
     // Element interface: resizes this layout and rescales its children.
     void set_size(int width, int height) noexcept override;
 private:
-    // Renders the whole element tree and stores it as absolute DrawCommands.
-    void render_to_commands_() const;
-
-    mutable std::queue<DrawCommand> renderable_commands_;
     std::vector<std::shared_ptr<Element>> elements_;
-    // Tracks the drain/refresh cycle used by TerminalUI::render, which keeps
-    // calling empty() until it returns true. Reset once the queue is drained
-    // so the next frame renders a fresh batch.
-    mutable bool rendered_{false};
 };
 
 
