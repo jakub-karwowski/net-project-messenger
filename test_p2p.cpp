@@ -133,9 +133,9 @@ void test_watchdog_stops_stalled_reader() {
     auto connection = std::make_shared<TcpConnection>(std::move(*server));
     connection->with_receive_timeout(std::chrono::milliseconds{5000});
 
-    auto frozen = std::make_shared<p2p::ReaderActivity>(); // tick stays 0: never advances
-    p2p::WatchdogWorker watchdog;
-    watchdog.register_reader(frozen, connection);
+    auto frozen = std::make_shared<p2p::ReaderActivity>(connection); // tick stays 0: never advances
+    p2p::WatchdogWorker watchdog{kUncappedReaders};
+    watchdog.adopt(frozen, std::thread{}); // no reader thread: the watchdog just scans
 
     std::thread watchdog_thread{std::ref(watchdog)};
 
@@ -372,16 +372,15 @@ void test_watchdog_prunes_oldest_reader() {
     new_conn->with_receive_timeout(std::chrono::milliseconds{5000});
 
     // Both readers are alive (their ticks advance), but the "old" one read much earlier.
-    auto old_activity = std::make_shared<p2p::ReaderActivity>();
-    auto new_activity = std::make_shared<p2p::ReaderActivity>();
+    auto old_activity = std::make_shared<p2p::ReaderActivity>(old_conn);
+    auto new_activity = std::make_shared<p2p::ReaderActivity>(new_conn);
     old_activity->last_read_ns.store(100, std::memory_order_relaxed);
     new_activity->last_read_ns.store(200, std::memory_order_relaxed);
 
-    std::atomic<std::size_t> prune_requests{1};
-    p2p::WatchdogWorker watchdog;
-    watchdog.configure(prune_requests);
-    watchdog.register_reader(old_activity, old_conn);
-    watchdog.register_reader(new_activity, new_conn);
+    // A cap of one: adopting the second reader is what prunes the first.
+    p2p::WatchdogWorker watchdog{1};
+    watchdog.adopt(old_activity, std::thread{});
+    watchdog.adopt(new_activity, std::thread{});
 
     std::thread watchdog_thread{std::ref(watchdog)};
     std::this_thread::sleep_for(std::chrono::milliseconds{300}); // at least one scan
@@ -582,8 +581,26 @@ void test_cap_prune_reports_disconnect() {
         auto hello2 = wire::encode(wire::make_connect(
             kPeerName + 1, 0, std::vector<wire::Endpoint>{{"127.0.0.1", kPort}}));
         if (hello2) { (void)send_all(*second, *hello2); }
-        check(wait_first_peer(store_queue, std::chrono::milliseconds{1000}).has_value(),
-              "prune: second peer got a local id");
+
+        // The watchdog enforces the cap while ADOPTING the new reader, so the pruned
+        // peer can be reported gone before or after the second peer finishes its
+        // handshake. Watch for both at once instead of draining with a helper that
+        // discards the disconnect.
+        bool second_connected = false;
+        bool announced = false;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{1000};
+        while ((!second_connected || !announced)
+               && std::chrono::steady_clock::now() < deadline) {
+            while (auto event = store_queue.try_pop()) {
+                if (std::get_if<EventPeerConnected>(&*event) != nullptr) {
+                    second_connected = true;
+                } else if (const auto* gone = std::get_if<EventPeerDisconnected>(&*event)) {
+                    if (local_id.has_value() && gone->peer_id == *local_id) { announced = true; }
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        check(second_connected, "prune: second peer got a local id");
 
         // The cap shuts the first socket down and the pruned peer is reported gone.
         first->with_receive_timeout(std::chrono::milliseconds{2000});
@@ -591,18 +608,6 @@ void test_cap_prune_reports_disconnect() {
         auto pruned = first->receive(std::span<std::byte>{scratch.data(), scratch.size()});
         check(!pruned && pruned.error() == SocketError::ConnectionClosed,
               "prune: the first connection was pruned");
-
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{1000};
-        bool announced = false;
-        while (!announced && std::chrono::steady_clock::now() < deadline) {
-            while (auto event = store_queue.try_pop()) {
-                const auto* gone = std::get_if<EventPeerDisconnected>(&*event);
-                if (gone != nullptr && local_id.has_value() && gone->peer_id == *local_id) {
-                    announced = true;
-                }
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds{10});
-        }
         check(announced, "prune: the cap prune reports the disconnect");
         if (local_id.has_value()) {
             const auto entry = peers.lookup(*local_id);

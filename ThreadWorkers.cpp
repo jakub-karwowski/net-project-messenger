@@ -7,12 +7,13 @@
 // down, and the worker returns.
 //
 // One TCP connection is one conversation. ListenerWorker accepts peers and spawns
-// a WatchdogWorker plus one ReaderWorker per connection, capped at the listener's
-// max_readers. Each reader owns its TcpConnection and a shared ReaderActivity; the
-// watchdog holds weak references to both, reaps a reader that has finished (its
-// heartbeat is gone) and shuts down the socket of a reader whose tick stopped
-// advancing (thread wedged). When the listener spawns past its cap it raises a
-// prune request, and the watchdog drops the least-recently-read readers to make room.
+// one ReaderWorker per connection, handing each thread straight to the single
+// WatchdogWorker, which owns the reader threads and the reader population: it joins
+// a reader once its heartbeat reports `finished`, shuts down a reader whose tick
+// stopped advancing (thread wedged), and -- when a new reader pushes past the cap --
+// drops the least-recently-read readers to make room. The reader and the watchdog
+// share one ReaderActivity record (heartbeat, live socket, lifecycle flags), so
+// there is no per-reader handle for the listener to track.
 
 #include "ThreadWorkers.hpp"
 
@@ -81,21 +82,19 @@ void LoggerWorker::operator()() {
 // --- KeyboardListenerWorker -------------------------------------------------
 
 namespace {
-    constexpr int kKeyIdleTimeoutMs = 100;
-    constexpr int kKeySequenceTimeoutMs = 50;
-
     // Decodes one key press introduced by `lead`. Returns nullopt for input that
     // carries no EventLocal (a non-arrow CSI sequence, or a control byte that is
     // not a shortcut), so the caller keeps reading.
-    std::optional<EventLocal> decode_key(const TerminalUI& terminal, unsigned char lead) {
+    std::optional<EventLocal> decode_key(const TerminalUI& terminal, unsigned char lead,
+                                         int sequence_timeout_ms) {
         if (lead == 0x1B) { // ESC or an ANSI CSI sequence
             unsigned char next = 0;
-            if (terminal.read_byte(next, kKeySequenceTimeoutMs) != TerminalUI::ReadResult::Byte
+            if (terminal.read_byte(next, sequence_timeout_ms) != TerminalUI::ReadResult::Byte
                 || next != '[') {
                 return EventLocal{EventLocal::Type::EXIT, {}};
             }
             unsigned char code = 0;
-            if (terminal.read_byte(code, kKeySequenceTimeoutMs) == TerminalUI::ReadResult::Byte) {
+            if (terminal.read_byte(code, sequence_timeout_ms) == TerminalUI::ReadResult::Byte) {
                 if (code == 'A') { return EventLocal{EventLocal::Type::ARROW_UP, {}}; }
                 if (code == 'B') { return EventLocal{EventLocal::Type::ARROW_DOWN, {}}; }
                 if (code == 'C') { return EventLocal{EventLocal::Type::ARROW_RIGHT, {}}; }
@@ -108,15 +107,21 @@ namespace {
         if (lead == '\r' || lead == '\n') { return EventLocal{EventLocal::Type::ENTER, {}}; }
         if (lead < 0x20) { return std::nullopt; } // other control bytes
         return EventLocal{EventLocal::Type::TEXT,
-                          terminal.read_utf8_char(lead, kKeySequenceTimeoutMs)};
+                          terminal.read_utf8_char(lead, sequence_timeout_ms)};
     }
 } // namespace
 
 KeyboardListenerWorker::KeyboardListenerWorker(
     const TerminalUI& terminal,
     ThreadQueue<Event>& render_queue,
+    int idle_timeout_ms,
+    int sequence_timeout_ms,
     Logger logger)
-    : terminal_(terminal), render_queue_(render_queue), logger_(std::move(logger)) {}
+    : terminal_(terminal),
+      render_queue_(render_queue),
+      idle_timeout_ms_(idle_timeout_ms),
+      sequence_timeout_ms_(sequence_timeout_ms),
+      logger_(std::move(logger)) {}
 
 void KeyboardListenerWorker::stop() noexcept {
     running_.store(false, std::memory_order_relaxed);
@@ -125,7 +130,7 @@ void KeyboardListenerWorker::stop() noexcept {
 void KeyboardListenerWorker::operator()() {
     while (running_.load(std::memory_order_relaxed)) {
         unsigned char lead = 0;
-        const TerminalUI::ReadResult result = terminal_.read_byte(lead, kKeyIdleTimeoutMs);
+        const TerminalUI::ReadResult result = terminal_.read_byte(lead, idle_timeout_ms_);
 
         if (result == TerminalUI::ReadResult::Timeout) { continue; } // idle: keep polling
 
@@ -133,7 +138,7 @@ void KeyboardListenerWorker::operator()() {
         if (result == TerminalUI::ReadResult::Eof) {
             key = EventLocal{EventLocal::Type::EXIT, {}}; // EOF quits
         } else {
-            key = decode_key(terminal_, lead);
+            key = decode_key(terminal_, lead, sequence_timeout_ms_);
             if (!key) { continue; }
         }
 
@@ -150,21 +155,6 @@ void KeyboardListenerWorker::operator()() {
 }
 
 namespace {
-    // Watchdog cadence and the stall threshold expressed in scans: a reader that
-    // fails to tick for kStallScanLimit consecutive scans is considered wedged.
-    constexpr auto kWatchdogScan = std::chrono::milliseconds{100};
-    constexpr unsigned kStallScanLimit = 10; // 10 * 100 ms = 1 s without a tick
-
-    // Bounded receive: kept well below the stall threshold so a healthy idle
-    // reader (no inbound data) still ticks every period instead of looking stuck.
-    constexpr auto kReaderTickPeriod = std::chrono::milliseconds{200};
-
-    constexpr std::size_t kReadChunk = 4096;
-
-    // The application's hard cap on concurrently running reader threads (the
-    // ListenerWorker receives it as a constructor argument).
-    constexpr std::size_t kMaxReaderThreads = 8;
-
     // Monotonic nanoseconds on the steady clock, used to stamp and rank a reader's
     // last real read (see ReaderActivity).
     int64_t steady_now_ns() {
@@ -255,14 +245,17 @@ bool PeerTable::erase(uint64_t peer_id) {
 
 ReaderWorker::ReaderWorker(
     ThreadQueue<Event>& store_queue,
-    std::shared_ptr<TcpConnection> connection,
     std::shared_ptr<ReaderActivity> activity,
     PeerTable& peers,
+    std::size_t read_chunk,
+    std::chrono::milliseconds tick_period,
     Logger logger)
     : store_queue_(store_queue),
-      connection_(std::move(connection)),
       activity_(std::move(activity)),
       peers_(peers),
+      // A zero buffer or timeout would be unusable: fall back to the defaults.
+      read_chunk_(read_chunk == 0 ? kDefaultReadChunk : read_chunk),
+      tick_period_(tick_period.count() > 0 ? tick_period : kDefaultTickPeriod),
       logger_(std::move(logger)) {}
 
 void ReaderWorker::remember_assigned_id(uint64_t peer_id, uint64_t assigned_id) {
@@ -280,7 +273,19 @@ void ReaderWorker::remember_assigned_id(uint64_t peer_id, uint64_t assigned_id) 
 }
 
 void ReaderWorker::operator()() {
-    std::array<std::byte, kReadChunk> scratch{};
+    // Report completion on every exit path (including an early return): the watchdog
+    // joins this thread as soon as it observes the flag, so the listener needs no
+    // handle to join it with.
+    struct FinishGuard {
+        std::atomic<bool>& flag;
+        ~FinishGuard() { flag.store(true, std::memory_order_release); }
+    } finish_guard{activity_->finished};
+
+    TcpConnection& connection = *activity_->connection;
+    // The reader owns its polling cadence: a bounded receive keeps the heartbeat
+    // advancing even when no data arrives.
+    connection.with_receive_timeout(tick_period_);
+    std::vector<std::byte> scratch(read_chunk_);
 
     bool stop = false;
     while (!stop) {
@@ -288,7 +293,7 @@ void ReaderWorker::operator()() {
         // iteration, so only a genuinely wedged thread stops ticking.
         activity_->tick.fetch_add(1, std::memory_order_relaxed);
 
-        auto received = connection_->receive(std::span<std::byte>{scratch.data(), scratch.size()});
+        auto received = connection.receive(std::span<std::byte>{scratch.data(), scratch.size()});
         if (!received) {
             if (received.error() == SocketError::WouldBlock) {
                 continue; // bounded receive timed out; nothing arrived yet
@@ -377,88 +382,143 @@ void ReaderWorker::operator()() {
 
 // --- WatchdogWorker ---------------------------------------------------------
 
-void WatchdogWorker::configure(std::atomic<std::size_t>& prune_requests, Logger logger) noexcept {
-    std::lock_guard lock(mutex_);
-    prune_requests_ = &prune_requests;
-    logger_ = std::move(logger);
-}
+WatchdogWorker::WatchdogWorker(std::size_t max_readers,
+                               std::chrono::milliseconds scan_interval,
+                               unsigned stall_scan_limit,
+                               Logger logger) noexcept
+    : max_readers_(max_readers == 0 ? 1 : max_readers),
+      // Clamp the configuration like a zero cap: a zero interval would spin, and a
+      // zero limit would declare every reader stalled on its first scan.
+      scan_interval_(scan_interval.count() > 0 ? scan_interval
+                                               : std::chrono::milliseconds{1}),
+      stall_scan_limit_(stall_scan_limit == 0 ? 1 : stall_scan_limit),
+      logger_(std::move(logger)) {}
 
-void WatchdogWorker::register_reader(const std::shared_ptr<ReaderActivity>& activity,
-                                     const std::shared_ptr<TcpConnection>& connection) {
-    std::lock_guard lock(mutex_);
-    Entry entry;
-    entry.activity = activity;
-    entry.connection = connection;
-    entry.last_seen = activity->tick.load(std::memory_order_relaxed);
-    watch_.push_back(std::move(entry));
+WatchdogWorker::~WatchdogWorker() {
+    // Belt and braces: operator() already drains on its way out, but a watchdog that
+    // never ran must not leave a joinable thread in an Entry (that would terminate).
+    stop();
+    drain();
 }
 
 void WatchdogWorker::stop() noexcept {
     running_.store(false, std::memory_order_relaxed);
 }
 
-void WatchdogWorker::operator()() {
-    // Shuts a watched connection down and forgets it in the same step: a reader on
-    // its way out is no longer monitored, so a later pass can never pick it again.
-    const auto shutdown = [](const std::weak_ptr<TcpConnection>& connection) {
-        if (auto live = connection.lock()) {
-            std::ignore = live->shutdown(TcpConnection::Shutdown::Both);
-        }
-    };
+void WatchdogWorker::join_reader(Entry& entry) {
+    if (entry.thread.joinable()) { entry.thread.join(); }
+}
 
+void WatchdogWorker::shutdown_reader(Entry& entry) noexcept {
+    // Mark first: a later scan (or the prune loop) must not pick this reader again
+    // while its thread is still winding down.
+    entry.activity->stopping.store(true, std::memory_order_relaxed);
+    if (entry.activity->connection) {
+        std::ignore = entry.activity->connection->shutdown(TcpConnection::Shutdown::Both);
+    }
+}
+
+void WatchdogWorker::reap_finished_locked() {
+    std::erase_if(watch_, [](Entry& entry) {
+        if (!entry.activity->finished.load(std::memory_order_acquire)) { return false; }
+        join_reader(entry);
+        return true;
+    });
+}
+
+void WatchdogWorker::adopt(std::shared_ptr<ReaderActivity> activity, std::thread thread) {
+    Entry entry;
+    entry.activity = std::move(activity);
+    entry.thread = std::move(thread);
+    entry.last_seen = entry.activity->tick.load(std::memory_order_relaxed);
+    // Stamp the ranking key now: the listener set last_read_ns at accept time, so a
+    // brand-new reader is the most recently active one and is never its own victim.
+    entry.last_read_ns = entry.activity->last_read_ns.load(std::memory_order_relaxed);
+
+    std::lock_guard lock(mutex_);
+    if (!running_.load(std::memory_order_relaxed)) {
+        // Stopped while this reader was being spawned: take it down with the rest
+        // rather than leaving an unjoined thread behind.
+        shutdown_reader(entry);
+        join_reader(entry);
+        return;
+    }
+
+    // A reader that already finished frees its slot before we count, so a stale entry
+    // cannot make a live reader look like it is over the cap.
+    reap_finished_locked();
+    watch_.push_back(std::move(entry));
+
+    // Population control. Only readers still running count: an evicted reader keeps
+    // its entry until its thread exits (so it can be joined), and counting it again
+    // would evict a second, live reader.
+    std::size_t live = 0;
+    for (const Entry& existing : watch_) {
+        if (!existing.activity->stopping.load(std::memory_order_relaxed)) { ++live; }
+    }
+    if (live <= max_readers_) { return; }
+
+    std::size_t need = live - max_readers_;
+    // Oldest reads sort first. The cached timestamps are a stable key, so the
+    // comparator never locks and the order cannot shift mid-sort.
+    std::sort(watch_.begin(), watch_.end(), [](const Entry& a, const Entry& b) {
+        return a.last_read_ns < b.last_read_ns;
+    });
+    for (Entry& existing : watch_) {
+        if (need == 0) { break; }
+        if (existing.activity->stopping.load(std::memory_order_relaxed)) { continue; }
+        shutdown_reader(existing);
+        logger_.info("watchdog: pruned idle reader");
+        --need;
+    }
+}
+
+void WatchdogWorker::operator()() {
     while (running_.load(std::memory_order_relaxed)) {
-        std::this_thread::sleep_for(kWatchdogScan);
+        std::this_thread::sleep_for(scan_interval_);
 
         std::lock_guard lock(mutex_);
 
-        // Stall pass: drop readers whose heartbeat has not advanced for a full
-        // window, and cache each survivor's last read so the prune pass can rank it
-        // without touching the weak_ptrs again. erase_if applies the predicate
-        // exactly once per element, so each stalled shutdown is counted once. A reader
-        // that already exited frees a slot too, so both are subtracted from the
-        // listener's prune request below.
-        std::size_t n_stalled = 0;
-        std::size_t n_gone = 0;
+        // One pass over the readers: a finished one is joined here (freeing its slot
+        // immediately), and one whose heartbeat has not advanced for a full window is
+        // shut down. A shut-down reader keeps its entry until the thread really
+        // returns, so it can still be joined -- and `stopping` keeps later scans from
+        // selecting it again.
         std::erase_if(watch_, [&](Entry& entry) {
-            auto activity = entry.activity.lock();
-            if (!activity) { ++n_gone; return true; } // reader gone: its slot is free
-            entry.last_read_ns = activity->last_read_ns.load(std::memory_order_relaxed);
-            const uint64_t now = activity->tick.load(std::memory_order_relaxed);
+            if (entry.activity->finished.load(std::memory_order_acquire)) {
+                join_reader(entry);
+                return true;
+            }
+            if (entry.activity->stopping.load(std::memory_order_relaxed)) {
+                return false; // already on its way out: wait for `finished`
+            }
+            entry.last_read_ns = entry.activity->last_read_ns.load(std::memory_order_relaxed);
+            const uint64_t now = entry.activity->tick.load(std::memory_order_relaxed);
             if (now != entry.last_seen) {
                 entry.last_seen = now;
                 entry.stalled_scans = 0;
                 return false;
             }
-            if (++entry.stalled_scans < kStallScanLimit) { return false; }
-            entry.stalled_scans = 0;
-            shutdown(entry.connection);
-            ++n_stalled;
+            if (++entry.stalled_scans < stall_scan_limit_) { return false; }
+            shutdown_reader(entry);
             logger_.warn("watchdog: stalled reader shut down");
-            return true;
+            return false; // kept: the thread still has to be joined
         });
-
-        // Prune pass: the listener asks for `n` readers to go when it spawns past its
-        // cap. Stalls already freed `n_stalled` of them, so only the remainder is
-        // taken. Sorting the watch list in place (its cached timestamps are a stable
-        // key, so the comparator never locks and the order cannot shift mid-sort)
-        // puts the newest reads first and the oldest at the tail.
-        const std::size_t requested = prune_requests_ != nullptr
-            ? prune_requests_->exchange(0, std::memory_order_relaxed)
-            : 0;
-        const std::size_t freed = n_stalled + n_gone;
-        const std::size_t need = requested > freed ? requested - freed : 0;
-        if (need != 0) {
-            std::sort(watch_.begin(), watch_.end(), [](const Entry& a, const Entry& b) {
-                return a.last_read_ns > b.last_read_ns; // most recent first
-            });
-            const std::size_t count = std::min(need, watch_.size());
-            for (std::size_t index = watch_.size() - count; index < watch_.size(); ++index) {
-                shutdown(watch_[index].connection);
-                logger_.info("watchdog: pruned idle reader");
-            }
-            watch_.resize(watch_.size() - count); // drop the oldest (tail)
-        }
     }
+
+    drain();
+}
+
+void WatchdogWorker::drain() {
+    std::vector<Entry> entries;
+    {
+        std::lock_guard lock(mutex_);
+        entries.swap(watch_);
+    }
+    // Shut every socket down first: a reader blocked in receive only returns once its
+    // connection is gone, so joining before shutting down could wait forever.
+    for (Entry& entry : entries) { shutdown_reader(entry); }
+    for (Entry& entry : entries) { join_reader(entry); }
 }
 
 // --- ListenerWorker ---------------------------------------------------------
@@ -477,43 +537,30 @@ ListenerWorker::ListenerWorker(
       backlog_(backlog),
       store_queue_(store_queue),
       peers_(peers),
-      logger_(std::move(logger)) {
-    watchdog_.configure(n_prune_, logger_);
-}
+      watchdog_(max_readers_,
+                WatchdogWorker::kDefaultScanInterval,
+                WatchdogWorker::kDefaultStallScanLimit,
+                logger),
+      logger_(std::move(logger)) {}
 
 ListenerWorker::~ListenerWorker() {
     stop();
+    // The watchdog joins the reader threads as part of shutting down, so there is
+    // nothing left for the listener to reap here.
     if (watchdog_thread_.joinable()) { watchdog_thread_.join(); }
-
-    std::lock_guard lock(readers_mutex_);
-    for (ReaderHandle& handle : readers_) {
-        if (handle.connection) {
-            std::ignore = handle.connection->shutdown(TcpConnection::Shutdown::Both);
-        }
-    }
-    for (ReaderHandle& handle : readers_) {
-        if (handle.thread.joinable()) { handle.thread.join(); }
-    }
 }
 
 void ListenerWorker::stop() noexcept {
     if (!running_.exchange(false)) { return; }
     logger_.info("listener stopping");
+    // The watchdog stops scanning and drains its readers (shuts their sockets down,
+    // then joins the threads) when its loop exits.
     watchdog_.stop();
     // Break a pending accept(): dial our own listener. The loop observes
     // running_ == false and exits without spawning a reader for the wake socket.
     if (auto wake = TcpConnection::connect(local_address_, port_)) {
         std::ignore = wake->shutdown(TcpConnection::Shutdown::Both);
     }
-}
-
-void ListenerWorker::reap_finished_readers() {
-    std::lock_guard lock(readers_mutex_);
-    std::erase_if(readers_, [](ReaderHandle& handle) {
-        if (!handle.done->load(std::memory_order_acquire)) { return false; }
-        if (handle.thread.joinable()) { handle.thread.join(); }
-        return true;
-    });
 }
 
 void ListenerWorker::operator()() {
@@ -543,77 +590,34 @@ void ListenerWorker::operator()() {
         if (!running_.load(std::memory_order_relaxed)) { break; } // drop the wake socket
 
         accepted->with_keep_alive(true)
-                .with_receive_timeout(kReaderTickPeriod)
                 .with_tcp_nodelay(true);
 
-        auto connection = std::make_shared<TcpConnection>(std::move(*accepted));
-        auto activity = std::make_shared<ReaderActivity>();
+        // One shared record per reader: heartbeat, live socket and lifecycle flags.
+        // The listener keeps no handle of its own -- the thread goes straight to the
+        // watchdog, which owns it from here on and joins it when the reader reports
+        // `finished`.
+        auto activity = std::make_shared<ReaderActivity>(
+            std::make_shared<TcpConnection>(std::move(*accepted)));
         // A connection that never reads still needs an ordering floor, so start its
         // stamp at accept time instead of 0.
         activity->last_read_ns.store(steady_now_ns(), std::memory_order_relaxed);
-        watchdog_.register_reader(activity, connection);
 
-        auto done = std::make_shared<std::atomic<bool>>(false);
-        ReaderWorker reader{store_queue_, connection, std::move(activity), peers_};
-        ReaderHandle handle{
-            std::thread{[reader = std::move(reader), done]() mutable {
-                reader();
-                done->store(true, std::memory_order_release);
-            }},
-            connection,
-            done};
-
-        // Reap finished readers before counting: a reader that already exited (e.g.
-        // one dropped by a disconnect, with no accept since) has freed its slot, so
-        // its stale handle must not inflate the count and make the watchdog prune a
-        // live reader -- which tears the fresh connection straight back down.
-        reap_finished_readers();
-        {
-            std::lock_guard lock(readers_mutex_);
-            readers_.push_back(std::move(handle));
-            // Count only live readers for the same reason: a handle whose reader has
-            // already finished does not occupy the cap even if it is not reaped yet.
-            std::size_t live = 0;
-            for (const ReaderHandle& existing : readers_) {
-                if (!existing.done->load(std::memory_order_acquire)) { ++live; }
-            }
-            // Past the cap: ask the watchdog to drop enough idle readers to make room
-            // for this one. It prunes asynchronously, so the thread count may overshoot
-            // by the arrivals within one scan window.
-            if (live > max_readers_) {
-                n_prune_.fetch_add(live - max_readers_, std::memory_order_relaxed);
-            }
-        }
+        ReaderWorker reader{store_queue_, activity, peers_,
+                            ReaderWorker::kDefaultReadChunk,
+                            ReaderWorker::kDefaultTickPeriod,
+                            logger_};
+        watchdog_.adopt(
+            std::move(activity),
+            std::thread{[reader = std::move(reader)]() mutable { reader(); }});
     }
 
     watchdog_.stop();
     if (watchdog_thread_.joinable()) { watchdog_thread_.join(); }
-
-    std::vector<ReaderHandle> readers;
-    {
-        std::lock_guard lock(readers_mutex_);
-        readers.swap(readers_);
-    }
-    for (ReaderHandle& handle : readers) {
-        if (handle.connection) {
-            std::ignore = handle.connection->shutdown(TcpConnection::Shutdown::Both);
-        }
-    }
-    for (ReaderHandle& handle : readers) {
-        if (handle.thread.joinable()) { handle.thread.join(); }
-    }
 }
 
 // --- SenderWorker -----------------------------------------------------------
 
 namespace {
-    // Outbound dial/send policy: a failed dial or send is retried a bounded
-    // number of times before the peer is declared unreachable.
-    constexpr unsigned kSendAttempts = 3;
-    constexpr auto kSendRetryDelay = std::chrono::milliseconds{100};
-    // A peer that stops draining its socket must not park the sender forever.
-    constexpr auto kSendTimeout = std::chrono::milliseconds{500};
-
     // Pushes every byte of `data`; a partial send resumes where the previous one
     // stopped. Returns false as soon as the socket reports a failure.
     bool send_all(TcpConnection& connection, std::span<const std::byte> data) {
@@ -632,11 +636,19 @@ SenderWorker::SenderWorker(
     ThreadQueue<Event>& sender_queue,
     PeerTable& peers,
     LocalEndpoints local,
+    unsigned send_attempts,
+    std::chrono::milliseconds retry_delay,
+    std::chrono::milliseconds send_timeout,
     Logger logger)
     : store_queue_(store_queue),
       sender_queue_(sender_queue),
       peers_(peers),
       local_(std::move(local)),
+      send_attempts_(send_attempts == 0 ? 1 : send_attempts),
+      retry_delay_(retry_delay),
+      // A zero timeout would mean "block forever", which is exactly what this bound
+      // exists to prevent.
+      send_timeout_(send_timeout.count() > 0 ? send_timeout : kDefaultSendTimeout),
       logger_(std::move(logger)) {}
 
 TcpConnection* SenderWorker::ensure_connection(uint64_t peer_id) {
@@ -661,7 +673,7 @@ TcpConnection* SenderWorker::open(uint64_t peer_id,
     auto connected = TcpConnection::connect(ip, port);
     if (!connected) { return nullptr; }
 
-    connected->with_tcp_nodelay(true).with_keep_alive(true).with_send_timeout(kSendTimeout);
+    connected->with_tcp_nodelay(true).with_keep_alive(true).with_send_timeout(send_timeout_);
 
     const auto frame = wire::encode(hello);
     if (!frame || !send_all(*connected, *frame)) {
@@ -812,7 +824,7 @@ void SenderWorker::operator()() {
             wire::make_chat_message(0, 0, message->payload));
 
         bool delivered = false;
-        for (unsigned attempt = 0; frame && attempt < kSendAttempts; ++attempt) {
+        for (unsigned attempt = 0; frame && attempt < send_attempts_; ++attempt) {
             TcpConnection* connection = ensure_connection(message->peer_id);
             if (connection != nullptr && send_all(*connection, *frame)) {
                 peers_.mark_connected(message->peer_id);
@@ -825,8 +837,8 @@ void SenderWorker::operator()() {
             // The socket is suspect (or the dial failed): drop it so the next
             // attempt starts from a fresh connection.
             drop_connection(message->peer_id);
-            if (attempt + 1 < kSendAttempts) {
-                std::this_thread::sleep_for(kSendRetryDelay);
+            if (attempt + 1 < send_attempts_) {
+                std::this_thread::sleep_for(retry_delay_);
             }
         }
 
@@ -862,10 +874,18 @@ void MainWorker::operator()() {
     SenderWorker sender{store_queue, sender_queue, peers,
                         LocalEndpoints{{wire::Endpoint{local_address_,
                                                        static_cast<uint16_t>(port_)}}},
+                        SenderWorker::kDefaultSendAttempts,
+                        SenderWorker::kDefaultRetryDelay,
+                        SenderWorker::kDefaultSendTimeout,
                         logger};
-    KeyboardListenerWorker keyboard{terminal, render_queue, logger};
+    KeyboardListenerWorker keyboard{
+        terminal, render_queue,
+        KeyboardListenerWorker::kDefaultIdleTimeoutMs,
+        KeyboardListenerWorker::kDefaultSequenceTimeoutMs,
+        logger};
     ListenerWorker listener{local_address_, port_, store_queue, peers,
-                            kMaxReaderThreads, 16, logger};
+                            ListenerWorker::kDefaultMaxReaders,
+                            ListenerWorker::kDefaultBacklog, logger};
 
     logger.info("main: starting on " + local_address_ + ":" + std::to_string(port_));
 

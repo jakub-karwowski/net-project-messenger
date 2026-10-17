@@ -6,6 +6,7 @@
 #include "TcpSocket.hpp"
 #include "Wire.hpp"
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <iosfwd>
@@ -181,9 +182,16 @@ private:
 };
 
 struct KeyboardListenerWorker {
+    // Polling cadence, and how long an escape sequence may pause between its bytes
+    // before the lead byte is treated as a standalone key.
+    static constexpr int kDefaultIdleTimeoutMs = 100;
+    static constexpr int kDefaultSequenceTimeoutMs = 50;
+
     KeyboardListenerWorker(
         const TerminalUI& terminal,
         ThreadQueue<Event>& render_queue,
+        int idle_timeout_ms = kDefaultIdleTimeoutMs,
+        int sequence_timeout_ms = kDefaultSequenceTimeoutMs,
         Logger logger = {}
     );
     void stop() noexcept; // makes the reader return within one poll period
@@ -191,6 +199,8 @@ struct KeyboardListenerWorker {
 private:
     const TerminalUI& terminal_;
     ThreadQueue<Event>& render_queue_;
+    int idle_timeout_ms_;     // how long one poll may block waiting for a byte
+    int sequence_timeout_ms_; // how long the rest of a key sequence may take
     Logger logger_;
     std::atomic<bool> running_{true};
 };
@@ -271,31 +281,51 @@ private:
     std::string log_path_;
 };
 
-// Heartbeat shared between a reader and the watchdog. `tick` is a monotonic counter
-// the reader bumps as it makes progress: the watchdog compares successive snapshots,
-// so a stalled reader (unchanged counter past a deadline) is distinguishable from a
-// healthy one -- unlike a plain bool. `last_read_ns` is the steady-clock time of the
-// last bytes the reader actually received, so the watchdog can rank readers by
-// idleness and prune the least recently active ones first when over the reader cap.
+// Everything the watchdog needs to know about one reader, and the one record the
+// reader and the watchdog share -- there is no separate per-reader handle type.
+// `tick` is a monotonic counter the reader bumps as it makes progress: the watchdog
+// compares successive snapshots, so a stalled reader (unchanged counter past a
+// deadline) is distinguishable from a healthy one -- unlike a plain bool.
+// `last_read_ns` is the steady-clock time of the last bytes the reader actually
+// received, so the watchdog can rank readers by idleness and drop the least
+// recently active ones first when over the reader cap. `connection` is the live
+// socket the watchdog shuts down to unblock a stalled or evicted reader, and the
+// two flags carry the lifecycle: the reader sets `finished` as it returns (the
+// watchdog then owns joining its thread), the watchdog sets `stopping` before it
+// shuts the socket down so the same reader is never selected twice.
 struct ReaderActivity {
+    explicit ReaderActivity(std::shared_ptr<TcpConnection> connection) noexcept
+        : connection(std::move(connection)) {}
+
     std::atomic<uint64_t> tick{0};
     std::atomic<int64_t> last_read_ns{0};
+    std::shared_ptr<TcpConnection> connection;
+    std::atomic<bool> finished{false};
+    std::atomic<bool> stopping{false};
 };
 
 struct ReaderWorker {
+    // Receive buffer size, and how long one receive may block. The tick period is
+    // kept well below the watchdog's stall window so a healthy idle reader still
+    // ticks every period instead of looking stuck.
+    static constexpr std::size_t kDefaultReadChunk = 4096;
+    static constexpr std::chrono::milliseconds kDefaultTickPeriod{200};
+
     ReaderWorker(
         ThreadQueue<Event>& store_queue,
-        std::shared_ptr<TcpConnection> connection,
         std::shared_ptr<ReaderActivity> activity,
         PeerTable& peers,
+        std::size_t read_chunk = kDefaultReadChunk,
+        std::chrono::milliseconds tick_period = kDefaultTickPeriod,
         Logger logger = {}
     );
     void operator()();
 private:
     ThreadQueue<Event>& store_queue_;
-    std::shared_ptr<TcpConnection> connection_; // reader owns the live connection while it reads
-    std::shared_ptr<ReaderActivity> activity_;  // reader owns the heartbeat while it reads
+    std::shared_ptr<ReaderActivity> activity_; // heartbeat + live connection, shared with the watchdog
     PeerTable& peers_;
+    std::size_t read_chunk_;                // bytes per receive
+    std::chrono::milliseconds tick_period_; // bounded receive: the reader's poll period
     Logger logger_;
     wire::Decoder decoder_;
     uint64_t peer_id_{0}; // our name for the peer: minted on handshake, or the id it re-presents
@@ -308,74 +338,109 @@ private:
     void remember_assigned_id(uint64_t peer_id, uint64_t assigned_id);
 };
 
+// Owns every reader thread and the reader population. The listener hands it a
+// freshly spawned ReaderWorker together with the shared ReaderActivity tracking it,
+// and the watchdog joins that thread once the reader reports `finished`. Each scan
+// also unsticks a reader whose heartbeat stopped advancing, and `adopt` enforces the
+// cap by shutting down the least-recently-active readers -- so the listener keeps no
+// reader handles and no prune counter of its own.
 struct WatchdogWorker {
-    WatchdogWorker() = default;
-    // Shares the listener's prune-request counter with the watchdog: the listener
-    // increments it when it spawns a reader past the cap, and the watchdog drains it
-    // and shuts down that many least-recently-active readers. A watchdog that was
-    // never configured holds no counter and never prunes.
-    void configure(std::atomic<std::size_t>& prune_requests, Logger logger = {}) noexcept;
-    void register_reader(const std::shared_ptr<ReaderActivity>& activity,
-                         const std::shared_ptr<TcpConnection>& connection);
+    // Scan cadence, and how many consecutive scans a reader's tick may stay unchanged
+    // before it counts as wedged. The defaults are the production values; both are
+    // constructor parameters so tests can drive the watchdog faster.
+    static constexpr std::chrono::milliseconds kDefaultScanInterval{100};
+    static constexpr unsigned kDefaultStallScanLimit = 10; // 10 * 100 ms = 1 s
+
+    explicit WatchdogWorker(
+        std::size_t max_readers,
+        std::chrono::milliseconds scan_interval = kDefaultScanInterval,
+        unsigned stall_scan_limit = kDefaultStallScanLimit,
+        Logger logger = {}
+    ) noexcept;
+    ~WatchdogWorker();
+
+    // Takes ownership of a freshly spawned reader: its thread handle and its activity
+    // record. Joins readers that have already finished (freeing their slots) and, if
+    // this one pushes the population past `max_readers`, shuts down enough
+    // least-recently-active readers to make room. A reader adopted after stop() is
+    // shut down and joined immediately, so adopt never leaves an unjoined thread.
+    void adopt(std::shared_ptr<ReaderActivity> activity, std::thread thread);
     void stop() noexcept;
-    void operator()(); // scans registrations, reaps finished readers, prunes stalled and idle ones
+    void operator()(); // scans readers: joins finished ones, unsticks stalled ones
 private:
     struct Entry {
-        std::weak_ptr<ReaderActivity> activity;  // never owns: the reader controls the heartbeat's lifetime
-        std::weak_ptr<TcpConnection> connection; // used to shut down a stalled or pruned reader
-        uint64_t last_seen = 0;
-        unsigned stalled_scans = 0;              // scans since the tick last changed
-        int64_t last_read_ns = 0;                // snapshot at scan time: the sort key (stable, lock-free)
+        std::shared_ptr<ReaderActivity> activity; // owns the heartbeat and the socket
+        std::thread thread;                       // joined once `activity->finished`
+        uint64_t last_seen = 0;                   // last observed tick
+        unsigned stalled_scans = 0;               // scans since the tick last changed
+        int64_t last_read_ns = 0;                 // snapshot at scan/adopt time: the sort key
     };
+
+    // Joins `entry.thread` when it holds a running thread (tests adopt empty handles).
+    static void join_reader(Entry& entry);
+    // Marks the reader stopping (so it is never picked twice) and shuts its socket
+    // down, which unblocks the reader's receive.
+    static void shutdown_reader(Entry& entry) noexcept;
+    // Joins and forgets every finished reader. The caller holds `mutex_`.
+    void reap_finished_locked();
+    // Shuts every remaining reader down and joins it. Idempotent.
+    void drain();
+
     std::mutex mutex_;
     std::vector<Entry> watch_;
-    std::atomic<std::size_t>* prune_requests_{nullptr}; // listener-owned; null means never prune
+    std::size_t max_readers_;                 // hard cap on concurrently running readers (>= 1)
+    std::chrono::milliseconds scan_interval_; // watchdog scan cadence
+    unsigned stall_scan_limit_;               // scans without a tick before a reader is wedged
     Logger logger_;
     std::atomic<bool> running_{true};
 };
 
 struct ListenerWorker {
+    // Defaults for the application's listen setup.
+    static constexpr std::size_t kDefaultMaxReaders = 8;
+    static constexpr int kDefaultBacklog = 16;
+
     ListenerWorker(
         std::string local_address,
         unsigned port,
         ThreadQueue<Event>& store_queue,
         PeerTable& peers,
-        std::size_t max_readers,
-        int backlog = 16,
+        std::size_t max_readers = kDefaultMaxReaders,
+        int backlog = kDefaultBacklog,
         Logger logger = {}
     );
     ~ListenerWorker();
-    void stop() noexcept; // unblocks accept(), stops the watchdog
+    void stop() noexcept; // unblocks accept(), stops the watchdog (which joins the readers)
     void operator()();    // spawns the watchdog internally
 private:
-    struct ReaderHandle {
-        std::thread thread;
-        std::shared_ptr<TcpConnection> connection;
-        std::shared_ptr<std::atomic<bool>> done; // set by the reader when it exits
-    };
-    void reap_finished_readers();
-
     std::string local_address_;
     unsigned port_;
     std::size_t max_readers_; // hard cap on concurrently running readers (>= 1)
     int backlog_;
     ThreadQueue<Event>& store_queue_;
     PeerTable& peers_;
-    WatchdogWorker watchdog_;
+    WatchdogWorker watchdog_; // owns the reader threads and enforces max_readers_
     std::thread watchdog_thread_;
-    std::mutex readers_mutex_;
-    std::vector<ReaderHandle> readers_;
-    std::atomic<std::size_t> n_prune_{0}; // readers the watchdog should drop to get back under the cap
     Logger logger_;
     std::atomic<bool> running_{true};
 };
 
 struct SenderWorker {
+    // Outbound dial/send policy: a failed dial or send is retried `send_attempts`
+    // times, `retry_delay` apart, and a peer that stops draining its socket cannot
+    // park the sender longer than `send_timeout` per send.
+    static constexpr unsigned kDefaultSendAttempts = 3;
+    static constexpr std::chrono::milliseconds kDefaultRetryDelay{100};
+    static constexpr std::chrono::milliseconds kDefaultSendTimeout{500};
+
     SenderWorker(
         ThreadQueue<Event>& store_queue,
         ThreadQueue<Event>& sender_queue,
         PeerTable& peers,
         LocalEndpoints local = {},
+        unsigned send_attempts = kDefaultSendAttempts,
+        std::chrono::milliseconds retry_delay = kDefaultRetryDelay,
+        std::chrono::milliseconds send_timeout = kDefaultSendTimeout,
         Logger logger = {}
     );
     void operator()();
@@ -420,6 +485,9 @@ private:
     ThreadQueue<Event>& sender_queue_;
     PeerTable& peers_;
     LocalEndpoints local_;                                     // endpoints advertised on dials
+    unsigned send_attempts_;                                   // dial/send tries per message
+    std::chrono::milliseconds retry_delay_;                    // pause between attempts
+    std::chrono::milliseconds send_timeout_;                   // bound on one send
     std::unordered_map<uint64_t, TcpConnection> connections_; // outbound, one per peer
     Logger logger_;
 };
