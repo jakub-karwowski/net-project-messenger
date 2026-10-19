@@ -823,6 +823,9 @@ void SenderWorker::operator()() {
         bool delivered = false;
         bool dropped = false;
         for (unsigned attempt = 0; frame && attempt < send_attempts_; ++attempt) {
+            // Port 0 is "no dialable address" (a duplex-only peer that advertises
+            // none): a redial cannot succeed, so do not sleep through the retries.
+            if (!peers_.tx_of(message->peer_id) && peer->address.port == 0) { break; }
             const auto connection = ensure_connection(message->peer_id);
             auto sent = connection ? transport_->send(*connection, *frame)
                                    : std::unexpected(SocketError::ConnectionNotFound);
