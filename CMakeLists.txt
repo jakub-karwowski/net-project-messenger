@@ -3,6 +3,10 @@ project(NetProject LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 find_package(Threads REQUIRED)
 
 set(CMAKE_CXX_STANDARD 23)
@@ -14,8 +18,17 @@ enable_testing()
 add_subdirectory(TcpSocket)
 add_subdirectory(TerminalUI)
 
-add_executable(app main.cpp ThreadWorkers.cpp)
-target_link_libraries(app PRIVATE TcpSocket TerminalUI Threads::Threads)
+# Everything the app and the worker tests share (workers, sessions, transports).
+add_library(app_core STATIC
+  ThreadWorkers.cpp
+  PeerSession.cpp
+  BlockingOutbound.cpp
+  Transport.cpp)
+target_include_directories(app_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(app_core PUBLIC TcpSocket TerminalUI Threads::Threads)
+
+add_executable(app main.cpp)
+target_link_libraries(app PRIVATE app_core)
 
 add_executable(test_queue test_queue.cpp)
 target_link_libraries(test_queue PRIVATE Threads::Threads)
@@ -34,26 +47,26 @@ target_link_libraries(test_terminal PRIVATE TerminalUI)
 add_executable(test_chat test_chat.cpp)
 target_link_libraries(test_chat PRIVATE TerminalUI Threads::Threads)
 
-add_executable(test_p2p test_p2p.cpp ThreadWorkers.cpp)
-target_link_libraries(test_p2p PRIVATE TcpSocket TerminalUI Threads::Threads)
+add_executable(test_p2p test_p2p.cpp)
+target_link_libraries(test_p2p PRIVATE app_core)
 
-add_executable(test_workers test_workers.cpp ThreadWorkers.cpp)
-target_link_libraries(test_workers PRIVATE TcpSocket TerminalUI Threads::Threads)
+add_executable(test_workers test_workers.cpp)
+target_link_libraries(test_workers PRIVATE app_core)
 
-add_executable(test_sender test_sender.cpp ThreadWorkers.cpp)
-target_link_libraries(test_sender PRIVATE TcpSocket TerminalUI Threads::Threads)
+add_executable(test_sender test_sender.cpp)
+target_link_libraries(test_sender PRIVATE app_core)
 
-add_executable(test_store test_store.cpp ThreadWorkers.cpp)
-target_link_libraries(test_store PRIVATE TcpSocket TerminalUI Threads::Threads)
+add_executable(test_store test_store.cpp)
+target_link_libraries(test_store PRIVATE app_core)
 
-add_executable(test_render test_render.cpp ThreadWorkers.cpp)
-target_link_libraries(test_render PRIVATE TcpSocket TerminalUI Threads::Threads)
+add_executable(test_render test_render.cpp)
+target_link_libraries(test_render PRIVATE app_core)
 
-add_executable(test_main test_main.cpp ThreadWorkers.cpp)
-target_link_libraries(test_main PRIVATE TcpSocket TerminalUI Threads::Threads)
+add_executable(test_main test_main.cpp)
+target_link_libraries(test_main PRIVATE app_core)
 
-add_executable(test_logger test_logger.cpp ThreadWorkers.cpp)
-target_link_libraries(test_logger PRIVATE TcpSocket TerminalUI Threads::Threads)
+add_executable(test_logger test_logger.cpp)
+target_link_libraries(test_logger PRIVATE app_core)
 
 add_test(NAME test_pool COMMAND test_pool)
 add_test(NAME test_queue COMMAND test_queue)

@@ -1,6 +1,10 @@
 #pragma once
 
+#include "AppConfig.hpp"
 #include "Events.hpp"
+#include "Logger.hpp"
+#include "OutboundTransport.hpp"
+#include "PeerSession.hpp"
 #include "TerminalUI.hpp"
 #include "ThreadQueue.hpp"
 #include "TcpSocket.hpp"
@@ -32,36 +36,6 @@ struct LocalEndpoints {
 // generates the id by which it refers to the *other* side (see ConnectInfo); this
 // single source keeps the ids unique across every reader and the store.
 uint64_t next_local_peer_id() noexcept;
-
-// Diagnostics channel, separate from the user-facing EventError (which lands in
-// the chat UI). Records are pushed onto one shared queue and consumed by the
-// single LoggerWorker, so log lines never interleave and never touch the terminal
-// the render thread is drawing on.
-enum class LogLevel : uint8_t { Info, Warn, Error };
-
-struct LogRecord {
-    LogLevel level{LogLevel::Info};
-    std::string message;
-};
-
-// A cheap, copyable producer handle onto the shared log queue. A default Logger
-// has no queue and silently drops every record, so workers can be built without
-// a logger.
-class Logger {
-public:
-    Logger() = default;
-    explicit Logger(ThreadQueue<LogRecord>* logger_queue) noexcept : queue_(logger_queue) {}
-
-    void info(std::string message) const { log(LogLevel::Info, std::move(message)); }
-    void warn(std::string message) const { log(LogLevel::Warn, std::move(message)); }
-    void error(std::string message) const { log(LogLevel::Error, std::move(message)); }
-    void log(LogLevel level, std::string message) const {
-        if (queue_ != nullptr) { (void)queue_->emplace(LogRecord{level, std::move(message)}); }
-    }
-
-private:
-    ThreadQueue<LogRecord>* queue_{nullptr};
-};
 
 // The single consumer: owns the sink and writes one line per record. Stops once
 // the queue is shut down and drained.
@@ -271,14 +245,12 @@ private:
 // / listener threads, runs the render loop here, and shuts everything down in
 // order once the render loop returns.
 struct MainWorker {
-    MainWorker(std::string local_address,
-               unsigned port,
-               std::string log_path);
+    explicit MainWorker(AppConfig config);
+    // Threads-mode defaults with just the listen address, port and log file.
+    MainWorker(std::string local_address, unsigned port, std::string log_path);
     void operator()();
 private:
-    std::string local_address_;
-    unsigned port_;
-    std::string log_path_;
+    AppConfig config_;
 };
 
 // Everything the watchdog needs to know about one reader, and the one record the
@@ -321,21 +293,10 @@ struct ReaderWorker {
     );
     void operator()();
 private:
-    ThreadQueue<Event>& store_queue_;
     std::shared_ptr<ReaderActivity> activity_; // heartbeat + live connection, shared with the watchdog
-    PeerTable& peers_;
     std::size_t read_chunk_;                // bytes per receive
     std::chrono::milliseconds tick_period_; // bounded receive: the reader's poll period
-    Logger logger_;
-    wire::Decoder decoder_;
-    uint64_t peer_id_{0}; // our name for the peer: minted on handshake, or the id it re-presents
-    // Unique owner id of this reader's inbound connection. A reader that a newer
-    // connection superseded must not report the (still live) peer as gone on exit.
-    uint64_t connection_id_{next_local_peer_id()};
-
-    // Keeps the name the peer uses for us, so the next ConnectInfo we send it
-    // re-presents that name and it recognises us after a reconnect.
-    void remember_assigned_id(uint64_t peer_id, uint64_t assigned_id);
+    PeerSession session_;                   // protocol state for this connection
 };
 
 // Owns every reader thread and the reader population. The listener hands it a
@@ -443,18 +404,30 @@ struct SenderWorker {
         std::chrono::milliseconds send_timeout = kDefaultSendTimeout,
         Logger logger = {}
     );
+    // Same policy over a caller-owned transport, which must outlive the sender
+    // (the constructor above owns a BlockingOutbound with `send_timeout`).
+    SenderWorker(
+        ThreadQueue<Event>& store_queue,
+        ThreadQueue<Event>& sender_queue,
+        PeerTable& peers,
+        OutboundTransport& transport,
+        LocalEndpoints local = {},
+        unsigned send_attempts = kDefaultSendAttempts,
+        std::chrono::milliseconds retry_delay = kDefaultRetryDelay,
+        Logger logger = {}
+    );
     void operator()();
 private:
     // Returns the cached outbound connection for `peer_id`, creating it from the
     // address in `peers_` on first use and sending a ConnectInfo that names the
-    // peer. Returns nullptr when the peer is unknown or the dial fails.
-    TcpConnection* ensure_connection(uint64_t peer_id);
+    // peer. Returns nullopt when the peer is unknown or the dial fails.
+    std::optional<OutboundTransport::Handle> ensure_connection(uint64_t peer_id);
     // Dials `ip:port`, sends `hello` as the first frame and caches the connection
-    // under `peer_id`. Returns nullptr (closing the socket) on any failure.
-    TcpConnection* open(uint64_t peer_id,
-                        const std::string& ip,
-                        uint16_t port,
-                        const wire::Message& hello);
+    // under `peer_id`. Returns nullopt (nothing left open) on any failure.
+    std::optional<OutboundTransport::Handle> open(uint64_t peer_id,
+                                                  const std::string& ip,
+                                                  uint16_t port,
+                                                  const wire::Message& hello);
     // Handles a render-initiated dial: opens the connection and reports the
     // outcome to the store (EventPeerDialed on success, EventPeerDisconnected on
     // failure).
@@ -487,8 +460,9 @@ private:
     LocalEndpoints local_;                                     // endpoints advertised on dials
     unsigned send_attempts_;                                   // dial/send tries per message
     std::chrono::milliseconds retry_delay_;                    // pause between attempts
-    std::chrono::milliseconds send_timeout_;                   // bound on one send
-    std::unordered_map<uint64_t, TcpConnection> connections_; // outbound, one per peer
+    std::unique_ptr<OutboundTransport> owned_transport_;       // set when the sender built its own
+    OutboundTransport* transport_;                             // socket ops only; policy stays here
+    std::unordered_map<uint64_t, OutboundTransport::Handle> connections_; // outbound, one per peer
     Logger logger_;
 };
 }
