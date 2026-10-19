@@ -30,6 +30,11 @@ public:
     // true: WouldBlock means the transport's tx buffer is full (backpressure); the
     // message is dropped and counted, with no retry, sleep or re-dial.
     virtual bool backpressure_is_drop() const noexcept { return false; }
+    // true: the socket a peer dialed us on is also our write channel (its tx slot
+    // is filled by the FrameChannel), so on the peer's ConnectInfo the sender
+    // answers the handshake on that socket instead of dialing back. false
+    // (default): simplex -- the sender dials the peer's advertised endpoint.
+    virtual bool duplex() const noexcept { return false; }
 };
 
 // Today's behaviour: one blocking TcpConnection per handle, send_all with

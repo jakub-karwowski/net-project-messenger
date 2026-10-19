@@ -214,25 +214,59 @@ bool PeerTable::mark_connected(uint64_t peer_id) {
     return true;
 }
 
-bool PeerTable::set_connection(uint64_t peer_id, uint64_t connection_id) {
-    if (peer_id == 0 || connection_id == 0) { return false; }
+std::optional<ChannelRef> PeerTable::attach_rx(uint64_t peer_id, ChannelRef ref) {
+    if (peer_id == 0 || ref.connection_id == 0) { return std::nullopt; }
     std::lock_guard lock(mutex_);
-    // A newer connection for the same peer takes over ownership; whoever held it
-    // before is superseded and must not report the peer gone when it exits.
-    owners_[peer_id] = connection_id;
+    // A newer channel for the same peer takes over; whoever held the slot before
+    // is superseded and must not report the peer gone when it closes.
+    auto& slot = slots_[peer_id].rx;
+    std::optional<ChannelRef> previous;
+    if (slot && slot->connection_id != ref.connection_id) { previous = slot; }
+    slot = ref;
     if (const auto it = peers_.find(peer_id); it != peers_.end()) {
         it->second.status = Status::Connected;
     }
-    return true;
+    return previous;
 }
 
-bool PeerTable::release_connection(uint64_t peer_id, uint64_t connection_id) {
+std::optional<ChannelRef> PeerTable::attach_tx(uint64_t peer_id, ChannelRef ref) {
+    if (peer_id == 0 || ref.connection_id == 0) { return std::nullopt; }
     std::lock_guard lock(mutex_);
-    const auto it = owners_.find(peer_id);
-    if (it == owners_.end() || it->second != connection_id) {
-        return false; // superseded by a newer connection (or never owned it)
-    }
-    owners_.erase(it);
+    auto& slot = slots_[peer_id].tx;
+    std::optional<ChannelRef> previous;
+    if (slot && slot->connection_id != ref.connection_id) { previous = slot; }
+    slot = ref;
+    return previous;
+}
+
+std::optional<ChannelRef> PeerTable::tx_of(uint64_t peer_id) const {
+    std::lock_guard lock(mutex_);
+    const auto it = slots_.find(peer_id);
+    if (it == slots_.end()) { return std::nullopt; }
+    return it->second.tx;
+}
+
+std::optional<ChannelRef> PeerTable::clear_tx(uint64_t peer_id) {
+    std::lock_guard lock(mutex_);
+    const auto it = slots_.find(peer_id);
+    if (it == slots_.end()) { return std::nullopt; }
+    auto previous = it->second.tx;
+    it->second.tx.reset();
+    if (!it->second.rx) { slots_.erase(it); }
+    return previous;
+}
+
+bool PeerTable::release(uint64_t peer_id, uint64_t connection_id) {
+    if (connection_id == 0) { return false; }
+    std::lock_guard lock(mutex_);
+    const auto it = slots_.find(peer_id);
+    if (it == slots_.end()) { return false; } // never bound (or already released)
+    Slots& slots = it->second;
+    const bool rx_current = slots.rx && slots.rx->connection_id == connection_id;
+    if (rx_current) { slots.rx.reset(); }
+    if (slots.tx && slots.tx->connection_id == connection_id) { slots.tx.reset(); }
+    if (!slots.rx && !slots.tx) { slots_.erase(it); }
+    if (!rx_current) { return false; } // superseded, or only the tx slot matched
     if (const auto peer = peers_.find(peer_id); peer != peers_.end()) {
         peer->second.status = Status::Disconnected;
     }
@@ -591,8 +625,8 @@ SenderWorker::SenderWorker(
       logger_(std::move(logger)) {}
 
 std::optional<OutboundTransport::Handle> SenderWorker::ensure_connection(uint64_t peer_id) {
-    if (const auto it = connections_.find(peer_id); it != connections_.end()) {
-        return it->second; // reuse the connection opened for an earlier message
+    if (const auto tx = peers_.tx_of(peer_id)) {
+        return tx->handle; // reuse the connection opened for an earlier message
     }
 
     const auto entry = peers_.lookup(peer_id);
@@ -613,14 +647,15 @@ std::optional<OutboundTransport::Handle> SenderWorker::open(uint64_t peer_id,
     if (!frame) { return std::nullopt; }
     auto handle = transport_->open(ip, port, *frame);
     if (!handle) { return std::nullopt; }
-    connections_[peer_id] = *handle;
+    (void)peers_.attach_tx(peer_id, ChannelRef{next_local_peer_id(), *handle});
     return *handle;
 }
 
 void SenderWorker::establish_ack(uint64_t peer_id,
                                  uint64_t assigned_peer_id,
                                  const std::vector<wire::Endpoint>& endpoints,
-                                 bool reestablish) {
+                                 bool reestablish,
+                                 int superseded) {
     // A peer dialled us and named us: open our own write channel to it and answer
     // the handshake, telling it the name we gave it (`peer_id`) and echoing the name
     // it gave us (`assigned_peer_id`). On a reconnect (reestablish) the write side is
@@ -628,8 +663,26 @@ void SenderWorker::establish_ack(uint64_t peer_id,
     // the socket the previous session left behind is dropped rather than reused (a
     // stale socket would swallow the next send and surface as a spurious disconnect).
     if (peer_id == 0) { return; }
+    if (transport_->duplex()) {
+        // The socket the peer dialled is already our write channel (the channel
+        // filled the tx slot before queueing this event): answer on it.
+        if (superseded != 0) { transport_->close(superseded); }
+        const auto tx = peers_.tx_of(peer_id);
+        if (!tx) {
+            logger_.warn("handshake answer failed: peer#" + std::to_string(peer_id)
+                         + " has no write channel");
+            return;
+        }
+        const auto frame = wire::encode(wire::make_connect_ack(peer_id, assigned_peer_id));
+        if (frame && transport_->send(tx->handle, *frame)) {
+            logger_.info("handshake answer sent: peer#" + std::to_string(peer_id));
+        } else {
+            logger_.warn("handshake answer failed: peer#" + std::to_string(peer_id));
+        }
+        return;
+    }
     if (reestablish) { drop_connection(peer_id); }
-    if (connections_.find(peer_id) != connections_.end()) { return; }
+    if (peers_.tx_of(peer_id)) { return; }
     if (endpoints.empty()) { return; }
     const wire::Endpoint& endpoint = endpoints.front();
     const bool sent = open(peer_id, endpoint.address, endpoint.port,
@@ -644,20 +697,32 @@ void SenderWorker::establish_ack(uint64_t peer_id,
 void SenderWorker::dial_peer(const EventDialPeer& dial) {
     // A render-initiated dial: name the new peer and open the write connection,
     // then tell the store so it can hand the conversation to the render.
-    bool connected = connections_.find(dial.peer_id) != connections_.end();
-    if (!connected) {
+    bool connected = peers_.tx_of(dial.peer_id).has_value();
+    if (connected) {
+        (void)peers_.insert(dial.peer_id, PeerTable::Address{dial.ip, dial.port});
+    } else {
         // A render-initiated dial usually names a peer we have never met, so there
         // is no remembered name to re-present; a peer we already know supplies one.
         const auto known = peers_.lookup(dial.peer_id);
         const uint64_t assigned_id = known ? known->assigned_id : 0;
+        // Remember where the peer lives BEFORE opening: with a duplex transport the
+        // peer's Ack can arrive within one RTT of the hello, and its handling needs
+        // the entry. If the dial fails, restore what was there before.
+        (void)peers_.insert(dial.peer_id, PeerTable::Address{dial.ip, dial.port});
         connected = open(dial.peer_id, dial.ip, dial.port,
                          wire::make_connect(dial.peer_id, assigned_id, local_.endpoints)).has_value();
+        if (!connected) {
+            if (!known) {
+                (void)peers_.erase(dial.peer_id);
+            } else {
+                (void)peers_.insert(dial.peer_id, known->address);
+                if (known->status == PeerTable::Status::Disconnected) {
+                    peers_.mark_disconnected(dial.peer_id);
+                }
+            }
+        }
     }
     if (connected) {
-        // Remember where the peer lives: unlike an inbound peer (recorded by the
-        // reader) a dialled peer has no address in the table yet, and the compose
-        // path looks it up before reusing the cached connection.
-        (void)peers_.insert(dial.peer_id, PeerTable::Address{dial.ip, dial.port});
         logger_.info("dial ok: peer#" + std::to_string(dial.peer_id));
         (void)store_queue_.emplace(EventPeerDialed{0, dial.peer_id});
     } else {
@@ -667,10 +732,9 @@ void SenderWorker::dial_peer(const EventDialPeer& dial) {
 }
 
 bool SenderWorker::drop_connection(uint64_t peer_id) {
-    const auto it = connections_.find(peer_id);
-    if (it == connections_.end()) { return false; }
-    transport_->close(it->second);
-    connections_.erase(it);
+    const auto tx = peers_.clear_tx(peer_id);
+    if (!tx) { return false; }
+    transport_->close(tx->handle);
     return true;
 }
 
@@ -715,7 +779,7 @@ void SenderWorker::operator()() {
         }
         if (const auto* connected = std::get_if<EventPeerConnected>(&*event)) {
             establish_ack(connected->peer_id, connected->assigned_peer_id,
-                          connected->endpoints, connected->adopted);
+                          connected->endpoints, connected->adopted, connected->superseded);
             continue;
         }
         if (const auto* gone = std::get_if<EventPeerDisconnected>(&*event)) {

@@ -76,7 +76,7 @@ int main() {
         ThreadQueue<Event> store_queue;
         p2p::PeerTable peers;
         p2p::Metrics sm;
-        p2p::PeerSession session{store_queue, peers};
+        p2p::FrameChannel session{store_queue, peers};
         session.set_metrics(&sm);
         std::vector<std::byte> bytes;
         for (const auto& msg : {wire::make_connect(1, 0, {wire::Endpoint{"127.0.0.1", 1}}),

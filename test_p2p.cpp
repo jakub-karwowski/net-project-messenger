@@ -101,20 +101,74 @@ void test_peer_table_connection_owner() {
     p2p::PeerTable peers;
     peers.insert(1, {"127.0.0.1", 5000});
 
-    check(peers.set_connection(1, 100), "owner: first reader takes ownership");
-    check(peers.set_connection(1, 200), "owner: a newer reader takes over");
-    check(!peers.release_connection(1, 100),
-          "owner: the superseded reader cannot release");
+    check(!peers.attach_rx(1, {100, 0}), "owner: first reader takes ownership");
+    const auto prev = peers.attach_rx(1, {200, 0});
+    check(prev && prev->connection_id == 100, "owner: a newer reader takes over");
+    check(!peers.release(1, 100), "owner: the superseded reader cannot release");
     auto live = peers.lookup(1);
     check(live && live->status == p2p::PeerTable::Status::Connected,
           "owner: a superseded exit leaves the peer connected");
 
-    check(peers.release_connection(1, 200), "owner: the current reader releases");
+    check(peers.release(1, 200), "owner: the current reader releases");
     auto gone = peers.lookup(1);
     check(gone && gone->status == p2p::PeerTable::Status::Disconnected,
           "owner: releasing marks the peer disconnected");
-    check(!peers.release_connection(1, 200), "owner: releasing twice is false");
-    check(!peers.set_connection(0, 5), "owner: a zero peer id is rejected");
+    check(!peers.release(1, 200), "owner: releasing twice is false");
+    check(!peers.attach_rx(0, {5, 0}) && !peers.release(0, 5), "owner: a zero peer id is rejected");
+}
+
+// Per-peer rx/tx slots: simplex (two channels) and duplex (one channel in both).
+void test_peer_table_slots() {
+    using p2p::ChannelRef;
+    p2p::PeerTable peers;
+    peers.insert(1, {"127.0.0.1", 5000});
+
+    // Per-slot supersede; re-attaching the same channel reports no predecessor.
+    check(!peers.attach_tx(1, {10, 3}), "slots: first tx attach has no predecessor");
+    check(!peers.attach_tx(1, {10, 3}), "slots: re-attaching the same tx is not a supersede");
+    const auto old_tx = peers.attach_tx(1, {11, 4});
+    check(old_tx && old_tx->handle == 3, "slots: a newer tx supersedes and returns the old ref");
+    const auto now_tx = peers.tx_of(1);
+    check(now_tx && now_tx->connection_id == 11 && now_tx->handle == 4, "slots: tx_of is the newest");
+    check(!peers.attach_rx(1, {20, 0}), "slots: rx slot independent of tx");
+
+    // Simplex: tx clear does not disconnect; rx release does and leaves tx alone.
+    check(!peers.release(1, 11), "slots: a tx-only match is not an rx release");
+    check(peers.tx_of(1) == std::nullopt, "slots: release of the tx connection id clears tx");
+    peers.attach_tx(1, {12, 5});
+    const auto cleared = peers.clear_tx(1);
+    check(cleared && cleared->handle == 5, "slots: clear_tx returns the held ref");
+    check(!peers.clear_tx(1), "slots: clear_tx of an empty slot is nullopt");
+    auto st = peers.lookup(1);
+    check(st && st->status == p2p::PeerTable::Status::Connected, "slots: tx clear does not disconnect");
+    peers.attach_tx(1, {13, 6});
+    check(peers.release(1, 20), "slots: rx release reports the disconnect");
+    st = peers.lookup(1);
+    check(st && st->status == p2p::PeerTable::Status::Disconnected, "slots: rx release marks Disconnected");
+    const auto kept = peers.tx_of(1);
+    check(kept && kept->connection_id == 13, "slots: simplex rx release leaves tx");
+
+    // Duplex: the same ref in both slots; one release clears both, true once.
+    p2p::PeerTable duplex;
+    duplex.insert(2, {"127.0.0.1", 5001});
+    const ChannelRef ref{30, 7};
+    duplex.attach_rx(2, ref);
+    duplex.attach_tx(2, ref);
+    check(duplex.release(2, 30), "slots: duplex release reports once");
+    check(duplex.tx_of(2) == std::nullopt, "slots: duplex release clears tx too");
+    check(!duplex.release(2, 30), "slots: duplex second release is false");
+
+    // A superseded duplex channel stays silent and leaves the newer one intact.
+    duplex.attach_rx(2, {31, 8});
+    duplex.attach_tx(2, {31, 8});
+    const auto replaced_rx = duplex.attach_rx(2, {32, 9});
+    const auto replaced_tx = duplex.attach_tx(2, {32, 9});
+    check(replaced_rx && replaced_tx && replaced_tx->handle == 8, "slots: duplex reconnect supersedes both");
+    check(!duplex.release(2, 31), "slots: superseded duplex release is false");
+    const auto live = duplex.tx_of(2);
+    check(live && live->connection_id == 32, "slots: superseded release leaves the new tx");
+    auto ds = duplex.lookup(2);
+    check(ds && ds->status == p2p::PeerTable::Status::Connected, "slots: superseded release keeps peer connected");
 }
 
 // A reader whose tick never advances must be unstuck by the watchdog.
@@ -703,6 +757,7 @@ void test_superseded_reader_stays_silent() {
 int main() {
     test_peer_table();
     test_peer_table_connection_owner();
+    test_peer_table_slots();
     test_watchdog_stops_stalled_reader();
     test_watchdog_prunes_oldest_reader();
     test_listener_roundtrip();

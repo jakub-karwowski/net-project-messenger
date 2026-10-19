@@ -1,7 +1,7 @@
-// PeerSession.cpp - the per-connection protocol state machine behind every
+// FrameChannel.cpp - the per-connection protocol state machine behind every
 // inbound transport (see ReaderWorker for the thread-per-connection driver).
 
-#include "PeerSession.hpp"
+#include "FrameChannel.hpp"
 
 #include "ThreadWorkers.hpp"
 
@@ -10,13 +10,17 @@
 
 namespace p2p {
 
-PeerSession::PeerSession(ThreadQueue<Event>& store_queue, PeerTable& peers, Logger logger)
+FrameChannel::FrameChannel(ThreadQueue<Event>& store_queue, PeerTable& peers, Logger logger,
+                           ChannelRef ref, bool duplex)
     : store_queue_(store_queue),
       peers_(peers),
       logger_(std::move(logger)),
-      connection_id_(next_local_peer_id()) {}
+      ref_(ref),
+      duplex_(duplex) {
+    if (ref_.connection_id == 0) { ref_.connection_id = next_local_peer_id(); }
+}
 
-void PeerSession::remember_assigned_id(uint64_t peer_id, uint64_t assigned_id) {
+void FrameChannel::remember_assigned_id(uint64_t peer_id, uint64_t assigned_id) {
     // The peer told us the name it uses for us (either by naming us in its own
     // ConnectInfo, or by answering ours with a ConnectInfoAck). Keep it in the peer
     // table: the sender echoes it in the next ConnectInfo it sends that peer, which
@@ -30,7 +34,7 @@ void PeerSession::remember_assigned_id(uint64_t peer_id, uint64_t assigned_id) {
     }
 }
 
-bool PeerSession::on_bytes(std::span<const std::byte> bytes) {
+bool FrameChannel::on_bytes(std::span<const std::byte> bytes) {
     if (metrics_) { metrics_->bytes_in.fetch_add(bytes.size(), std::memory_order_relaxed); }
     decoder_.feed(bytes);
 
@@ -64,10 +68,20 @@ bool PeerSession::on_bytes(std::span<const std::byte> bytes) {
             for (const wire::Endpoint& endpoint : connect->endpoints) {
                 peers_.insert(peer_id_, PeerTable::Address{endpoint.address, endpoint.port});
             }
-            peers_.set_connection(peer_id_, connection_id_);
+            (void)peers_.attach_rx(peer_id_, ref_);
+            int superseded = 0;
+            if (duplex_ && ref_.handle != 0) {
+                // The stream we were dialled on is also our write channel. A
+                // different socket previously in the tx slot is stale: hand it to
+                // the sender to close.
+                if (const auto old = peers_.attach_tx(peer_id_, ref_);
+                    old && old->handle != 0 && old->handle != ref_.handle) {
+                    superseded = old->handle;
+                }
+            }
             remember_assigned_id(peer_id_, connect->peer_id);
             if (!store_queue_.emplace(EventPeerConnected{
-                    peer_id_, connect->peer_id, connect->endpoints, adopted})) {
+                    peer_id_, connect->peer_id, connect->endpoints, adopted, superseded})) {
                 return false; // consumer gone: nothing left to deliver to
             }
         } else if (const auto* ack = wire::as_connect_ack(message)) {
@@ -76,7 +90,7 @@ bool PeerSession::on_bytes(std::span<const std::byte> bytes) {
             // `peer_id` is the name it gave us, kept to re-present later.
             peer_id_ = ack->ack_peer_id;
             logger_.info("handshake complete: peer#" + std::to_string(peer_id_));
-            peers_.set_connection(peer_id_, connection_id_);
+            (void)peers_.attach_rx(peer_id_, ref_);
             remember_assigned_id(peer_id_, ack->peer_id);
         } else if (const auto* chat = wire::as_message(message)) {
             // The conversation is local to this node, so the wire's
@@ -94,8 +108,8 @@ bool PeerSession::on_bytes(std::span<const std::byte> bytes) {
     }
 }
 
-void PeerSession::on_closed() {
-    if (peer_id_ != 0 && peers_.release_connection(peer_id_, connection_id_)) {
+void FrameChannel::on_closed() {
+    if (peer_id_ != 0 && peers_.release(peer_id_, ref_.connection_id)) {
         // Keep the peer in the table so its address stays usable for a later
         // reconnect; only the status records that it is gone. The store worker
         // resolves the local conversation and routes the error to its subscriber.
