@@ -234,6 +234,22 @@ struct EventConversationList {
     std::vector<ConversationInfo> conversations;
 };
 
+// render -> StoreWorker: switch echo mode. With echo on the store bounces every
+// inbound EventMessage straight back to the sender (same peer, same payload) and
+// neither stores it nor publishes anything to the render. Used by the stress rig.
+struct EventSetEcho {
+    bool on{};
+};
+
+// Headless input reader -> render: one line typed on the headless command fd.
+// `eof` marks the end of the input (equivalent to /quit); `line` is then empty.
+// Travelling through the render queue keeps command lines and store events in a
+// single total order.
+struct EventCommandLine {
+    std::string line;
+    bool eof{false};
+};
+
 using Event = std::variant<
     EventLocal,
     EventMessage,
@@ -251,4 +267,6 @@ using Event = std::variant<
     EventConversationSnapshot,
     EventConversationDelta,
     EventConversationNotification,
-    EventConversationList>;
+    EventConversationList,
+    EventSetEcho,
+    EventCommandLine>;
