@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <expected>
 #include <memory>
 #include <mutex>
@@ -229,7 +230,7 @@ public:
     // connection is not usable (moved-from) or the pool has already been closed.
     int add_connection(TcpConnection connection) noexcept;
 
-    // Explicitly removes and closes a connection by its ID.
+    // Explicitly removes and closes a connection by its ID. Not reported by receive().
     bool remove_connection(int connection_id) noexcept;
 
     // Signals the pool to shut down and unblocks any thread waiting in receive().
@@ -241,6 +242,11 @@ public:
     //
     // destination: caller-provided buffer to receive raw bytes from a ready socket;
     //              must not be empty.
+    // Close guarantee: every connection the pool drops on its own (EOF, read/write
+    // error, idle timeout, max_connections eviction, fatal write inside send()) is
+    // reported exactly once via receive() with bytes_read == 0. Only an explicit
+    // remove_connection() is not reported.
+    //
     // Returns a ReceiveResult with the connection_id and bytes read (0 on disconnect),
     // or a SocketError if the pool is closed or ::poll() fails fatally. A connection
     // with a fatal read/write error is dropped and reported as a disconnect
@@ -305,6 +311,7 @@ private:
 
     PollSet poll_set_;
     ConnectionMap connections_;
+    std::deque<int> pending_closed_;      // Dropped outside receive(); reported by receive()
 };
 
 // Drop-in alternative to TcpConnectionPool backed by epoll(7) (Linux only).
@@ -342,6 +349,9 @@ public:
 
     // Blocks in epoll_wait() until a connection is readable/disconnects, while
     // flushing pending tx buffers and sweeping idle/over-capacity connections.
+    // Same close guarantee as TcpConnectionPool: every connection the pool drops on
+    // its own is reported exactly once via receive() with bytes_read == 0;
+    // remove_connection() is not reported.
     std::expected<ReceiveResult, SocketError> receive(
         std::span<std::byte> destination) noexcept;
 
@@ -395,6 +405,7 @@ private:
     std::int64_t next_sweep_ms_{0};       // When the next sweep is due
 
     ConnectionMap connections_;
+    std::deque<int> pending_closed_;      // Dropped outside receive(); reported by receive()
     std::vector<epoll_event> events_;     // receive() only; sized to max_connections_ + 2
     std::size_t cursor_{0};               // Fairness cursor into events_
 

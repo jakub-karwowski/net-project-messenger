@@ -496,6 +496,7 @@ void TcpConnectionPool::prune_locked(std::int64_t now) noexcept {
     if (idle_timeout_ms_ > 0) {
         for (auto it = connections_.begin(); it != connections_.end();) {
             if (now - it->second.last_active_ms >= idle_timeout_ms_) {
+                pending_closed_.push_back(it->first);
                 it = drop_locked(it);
             } else {
                 ++it;
@@ -515,6 +516,7 @@ void TcpConnectionPool::prune_locked(std::int64_t now) noexcept {
                 && it->first < oldest->first;
             if (older || same_age_lower_id) { oldest = it; }
         }
+        pending_closed_.push_back(oldest->first);
         drop_locked(oldest);
     }
 }
@@ -560,6 +562,14 @@ std::expected<ReceiveResult, SocketError> TcpConnectionPool::receive(
             if (current >= next_sweep_ms_) {
                 prune_locked(current);
                 next_sweep_ms_ = current + sweep_interval_ms_;
+            }
+
+            // Drops made outside this read path (prune, fatal write in send()) are
+            // reported here, one per call, before blocking again.
+            if (!pending_closed_.empty()) {
+                const int id = pending_closed_.front();
+                pending_closed_.pop_front();
+                return ReceiveResult{.connection_id = id, .bytes_read = 0};
             }
 
             // Rebuild the kernel array from the desired state. Safe without a copy:
@@ -685,6 +695,7 @@ std::expected<void, SocketError> TcpConnectionPool::send(
 
             // Fatal write error (or a zero-length write on a non-empty stream).
             const SocketError error = sent ? SocketError::ConnectionClosed : sent.error();
+            pending_closed_.push_back(connection_id);
             drop_locked(it);
             poll_set_.wake();
             return std::unexpected(error);
@@ -872,6 +883,7 @@ void EpollConnectionPool::prune_locked(std::int64_t now) noexcept {
     if (idle_timeout_ms_ > 0) {
         for (auto it = connections_.begin(); it != connections_.end();) {
             if (now - it->second.last_active_ms >= idle_timeout_ms_) {
+                pending_closed_.push_back(it->first);
                 it = drop_locked(it);
             } else {
                 ++it;
@@ -891,6 +903,7 @@ void EpollConnectionPool::prune_locked(std::int64_t now) noexcept {
                 && it->first < oldest->first;
             if (older || same_age_lower_id) { oldest = it; }
         }
+        pending_closed_.push_back(oldest->first);
         drop_locked(oldest);
     }
 }
@@ -936,6 +949,14 @@ std::expected<ReceiveResult, SocketError> EpollConnectionPool::receive(
             if (current >= next_sweep_ms_) {
                 prune_locked(current);
                 next_sweep_ms_ = current + sweep_interval_ms_;
+            }
+
+            // Drops made outside this read path (prune, fatal write in send()) are
+            // reported here, one per call, before blocking again.
+            if (!pending_closed_.empty()) {
+                const int id = pending_closed_.front();
+                pending_closed_.pop_front();
+                return ReceiveResult{.connection_id = id, .bytes_read = 0};
             }
         }
 
@@ -1073,6 +1094,7 @@ std::expected<void, SocketError> EpollConnectionPool::send(
 
             // Fatal write error (or a zero-length write on a non-empty stream).
             const SocketError error = sent ? SocketError::ConnectionClosed : sent.error();
+            pending_closed_.push_back(connection_id);
             drop_locked(it);
             wake();
             return std::unexpected(error);
