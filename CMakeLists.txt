@@ -113,7 +113,7 @@ add_test(NAME test_metrics COMMAND test_metrics)
 # End-to-end tests: real headless processes (python3 stdlib only).
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
-  foreach(io threads pool-sender poll epoll)
+  foreach(io threads pool-sender poll epoll poll-duplex epoll-duplex poll-split epoll-split)
     add_test(NAME e2e_${io}
       COMMAND ${Python3_EXECUTABLE} -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e -p "test_e2e.py" -v)
     set_tests_properties(e2e_${io} PROPERTIES

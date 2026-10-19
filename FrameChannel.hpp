@@ -6,6 +6,7 @@
 #include "Metrics.hpp"
 #include "ThreadQueue.hpp"
 #include "Wire.hpp"
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -19,6 +20,16 @@ struct PeerTable;
 // to the store. It is transport-agnostic: whoever owns the socket feeds it bytes
 // and reports close.
 class FrameChannel {
+    // Movable atomic (FrameChannel is moved into ReaderWorker; moves are never concurrent).
+    struct AtomicId {
+        std::atomic<uint64_t> value{0};
+        AtomicId() = default;
+        AtomicId(AtomicId&& other) noexcept : value(other.value.load()) {}
+        AtomicId& operator=(AtomicId&& other) noexcept { value.store(other.value.load()); return *this; }
+        AtomicId& operator=(uint64_t v) noexcept { value.store(v); return *this; }
+        operator uint64_t() const noexcept { return value.load(); }
+    };
+
 public:
     // `ref` names this stream in the PeerTable slots; connection_id 0 mints a
     // fresh one. `duplex` (with ref.handle != 0) means the stream is also our
@@ -43,7 +54,9 @@ private:
     Logger logger_;
     Metrics* metrics_{nullptr};
     wire::Decoder decoder_;
-    uint64_t peer_id_{0}; // our name for the peer: minted on handshake, or the id it re-presents
+    // Atomic: close() on the sender thread may call on_closed() while the I/O thread
+    // is inside on_bytes().
+    AtomicId peer_id_; // our name for the peer: minted on handshake, or the id it re-presents
     // This stream's slot identity (unique connection_id). A channel that a newer
     // one superseded must not report the (still live) peer as gone on close.
     ChannelRef ref_;
