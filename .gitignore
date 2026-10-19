@@ -4,3 +4,4 @@ compile_commands.json
 build-*/
 results*/
 .claude/worktrees/
+__pycache__/

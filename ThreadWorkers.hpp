@@ -16,6 +16,7 @@
 #include <iosfwd>
 #include <memory>
 #include <mutex>
+#include <functional>
 #include <optional>
 #include <string>
 #include <thread>
@@ -378,7 +379,13 @@ struct ListenerWorker {
     ~ListenerWorker();
     void stop() noexcept; // unblocks accept(), stops the watchdog (which joins the readers)
     void operator()();    // spawns the watchdog internally
+    // Called once from operator() after bind succeeds ("ip:port", no error) or fails
+    // ("", reason). Set before operator() runs.
+    void set_ready_callback(std::function<void(std::string, std::optional<std::string>)> cb) {
+        ready_ = std::move(cb);
+    }
 private:
+    std::function<void(std::string, std::optional<std::string>)> ready_;
     std::string local_address_;
     unsigned port_;
     std::size_t max_readers_; // hard cap on concurrently running readers (>= 1)

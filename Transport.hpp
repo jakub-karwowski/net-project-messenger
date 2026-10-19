@@ -9,6 +9,8 @@
 
 #include <chrono>
 #include <cstddef>
+#include <functional>
+#include <optional>
 #include <memory>
 #include <string>
 
@@ -18,6 +20,19 @@ public:
     virtual ~InboundTransport() = default;
     virtual void run() = 0;            // blocks until stop(); call from its own thread
     virtual void stop() noexcept = 0;  // idempotent, callable from any thread
+
+    // Readiness hook: invoked once, from the thread running run(), after the listen
+    // socket is bound ("ip:port", no error) or when binding failed ("", reason).
+    // Set before run(). Subclasses call notify_ready().
+    void set_ready_callback(std::function<void(std::string, std::optional<std::string>)> cb) {
+        ready_ = std::move(cb);
+    }
+protected:
+    void notify_ready(std::string listen, std::optional<std::string> error = std::nullopt) {
+        if (ready_) { ready_(std::move(listen), std::move(error)); }
+    }
+private:
+    std::function<void(std::string, std::optional<std::string>)> ready_;
 };
 
 struct NetConfig {
@@ -36,7 +51,12 @@ class ThreadedInbound final : public InboundTransport {
 public:
     ThreadedInbound(const NetConfig& net, ThreadQueue<Event>& store_queue,
                     PeerTable& peers, Logger logger);
-    void run() override { listener_(); }
+    void run() override {
+        listener_.set_ready_callback([this](std::string listen, std::optional<std::string> error) {
+            notify_ready(std::move(listen), std::move(error));
+        });
+        listener_();
+    }
     void stop() noexcept override { listener_.stop(); }
 private:
     ListenerWorker listener_;
