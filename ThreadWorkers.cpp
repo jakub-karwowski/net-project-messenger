@@ -19,6 +19,7 @@
 
 #include "Chat.hpp"
 #include "Element.hpp"
+#include "Render.hpp"
 #include "Transport.hpp"
 #include "Utils.hpp"
 
@@ -38,6 +39,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <unistd.h>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -485,6 +487,7 @@ void ListenerWorker::operator()() {
     try {
         listener.emplace(local_address_, port_, backlog_);
         logger_.info("listening on " + local_address_ + ":" + std::to_string(port_));
+        if (ready_) { ready_(local_address_ + ":" + std::to_string(port_), std::nullopt); }
     } catch (const std::exception& error) {
         // A busy port (or a bad address) must not take the process down: report it
         // and stop accepting. Outbound dials still work, so the app keeps running.
@@ -492,6 +495,7 @@ void ListenerWorker::operator()() {
             + std::to_string(port_) + ": " + error.what();
         logger_.error(detail);
         (void)store_queue_.emplace(EventError{detail});
+        if (ready_) { ready_("", detail); }
         running_.store(false, std::memory_order_relaxed);
         return;
     }
@@ -776,9 +780,11 @@ MainWorker::MainWorker(std::string local_address, unsigned port, std::string log
       }()) {}
 
 void MainWorker::operator()() {
-    // The main thread owns the terminal and the render loop; every other worker
-    // runs on its own thread and talks only through the queues.
-    TerminalUI terminal;
+    // The main thread owns the terminal (or, headless, stdin/stdout) and the render
+    // loop; every other worker runs on its own thread and talks only through the
+    // queues. Headless mode never touches the terminal.
+    std::optional<TerminalUI> terminal;
+    if (!config_.headless) { terminal.emplace(); }
     ThreadQueue<Event> render_queue;
     ThreadQueue<Event> store_queue;
     ThreadQueue<Event> sender_queue;
@@ -792,9 +798,8 @@ void MainWorker::operator()() {
     Logger logger{&logger_queue};
     LoggerWorker logger_worker{logger_queue, log_sink};
 
-    StoreWorker store{render_queue, store_queue, sender_queue, logger};
-    // TODO(headless/echo/metrics): config_.headless, config_.echo and
-    // config_.metrics_path are parsed but not wired yet; a later task adds them.
+    StoreWorker store{render_queue, store_queue, sender_queue, logger, config_.echo};
+    // TODO(metrics): config_.metrics_path is parsed but not wired yet.
     NetConfig net;
     net.address = config_.address;
     net.port = config_.port;
@@ -807,11 +812,23 @@ void MainWorker::operator()() {
                         SenderWorker::kDefaultSendAttempts,
                         SenderWorker::kDefaultRetryDelay,
                         logger};
-    KeyboardListenerWorker keyboard{
-        terminal, render_queue,
-        KeyboardListenerWorker::kDefaultIdleTimeoutMs,
-        KeyboardListenerWorker::kDefaultSequenceTimeoutMs,
-        logger};
+    std::optional<KeyboardListenerWorker> keyboard;
+    std::optional<RenderWorker> terminal_render;
+    std::optional<HeadlessRenderWorker> headless_render;
+    if (terminal) {
+        keyboard.emplace(*terminal, render_queue,
+                         KeyboardListenerWorker::kDefaultIdleTimeoutMs,
+                         KeyboardListenerWorker::kDefaultSequenceTimeoutMs,
+                         logger);
+        terminal_render.emplace(*terminal, render_queue, store_queue, logger);
+    } else {
+        headless_render.emplace(render_queue, store_queue, STDIN_FILENO, STDOUT_FILENO,
+                                std::string{to_string(config_.io)}, logger);
+        io.inbound->set_ready_callback(
+            [&render = *headless_render](std::string listen, std::optional<std::string> error) {
+                render.announce_ready(std::move(listen), std::move(error));
+            });
+    }
 
     logger.info("main: starting on " + config_.address + ":" + std::to_string(config_.port)
                 + " io=" + std::string{to_string(config_.io)});
@@ -819,24 +836,24 @@ void MainWorker::operator()() {
     std::thread logger_thread{[&logger_worker] { logger_worker(); }};
     std::thread store_thread{[&store] { store(); }};
     std::thread sender_thread{[&sender] { sender(); }};
-    std::thread keyboard_thread{[&keyboard] { keyboard(); }};
+    std::thread keyboard_thread;
+    if (keyboard) { keyboard_thread = std::thread{[&keyboard] { (*keyboard)(); }}; }
     std::thread listener_thread{[&io] { io.inbound->run(); }};
 
     // Render on the main thread; it returns once the keyboard (Esc / Ctrl+C / EOF)
     // or a /quit command ends it.
-    RenderWorker render{terminal, render_queue, store_queue, logger};
-    render();
+    if (terminal_render) { (*terminal_render)(); } else { (*headless_render)(); }
 
     // Orderly shutdown: stop the readers, then drain the store and sender so the
     // remaining threads finish and can be joined.
     logger.info("main: shutting down");
-    keyboard.stop();
+    if (keyboard) { keyboard->stop(); }
     io.inbound->stop();
     store_queue.graceful_shutdown();
     sender_queue.graceful_shutdown();
     render_queue.graceful_shutdown();
 
-    keyboard_thread.join();
+    if (keyboard_thread.joinable()) { keyboard_thread.join(); }
     store_thread.join();
     sender_thread.join();
     listener_thread.join();

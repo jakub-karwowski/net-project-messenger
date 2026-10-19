@@ -17,12 +17,6 @@ int main(int argc, char** argv) {
         std::cerr << "app: " << config.error() << '\n';
         return 2;
     }
-    // TODO(headless task): wire --headless (HeadlessRender, no TerminalUI), --echo
-    // and --metrics, then drop this guard.
-    if (config->headless) {
-        std::cerr << "app: --headless is not implemented yet\n";
-        return 2;
-    }
     // TODO(io task): the non-threads variants are added by make_io_stack().
     if (config->io != IoMode::Threads) {
         std::cerr << "app: io mode not implemented yet: " << to_string(config->io) << '\n';

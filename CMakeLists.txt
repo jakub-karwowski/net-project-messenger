@@ -82,3 +82,13 @@ add_test(NAME test_logger COMMAND test_logger)
 add_executable(test_headless test_headless.cpp)
 target_link_libraries(test_headless PRIVATE app_core)
 add_test(NAME test_headless COMMAND test_headless)
+
+# End-to-end tests: real headless processes (python3 stdlib only).
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND)
+  add_test(NAME e2e_threads
+    COMMAND ${Python3_EXECUTABLE} -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e -p "test_e2e.py" -v)
+  set_tests_properties(e2e_threads PROPERTIES
+    ENVIRONMENT "E2E_IO=threads;APP_BIN=$<TARGET_FILE:app>"
+    TIMEOUT 120)
+endif()
