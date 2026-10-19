@@ -89,3 +89,8 @@ endforeach()
 add_executable(test_headless test_headless.cpp)
 target_link_libraries(test_headless PRIVATE Render TcpSocket TerminalUI Threads::Threads)
 add_test(NAME test_headless COMMAND test_headless)
+
+# --- PoolOutbound (T6): --io=pool-sender ---
+add_executable(test_pool_outbound test_pool_outbound.cpp)
+target_link_libraries(test_pool_outbound PRIVATE app_core Render)
+add_test(NAME test_pool_outbound COMMAND test_pool_outbound)

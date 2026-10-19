@@ -1,6 +1,7 @@
 // Transport.cpp - ThreadedInbound and the make_io_stack factory.
 
 #include "Transport.hpp"
+#include "PoolOutbound.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -20,7 +21,13 @@ IoStack make_io_stack(IoMode mode, const NetConfig& net, ThreadQueue<Event>& sto
             return IoStack{
                 std::make_unique<ThreadedInbound>(net, store_queue, peers, std::move(logger)),
                 std::make_unique<BlockingOutbound>(net.send_timeout)};
-        case IoMode::PoolSender:
+        case IoMode::PoolSender: {
+            PoolOutboundOptions options;
+            options.max_connections = 2 * net.max_peers;
+            return IoStack{
+                std::make_unique<ThreadedInbound>(net, store_queue, peers, logger),
+                std::make_unique<PoolOutbound<TcpConnectionPool>>(options, std::move(logger))};
+        }
         case IoMode::Poll:
         case IoMode::Epoll:
             break;
