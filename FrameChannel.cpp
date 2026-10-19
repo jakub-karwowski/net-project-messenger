@@ -91,6 +91,10 @@ bool FrameChannel::on_bytes(std::span<const std::byte> bytes) {
             peer_id_ = ack->ack_peer_id;
             logger_.info("handshake complete: peer#" + std::to_string(peer_id_));
             (void)peers_.attach_rx(peer_id_, ref_);
+            // Duplex: this is the socket we dialled and already write on. Re-attach it
+            // as tx under this channel's id (same handle: nothing to close) so that one
+            // close releases both slots.
+            if (duplex_ && ref_.handle != 0) { (void)peers_.attach_tx(peer_id_, ref_); }
             remember_assigned_id(peer_id_, ack->peer_id);
         } else if (const auto* chat = wire::as_message(message)) {
             // The conversation is local to this node, so the wire's

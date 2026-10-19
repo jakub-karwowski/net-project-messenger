@@ -104,7 +104,8 @@ int thread_count() {
 }
 
 // A MultiplexedIo plus the thread running its accept loop.
-template <class Pool>
+template <class Pool, class Tx = p2p::SamePoolTx,
+          p2p::ConnectionModel Model = p2p::ConnectionModel::Dual>
 struct Node {
     static NetConfig make_net(unsigned port, std::size_t max_peers) {
         NetConfig net;
@@ -115,12 +116,12 @@ struct Node {
     ThreadQueue<Event> store_queue;
     p2p::PeerTable peers;
     unsigned port;
-    p2p::MultiplexedIo<Pool> io;
+    p2p::MultiplexedIo<Pool, Tx> io;
     std::thread listener;
 
     explicit Node(std::size_t max_peers = 16, unsigned fixed_port = 0)
         : port(fixed_port ? fixed_port : random_port()),
-          io(make_net(port, max_peers), store_queue, peers, Logger{}) {
+          io(make_net(port, max_peers), store_queue, peers, Logger{}, 1024 * 1024, Model) {
         listener = std::thread{[this] { io.run(); }};
     }
     ~Node() {
@@ -295,11 +296,13 @@ void test_many(const std::string& tag) {
 // --- Two nodes: Store + Sender + make_io_stack -------------------------------
 
 struct FullNode {
-    static NetConfig make_net(unsigned port) {
+    static NetConfig make_net(unsigned port, p2p::Metrics* metrics) {
         NetConfig net;
         net.port = port;
+        net.metrics = metrics;
         return net;
     }
+    p2p::Metrics metrics;
     ThreadQueue<Event> render_queue, store_queue, sender_queue;
     p2p::PeerTable peers;
     unsigned port;
@@ -310,7 +313,7 @@ struct FullNode {
 
     FullNode(IoMode mode, unsigned port_)
         : port(port_),
-          io(p2p::make_io_stack(mode, make_net(port_), store_queue, peers, Logger{})),
+          io(p2p::make_io_stack(mode, make_net(port_, &metrics), store_queue, peers, Logger{})),
           store(render_queue, store_queue, sender_queue),
           sender(store_queue, sender_queue, peers, *io.outbound,
                  LocalEndpoints{{wire::Endpoint{"127.0.0.1", static_cast<uint16_t>(port_)}}}) {
@@ -400,6 +403,177 @@ void test_two_nodes(IoMode mode) {
     check(wait_text(b, "ping"), tag + " B received ping");
     check(b.store_queue.emplace(EventComposeMessage{conv_b, "pong"}), tag + " B composes");
     check(wait_text(a, "pong"), tag + " A received pong");
+
+    const bool single = mode == IoMode::PollDuplex || mode == IoMode::EpollDuplex
+                     || mode == IoMode::PollSplit || mode == IoMode::EpollSplit;
+    std::this_thread::sleep_for(200ms); // a dial-back would have happened by now
+    const auto accepts = a.metrics.accepts.load() + b.metrics.accepts.load();
+    if (single) {
+        // The pong reached A on its own dialed socket, which needs the ConnectAck
+        // (peer identity) to have been processed there: the handshake completed.
+        check(accepts == 1, tag + " exactly one TCP connection in total (accepts="
+                                + std::to_string(accepts) + ")");
+        check(a.metrics.connections_live.load() == 1 && b.metrics.connections_live.load() == 1,
+              tag + " both sides count that one connection live");
+    } else {
+        check(accepts == 2, tag + " two TCP connections in total (accepts="
+                                + std::to_string(accepts) + ")");
+    }
+}
+
+// --- Duplex / split scenarios on a bare MultiplexedIo --------------------------
+
+std::vector<std::byte> hello_adopt_bytes(uint64_t name, uint64_t returning, unsigned port) {
+    return *wire::encode(wire::make_connect(
+        name, returning, std::vector<wire::Endpoint>{{"127.0.0.1", static_cast<uint16_t>(port)}}));
+}
+
+template <class Pool, class Tx>
+void test_duplex_inbound(const std::string& tag) {
+    Node<Pool, Tx, p2p::ConnectionModel::Duplex> node;
+    check(node.io.duplex(), tag + " duplex(): true");
+    auto client = dial(node.port);
+    check(client.has_value(), tag + " duplex inbound: connected");
+    if (!client) { return; }
+    check(send_all(*client, hello_bytes(77, 1234)), tag + " duplex inbound: hello");
+    auto connected = pop_as<EventPeerConnected>(node.store_queue);
+    check(connected.has_value(), tag + " duplex inbound: EventPeerConnected");
+    if (!connected) { return; }
+    const uint64_t peer = connected->peer_id;
+    const auto tx = node.peers.tx_of(peer);
+    check(tx.has_value() && tx->handle != 0 && connected->superseded == 0,
+          tag + " duplex inbound: the accepted socket fills the tx slot");
+
+    // The sender answers on the tx handle: the client reads the ConnectAck back.
+    if (tx) {
+        const auto ack = *wire::encode(wire::make_connect_ack(peer, 77));
+        check(node.io.send(tx->handle, ack).has_value(), tag + " duplex inbound: ack sent");
+        client->with_receive_timeout(2s);
+        std::vector<std::byte> got;
+        std::byte scratch[256];
+        while (got.size() < ack.size()) {
+            auto r = client->receive(std::span<std::byte>{scratch});
+            if (!r || *r == 0) { break; }
+            got.insert(got.end(), scratch, scratch + *r);
+        }
+        check(got == ack, tag + " duplex inbound: ack delivered on the same socket");
+    }
+    check(send_all(*client, chat_bytes(77, "hi")), tag + " duplex inbound: chat");
+    auto message = pop_as<EventMessage>(node.store_queue);
+    check(message && message->payload == "hi", tag + " duplex inbound: message flows in");
+
+    client.reset();
+    auto gone = pop_as<EventPeerDisconnected>(node.store_queue);
+    check(gone && gone->peer_id == peer, tag + " duplex inbound: peer close -> EventPeerDisconnected");
+    check(!pop_for(node.store_queue, 300ms).has_value(),
+          tag + " duplex inbound: exactly one disconnect");
+    check(!node.peers.tx_of(peer).has_value(), tag + " duplex inbound: tx slot released too");
+}
+
+template <class Pool, class Tx>
+void test_duplex_adopt(const std::string& tag) {
+    Node<Pool, Tx, p2p::ConnectionModel::Duplex> node;
+    auto first = dial(node.port);
+    if (!first) { check(false, tag + " adopt: connect"); return; }
+    check(send_all(*first, hello_bytes(40, 1)), tag + " adopt: first hello");
+    auto c1 = pop_as<EventPeerConnected>(node.store_queue);
+    check(c1.has_value(), tag + " adopt: first connected");
+    if (!c1) { return; }
+    const uint64_t peer = c1->peer_id;
+    const int old_handle = node.peers.tx_of(peer) ? node.peers.tx_of(peer)->handle : 0;
+
+    auto second = dial(node.port);
+    if (!second) { check(false, tag + " adopt: connect 2"); return; }
+    check(send_all(*second, hello_adopt_bytes(40, peer, 1)), tag + " adopt: returning hello");
+    auto c2 = pop_as<EventPeerConnected>(node.store_queue);
+    check(c2 && c2->peer_id == peer && c2->adopted, tag + " adopt: same peer adopted");
+    check(c2 && c2->superseded == old_handle && old_handle != 0,
+          tag + " adopt: old channel handed over as superseded");
+    if (c2 && c2->superseded != 0) { node.io.close(c2->superseded); } // what the sender does
+
+    first->with_receive_timeout(2s);
+    std::byte scratch[16];
+    auto got = first->receive(std::span<std::byte>{scratch});
+    check(!got || *got == 0, tag + " adopt: the old socket was closed");
+    check(!pop_for(node.store_queue, 300ms).has_value(),
+          tag + " adopt: superseded close is silent, peer stays connected");
+    auto entry = node.peers.lookup(peer);
+    check(entry && entry->status == p2p::PeerTable::Status::Connected,
+          tag + " adopt: peer still connected");
+    const auto tx = node.peers.tx_of(peer);
+    check(tx && tx->handle != old_handle, tag + " adopt: tx slot holds the new channel");
+
+    second.reset();
+    auto gone = pop_as<EventPeerDisconnected>(node.store_queue);
+    check(gone && gone->peer_id == peer, tag + " adopt: new channel close reports once");
+}
+
+template <class Pool, class Tx>
+void test_duplex_dialed(const std::string& tag) {
+    const unsigned port = random_port();
+    TcpListener server("127.0.0.1", port, 4);
+    Node<Pool, Tx, p2p::ConnectionModel::Duplex> node;
+    constexpr uint64_t kPeer = 555;
+    node.peers.insert(kPeer, p2p::PeerTable::Address{"127.0.0.1", static_cast<uint16_t>(port)});
+
+    const auto hello = hello_bytes(9, node.port);
+    auto handle = node.io.open("127.0.0.1", port, hello);
+    check(handle.has_value(), tag + " dialed: open");
+    if (!handle) { return; }
+    // What SenderWorker::open does: attach tx under its own minted id.
+    constexpr uint64_t kSenderId = 999999999;
+    (void)node.peers.attach_tx(kPeer, p2p::ChannelRef{kSenderId, *handle});
+
+    auto remote = server.accept_client();
+    check(remote.has_value(), tag + " dialed: accepted");
+    if (!remote) { return; }
+    remote->with_receive_timeout(2s);
+    std::vector<std::byte> got;
+    std::byte scratch[4096];
+    while (got.size() < hello.size()) {
+        auto r = remote->receive(std::span<std::byte>{scratch});
+        if (!r || *r == 0) { break; }
+        got.insert(got.end(), scratch, scratch + *r);
+    }
+    check(got == hello, tag + " dialed: hello delivered");
+
+    // The remote answers on the same socket.
+    check(send_all(*remote, *wire::encode(wire::make_connect_ack(9, kPeer))),
+          tag + " dialed: ack sent back");
+    std::optional<p2p::ChannelRef> tx;
+    for (int i = 0; i < 200; ++i) {
+        tx = node.peers.tx_of(kPeer);
+        if (tx && tx->connection_id != kSenderId) { break; }
+        std::this_thread::sleep_for(5ms);
+    }
+    check(tx && tx->handle == *handle && tx->connection_id != kSenderId,
+          tag + " dialed: ack re-attaches tx under the channel's id");
+    // The dialed socket also carries traffic from the remote: a chat reaches the store.
+    check(send_all(*remote, chat_bytes(1, "from remote")), tag + " dialed: chat sent");
+    auto message = pop_as<EventMessage>(node.store_queue);
+    check(message && message->peer_id == kPeer && message->payload == "from remote",
+          tag + " dialed: rx works on the dialed socket");
+
+    // The sender drops the handle: both slots go and the peer is reported gone once.
+    node.io.close(*handle);
+    auto gone = pop_as<EventPeerDisconnected>(node.store_queue);
+    check(gone && gone->peer_id == kPeer, tag + " dialed: close reports the disconnect");
+    check(!node.peers.tx_of(kPeer).has_value(), tag + " dialed: tx slot released");
+    check(tx && !node.peers.release(kPeer, tx->connection_id),
+          tag + " dialed: rx slot released too");
+    auto entry = node.peers.lookup(kPeer);
+    check(entry && entry->status == p2p::PeerTable::Status::Disconnected,
+          tag + " dialed: status Disconnected");
+    check(!pop_for(node.store_queue, 300ms).has_value(), tag + " dialed: no second disconnect");
+    auto eof = remote->receive(std::span<std::byte>{scratch});
+    check(!eof || *eof == 0, tag + " dialed: socket closed");
+}
+
+template <class Pool, class Tx>
+void run_duplex_suite(const std::string& tag) {
+    test_duplex_inbound<Pool, Tx>(tag);
+    test_duplex_adopt<Pool, Tx>(tag);
+    test_duplex_dialed<Pool, Tx>(tag);
 }
 
 } // namespace
@@ -417,6 +591,14 @@ int main() {
     test_many<EpollConnectionPool>("epoll");
     test_two_nodes(IoMode::Poll);
     test_two_nodes(IoMode::Epoll);
+    run_duplex_suite<TcpConnectionPool, p2p::SamePoolTx>("poll-duplex");
+    run_duplex_suite<EpollConnectionPool, p2p::SamePoolTx>("epoll-duplex");
+    run_duplex_suite<TcpConnectionPool, PollTxPoller>("poll-split");
+    run_duplex_suite<EpollConnectionPool, EpollTxPoller>("epoll-split");
+    test_two_nodes(IoMode::PollDuplex);
+    test_two_nodes(IoMode::EpollDuplex);
+    test_two_nodes(IoMode::PollSplit);
+    test_two_nodes(IoMode::EpollSplit);
 
     std::cout << g_checks << " checks, " << g_failures << " failures\n";
     return g_failures == 0 ? 0 : 1;

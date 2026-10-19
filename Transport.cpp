@@ -35,6 +35,26 @@ IoStack make_io_stack(IoMode mode, const NetConfig& net, ThreadQueue<Event>& sto
                 net, store_queue, peers, std::move(logger));
             return IoStack{io, io};
         }
+        case IoMode::PollDuplex: {
+            auto io = std::make_shared<MultiplexedIo<TcpConnectionPool>>(
+                net, store_queue, peers, std::move(logger), 1024 * 1024, ConnectionModel::Duplex);
+            return IoStack{io, io};
+        }
+        case IoMode::EpollDuplex: {
+            auto io = std::make_shared<MultiplexedIo<EpollConnectionPool>>(
+                net, store_queue, peers, std::move(logger), 1024 * 1024, ConnectionModel::Duplex);
+            return IoStack{io, io};
+        }
+        case IoMode::PollSplit: {
+            auto io = std::make_shared<MultiplexedIo<TcpConnectionPool, PollTxPoller>>(
+                net, store_queue, peers, std::move(logger), 1024 * 1024, ConnectionModel::Duplex);
+            return IoStack{io, io};
+        }
+        case IoMode::EpollSplit: {
+            auto io = std::make_shared<MultiplexedIo<EpollConnectionPool, EpollTxPoller>>(
+                net, store_queue, peers, std::move(logger), 1024 * 1024, ConnectionModel::Duplex);
+            return IoStack{io, io};
+        }
         case IoMode::PoolSender: {
             PoolOutboundOptions options;
             options.max_connections = 2 * net.max_peers;

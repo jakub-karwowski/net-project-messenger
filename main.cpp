@@ -1,7 +1,7 @@
 // main.cpp - the p2p chat entry point. MainWorker builds the whole stack and runs
 // the render loop on this (the main) thread; everything else is a worker thread.
 //
-//   app [--io=threads|pool-sender|poll|epoll] [--headless] [--echo] [--max-peers=N]
+//   app [--io=threads|pool-sender|poll|epoll|poll-duplex|epoll-duplex|poll-split|epoll-split] [--headless] [--echo] [--max-peers=N]
 //       [--address=A] [--port=P] [--log=PATH] [--metrics=PATH]
 //   app [address] [port] [log file]     (old positional form; defaults: 127.0.0.1 9000 /dev/null)
 
