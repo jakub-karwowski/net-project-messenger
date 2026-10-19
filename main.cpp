@@ -23,8 +23,7 @@ int main(int argc, char** argv) {
         std::cerr << "app: --headless is not implemented yet\n";
         return 2;
     }
-    // TODO(io task): the non-threads variants are added by make_io_stack().
-    if (config->io != IoMode::Threads) {
+    if (config->io == IoMode::Poll || config->io == IoMode::Epoll) {
         std::cerr << "app: io mode not implemented yet: " << to_string(config->io) << '\n';
         return 2;
     }

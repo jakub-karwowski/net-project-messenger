@@ -422,6 +422,10 @@ struct SenderWorker {
         Logger logger = {}
     );
     void operator()();
+    // Messages dropped because the transport reported backpressure (tx buffer full).
+    uint64_t send_backpressure_drops() const noexcept {
+        return send_backpressure_drops_.load(std::memory_order_relaxed);
+    }
 private:
     // Returns the cached outbound connection for `peer_id`, creating it from the
     // address in `peers_` on first use and sending a ConnectInfo that names the
@@ -469,5 +473,6 @@ private:
     OutboundTransport* transport_;                             // socket ops only; policy stays here
     std::unordered_map<uint64_t, OutboundTransport::Handle> connections_; // outbound, one per peer
     Logger logger_;
+    std::atomic<uint64_t> send_backpressure_drops_{0};
 };
 }

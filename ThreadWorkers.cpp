@@ -740,9 +740,18 @@ void SenderWorker::operator()() {
             wire::make_chat_message(0, 0, message->payload));
 
         bool delivered = false;
+        bool dropped = false;
         for (unsigned attempt = 0; frame && attempt < send_attempts_; ++attempt) {
             const auto connection = ensure_connection(message->peer_id);
-            if (connection && transport_->send(*connection, *frame)) {
+            auto sent = connection ? transport_->send(*connection, *frame)
+                                   : std::unexpected(SocketError::ConnectionNotFound);
+            if (!sent && sent.error() == SocketError::WouldBlock &&
+                transport_->backpressure_is_drop()) {
+                // The peer is alive but not draining: drop, never sleep or retry.
+                dropped = true;
+                break;
+            }
+            if (sent) {
                 peers_.mark_connected(message->peer_id);
                 if (reconnecting) {
                     logger_.info("reconnected: peer#" + std::to_string(message->peer_id));
@@ -758,7 +767,15 @@ void SenderWorker::operator()() {
             }
         }
 
-        if (!delivered) { report_unreachable(message->conversation_id, message->peer_id); }
+        if (dropped) {
+            send_backpressure_drops_.fetch_add(1, std::memory_order_relaxed);
+            logger_.warn("backpressure: message to peer#" + std::to_string(message->peer_id)
+                         + " dropped");
+            (void)store_queue_.emplace(EventError{
+                "backpressure: message to peer#" + std::to_string(message->peer_id) + " dropped"});
+        } else if (!delivered) {
+            report_unreachable(message->conversation_id, message->peer_id);
+        }
     }
 }
 

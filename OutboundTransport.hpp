@@ -24,6 +24,12 @@ public:
     // Sends all of `data` or fails (a partial send is a failure).
     virtual std::expected<void, SocketError> send(Handle, std::span<const std::byte> data) = 0;
     virtual void close(Handle) noexcept = 0;
+    // What SenderWorker does with a send that fails with SocketError::WouldBlock.
+    // false (default): the socket is suspect, so the usual retry/re-dial policy
+    // applies (a blocking send hitting SO_SNDTIMEO reports WouldBlock too).
+    // true: WouldBlock means the transport's tx buffer is full (backpressure); the
+    // message is dropped and counted, with no retry, sleep or re-dial.
+    virtual bool backpressure_is_drop() const noexcept { return false; }
 };
 
 // Today's behaviour: one blocking TcpConnection per handle, send_all with

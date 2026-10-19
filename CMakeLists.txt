@@ -90,3 +90,8 @@ target_link_libraries(stressgen PRIVATE TcpSocket Threads::Threads)
 add_executable(test_stressgen test_stressgen.cpp)
 target_link_libraries(test_stressgen PRIVATE TcpSocket Threads::Threads)
 add_test(NAME test_stressgen COMMAND test_stressgen)
+
+# --- PoolOutbound (T6): --io=pool-sender ---
+add_executable(test_pool_outbound test_pool_outbound.cpp)
+target_link_libraries(test_pool_outbound PRIVATE app_core)
+add_test(NAME test_pool_outbound COMMAND test_pool_outbound)
