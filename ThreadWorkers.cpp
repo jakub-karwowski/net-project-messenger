@@ -839,6 +839,7 @@ void MainWorker::operator()() {
     net.address = config_.address;
     net.port = config_.port;
     net.max_peers = config_.max_peers;
+    net.backlog = config_.backlog;
     net.metrics = &metrics;
     IoStack io = make_io_stack(config_.io, net, store_queue, peers, logger);
 

@@ -2,7 +2,7 @@
 
 // Command line of the app:
 //   app [--io=threads|pool-sender|poll|epoll] [--headless] [--echo] [--max-peers=N]
-//       [--address=A] [--port=P] [--log=PATH] [--metrics=PATH]
+//       [--backlog=N] [--address=A] [--port=P] [--log=PATH] [--metrics=PATH]
 // The old positional form `app [address] [port] [log]` still works.
 
 #include "IoMode.hpp"
@@ -23,6 +23,7 @@ struct AppConfig {
     bool headless{false};
     bool echo{false};                      // initial store echo mode
     std::size_t max_peers{kDefaultMaxPeers};
+    int backlog{16};                       // listen() backlog
     std::string address{"127.0.0.1"};
     unsigned port{9000};
     std::string log_path{"/dev/null"};
@@ -76,6 +77,8 @@ inline std::expected<AppConfig, std::string> parse_app_config(int argc, char** a
             std::size_t peers = 0;
             if (!detail::parse_number(value, peers) || peers == 0) { return bad("bad --max-peers"); }
             config.max_peers = peers;
+        } else if (name == "--backlog" && has_value) {
+            if (!detail::parse_number(value, config.backlog) || config.backlog <= 0) { return bad("bad --backlog"); }
         } else if (name == "--address" && has_value) { config.address = std::string{value}; }
         else if (name == "--port" && has_value) {
             if (!detail::parse_number(value, config.port)) { return bad("bad --port"); }

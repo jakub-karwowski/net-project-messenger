@@ -118,7 +118,7 @@ def run_cell(args, sc, x, variant, rep, port, d):
     meta = dict(scenario=sc, x_name=SCENARIOS[sc]["x"], x=x, variant=variant, rep=rep,
                 port=port, params=p, status="failed", error=None, t_start=time.time())
     node = Node(["taskset", "-c", args.node_cpus, args.app, "--headless", "--echo",
-                 f"--io={variant}", f"--max-peers={max_peers_for(p)}", f"--port={port}",
+                 f"--io={variant}", f"--max-peers={max_peers_for(p)}", "--backlog=4096", f"--port={port}",
                  f"--log={pre}.node.log", f"--metrics={pre}.metrics.jsonl"])
     try:
         if not node.ready.wait(args.ready_timeout) or node.ready_err or node.p.poll() is not None:
