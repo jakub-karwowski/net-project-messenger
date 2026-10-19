@@ -75,9 +75,12 @@ struct StoreWorker {
         ThreadQueue<Event>& render_queue,
         ThreadQueue<Event>& store_queue,
         ThreadQueue<Event>& sender_queue,
-        Logger logger = {}
+        Logger logger = {},
+        bool echo = false
     );
     void operator()();
+    // Number of inbound messages bounced back in echo mode (metrics wiring later).
+    uint64_t echoed() const noexcept { return echoed_.load(std::memory_order_relaxed); }
 private:
     struct Subscription {
         SubscriptionFlag level{SubscriptionFlag::Message};
@@ -147,6 +150,8 @@ private:
     ThreadQueue<Event>& render_queue_;
     ThreadQueue<Event>& store_queue_;
     ThreadQueue<Event>& sender_queue_;
+    bool echo_{false};                   // echo mode: bounce inbound messages, store nothing
+    std::atomic<uint64_t> echoed_{0};
     uint64_t next_conversation_id_{1};                              // next local id to hand out
     std::unordered_set<uint64_t> pending_dials_;                    // dials awaiting an outcome
     std::unordered_map<uint64_t, uint64_t> peer_to_conversation_;   // peer_id -> local id

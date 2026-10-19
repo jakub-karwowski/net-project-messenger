@@ -867,6 +867,62 @@ void test_reconnect_peer_without_peer_reports_error() {
     }
 }
 
+// Echo mode: an inbound message goes straight back to the sender for the same peer
+// and is neither stored nor published; EventSetEcho toggles it at runtime.
+void test_echo_mode() {
+    Harness h;
+    (void)h.store.emplace(EventSetEcho{true});
+    (void)h.store.emplace(EventMessage{5, 0, "ping"});
+    auto out = h.sender.pop();
+    const auto* echoed = out ? std::get_if<EventMessage>(&*out) : nullptr;
+    check(echoed != nullptr, "echo: message forwarded to the sender");
+    if (echoed) {
+        check(echoed->peer_id == 5 && echoed->payload == "ping" && echoed->conversation_id != 0,
+              "echo: same peer and payload, conversation resolved");
+    }
+
+    // Nothing was stored or published: the list is empty and the render queue silent.
+    (void)h.store.emplace(EventListConversations{});
+    auto list = h.render.pop();
+    const auto* conversations = list ? std::get_if<EventConversationList>(&*list) : nullptr;
+    // The peer's id mapping (and so an empty conversation shell) exists, but no
+    // message was stored and nothing was published ahead of the list reply.
+    check(conversations != nullptr && conversations->conversations.size() == 1
+              && conversations->conversations[0].unread == 0,
+          "echo: nothing stored, nothing published (first render event is the list)");
+
+    // Same peer keeps the same conversation id.
+    (void)h.store.emplace(EventMessage{5, 0, "pong"});
+    auto again = h.sender.pop();
+    const auto* second = again ? std::get_if<EventMessage>(&*again) : nullptr;
+    check(second && echoed && second->conversation_id == echoed->conversation_id,
+          "echo: stable conversation per peer");
+
+    // Off again: back to the normal path.
+    (void)h.store.emplace(EventSetEcho{false});
+    (void)h.store.emplace(EventMessage{5, 0, "stored"});
+    (void)h.store.emplace(EventListConversations{});
+    auto after = h.render.pop();
+    const auto* after_list = after ? std::get_if<EventConversationList>(&*after) : nullptr;
+    // The conversation now exists and announces the new message first.
+    const bool notified = after && std::get_if<EventConversationNotification>(&*after);
+    check(notified || (after_list && !after_list->conversations.empty()),
+          "echo off: messages are stored again");
+    check(!h.sender.try_pop().has_value(), "echo off: nothing bounced to the sender");
+}
+
+void test_echo_initial_flag() {
+    ThreadQueue<Event> render, store, sender;
+    StoreWorker worker{render, store, sender, Logger{}, true};
+    std::thread thread{[&worker] { worker(); }};
+    (void)store.emplace(EventMessage{9, 0, "x"});
+    auto out = sender.pop();
+    check(out && std::get_if<EventMessage>(&*out) != nullptr, "echo: initial flag bounces");
+    store.graceful_shutdown();
+    thread.join();
+    check(worker.echoed() == 1, "echo: counter incremented");
+}
+
 } // namespace
 
 int main() {
@@ -897,6 +953,8 @@ int main() {
     test_reconnect_peer_resolves_and_forwards();
     test_reconnect_peer_without_peer_reports_error();
     test_error_forwarded_to_render();
+    test_echo_mode();
+    test_echo_initial_flag();
 
     std::cout << (g_checks - g_failures) << '/' << g_checks << " checks passed\n";
     return g_failures == 0 ? 0 : 1;
