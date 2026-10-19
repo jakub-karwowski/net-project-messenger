@@ -9,6 +9,11 @@
     scripts/analyze.py results                       # -> results/summary.csv, results/report.html
     python3 scripts/test_analyze.py                  # helper unit tests
 
+Variants (`--io` modes): `threads`, `pool-sender`, `poll`, `epoll` (two TCP connections per
+peer: the node dials back) and `poll-duplex`, `epoll-duplex`, `poll-split`, `epoll-split`
+(one connection per peer; the node answers Ack + echoes on the accepted socket; the matrix
+passes `--duplex` to stressgen for these). `-split` uses a separate thread for the write side.
+
 Scenarios (table at top of `run_matrix.py`): S1 fan-in (peers), S2 idle-heavy
 (idle_peers), S3 slow consumers (slow_peers), S4 churn, S5 throughput ceiling (size).
 `--max-peers` is set to peers+idle+slow+16 so caps never evict.

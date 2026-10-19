@@ -27,7 +27,7 @@ static bool send_all(int fd, const std::vector<std::byte>& b) {
 
 class FakeNode {
 public:
-    FakeNode() {
+    explicit FakeNode(bool duplex = false) : duplex_(duplex) {
         lfd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         int one = 1;
         ::setsockopt(lfd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
@@ -77,6 +77,12 @@ private:
                 if (!item) { continue; }
                 if (!*item) { break; }
                 if (const auto* ci = wire::as_connect(**item)) {
+                    if (duplex_) {   // answer on the accepted socket, never dial back
+                        ret = fd;
+                        auto ack = wire::encode(wire::make_connect_ack(77, ci->peer_id));
+                        send_all(ret, *ack);
+                        continue;
+                    }
                     if (ci->endpoints.empty()) { continue; }
                     ret = ::socket(AF_INET, SOCK_STREAM, 0);
                     sockaddr_in a{};
@@ -98,6 +104,7 @@ private:
             }
         }
     }
+    bool duplex_ = false;
     int lfd_ = -1;
     std::thread acceptor_;
     std::mutex m_;
@@ -148,6 +155,29 @@ int main() {
         check(r.churn_events > 10, "churn happened");
         check(r.slow_sent > 0 && r.received > 0, "slow peers send, active peers echo");
         check(r.received <= r.sent, "received <= sent");
+    }
+    {   // duplex: single connection per peer
+        FakeNode node(true);
+        stress::Config c;
+        c.target_port = node.port; c.duplex = true;
+        c.peers = 32; c.rate = 200; c.duration = 1.5; c.warmup = 0.5;
+        stress::Result r; std::string err;
+        check(run(c, r, err) == 0, "duplex rate run completes");
+        check(r.peers_ready == 32, "duplex: all peers ready");
+        check(r.sent > 0 && r.lost == 0 && r.received == r.sent, "duplex: received == sent");
+        check(r.rtt.count() == r.received, "duplex: one sample per echo");
+    }
+    {   // duplex: idle + slow + churn
+        FakeNode node(true);
+        stress::Config c;
+        c.target_port = node.port; c.duplex = true;
+        c.peers = 16; c.idle_peers = 4; c.slow_peers = 4; c.rate = 100; c.duration = 1.5; c.warmup = 0.3;
+        c.churn = 20; c.grace = 1;
+        stress::Result r; std::string err;
+        check(run(c, r, err) == 0, "duplex mixed run completes");
+        check(r.churn_events > 10, "duplex: churn happened");
+        check(r.slow_sent > 0 && r.received > 0, "duplex: slow peers send, active peers echo");
+        check(r.received <= r.sent, "duplex: received <= sent");
     }
     {   // unreachable target
         stress::Config c;

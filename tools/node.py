@@ -2,7 +2,7 @@
 
 Stdlib only. Typical use:
 
-    n = Node("build/app", io="epoll"); n.start()
+    n = Node("build/app", io="epoll")  # io: threads|pool-sender|poll|epoll|poll-duplex|epoll-duplex|poll-split|epoll-split; n.start()
     rid = n.cmd("/connect 127.0.0.1 9001")
     ev = n.expect("peer", what="dialed")
     n.stop()

@@ -11,7 +11,9 @@ static void usage() {
         "usage: stressgen --target ip:port [--peers N] [--rate R] [--window W] [--size B]\n"
         "                 [--duration S] [--warmup S] [--idle-peers M] [--slow-peers K]\n"
         "                 [--churn C] [--grace S] [--listen-ip IP] [--listen-port P] [--out file.json]\n"
+        "                 [--duplex]\n"
         "  rate: msgs/s/peer (0 = as fast as possible); window: max in-flight/peer (0 = unlimited)\n"
+        "  --duplex: single connection per peer (node replies Ack+echoes on the dialed socket; no listener)\n"
         "  idle/slow peers are extra peers on top of --peers. exit: 0 ok, 2 unreachable, 3 no handshakes\n";
 }
 
@@ -20,6 +22,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i], v;
         if (a == "-h" || a == "--help") { usage(); return 0; }
+        if (a == "--duplex") { c.duplex = true; continue; }
         const auto eq = a.find('=');
         if (eq != std::string::npos) { v = a.substr(eq + 1); a.resize(eq); }
         else if (i + 1 < argc) { v = argv[++i]; }

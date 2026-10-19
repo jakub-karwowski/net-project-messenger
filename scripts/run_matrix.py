@@ -11,7 +11,17 @@ Cells whose meta.json has status ok|dirty are skipped on re-run (resume).
 import argparse, json, math, os, random, resource, subprocess, sys, threading, time, zlib
 from pathlib import Path
 
-VARIANTS = ["threads", "pool-sender", "poll", "epoll"]
+VARIANTS = ["threads", "pool-sender", "poll", "epoll",
+            "poll-duplex", "epoll-duplex", "poll-split", "epoll-split"]
+
+
+def is_duplex(variant):
+    """duplex/split nodes answer on the dialed socket: stressgen --duplex, ~1 fd per peer."""
+    return variant.endswith(("-duplex", "-split"))
+
+
+def base_variant(variant):
+    return variant.split("-")[0] if is_duplex(variant) else variant
 
 # --- Scenario table ---------------------------------------------------------
 # x = the swept parameter name (a stressgen option), values = its values,
@@ -130,6 +140,8 @@ def run_cell(args, sc, x, variant, rep, port, d):
               "--idle-peers", str(p["idle_peers"]), "--slow-peers", str(p["slow_peers"]),
               "--churn", str(p["churn"]), "--grace", str(0.5 if args.quick else GRACE),
               "--out", f"{pre}.stress.json"]
+        if is_duplex(variant):
+            sg += ["--duplex"]
         if p.get("window"):
             sg += ["--window", str(p["window"])]
         limit = p["duration"] + p["warmup"] + 60 + (p["peers"] + p["idle_peers"]) * 0.02
@@ -154,7 +166,10 @@ def run_cell(args, sc, x, variant, rep, port, d):
 # --- Fake run ---------------------------------------------------------------
 # Plausible synthetic model. (cpu us/msg, rtt base us, rtt us per peer, threads per conn)
 FAKE = {"threads": (14, 90, 0.9, 1.0), "pool-sender": (12, 80, 0.7, 1.0),
-        "poll": (7, 110, 1.4, 0.0), "epoll": (6, 70, 0.2, 0.0)}
+        "poll": (7, 110, 1.4, 0.0), "epoll": (6, 70, 0.2, 0.0),
+        # duplex: one shared socket per peer, slightly less syscall work; split: +1 thread, a bit more latency
+        "poll-duplex": (6.5, 105, 1.3, 0.0), "epoll-duplex": (5.5, 65, 0.2, 0.0),
+        "poll-split": (7.5, 120, 1.3, 0.0), "epoll-split": (6.5, 80, 0.2, 0.0)}
 
 
 def fake_cell(args, sc, x, variant, rep, port, d):
@@ -190,18 +205,19 @@ def fake_cell(args, sc, x, variant, rep, port, d):
         ut += cpu * 0.6
         stt += cpu * 0.4 + 2000
         fin += int(rate)
-        vcsw += int(rate * (0.4 if variant in ("poll", "epoll") else 2.0))
+        vcsw += int(rate * (0.4 if base_variant(variant) in ("poll", "epoll") else 2.0))
         ivcsw += int(rate * 0.02 + 50)
         rows.append(dict(
             t_ns=t0 + i * 10**9, accepts=live, connections_live=live,
             bytes_in=fin * (p["size"] + 20), frames_in=fin, frames_out=fin, send_failures=0,
             send_backpressure_drops=int(fin * 0.001) if p["slow_peers"] and variant != "threads" else 0,
             reconnects=int(p["churn"] * i),
-            evictions=int(p["churn"] * i * 0.1) if variant in ("poll", "epoll") else 0,
+            evictions=int(p["churn"] * i * 0.1) if base_variant(variant) in ("poll", "epoll") else 0,
             echoed=fin, render_q_hwm=0, store_q_hwm=int(rnd.random() * 50),
             sender_q_hwm=int(rnd.random() * 50), utime_us=int(ut), stime_us=int(stt),
             nvcsw=vcsw, nivcsw=ivcsw, maxrss_kb=20000 + int(live * (60 if thr else 8)) + i * 10,
-            threads=int(8 + live * thr + (4 if variant != "threads" else 0)), fds=live * 2 + 10))
+            threads=int(8 + live * thr + (4 if variant != "threads" else 0) + (1 if variant.endswith("-split") else 0)),
+            fds=live * (1 if is_duplex(variant) else 2) + 10))
     (d / f"rep{rep}.metrics.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     (d / f"rep{rep}.node.log").write_text("fake\n")
     (d / f"rep{rep}.meta.json").write_text(json.dumps(dict(

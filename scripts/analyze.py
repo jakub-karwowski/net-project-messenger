@@ -9,11 +9,16 @@ the report instead of being silently dropped.
 import csv, html, json, math, sys
 from pathlib import Path
 
-VARIANTS = ["threads", "pool-sender", "poll", "epoll"]
+VARIANTS = ["threads", "pool-sender", "poll", "epoll",
+            "poll-duplex", "epoll-duplex", "poll-split", "epoll-split"]
 # Colour-blind-safe-ish categorical colours (light, dark) + distinct marker shapes.
 COLORS = {"threads": ("#0072B2", "#56B4E9"), "pool-sender": ("#D55E00", "#F0A060"),
-          "poll": ("#009E73", "#4FD1A5"), "epoll": ("#CC79A7", "#E8A3C8")}
-MARKERS = {"threads": "circle", "pool-sender": "square", "poll": "triangle", "epoll": "diamond"}
+          "poll": ("#009E73", "#4FD1A5"), "epoll": ("#CC79A7", "#E8A3C8"),
+          # duplex/split: shifted shades of their base poll (green) / epoll (pink) hue
+          "poll-duplex": ("#005C42", "#8FE3C2"), "poll-split": ("#8BC34A", "#B5E27A"),
+          "epoll-duplex": ("#7A2E58", "#F5C4DE"), "epoll-split": ("#E040A0", "#FF7FC8")}
+MARKERS = {"threads": "circle", "pool-sender": "square", "poll": "triangle", "epoll": "diamond",
+           "poll-duplex": "cross", "poll-split": "star", "epoll-duplex": "hexagon", "epoll-split": "plus"}
 
 # key, label, unit, prefer-log
 METRICS = [
@@ -208,6 +213,24 @@ def marker(shape, x, y, cls):
         return f'<rect class="{cls}" x="{x-r:.1f}" y="{y-r:.1f}" width="{2*r}" height="{2*r}"/>'
     if shape == "triangle":
         return f'<polygon class="{cls}" points="{x:.1f},{y-r-1:.1f} {x+r+1:.1f},{y+r:.1f} {x-r-1:.1f},{y+r:.1f}"/>'
+    def poly(pts):
+        return f'<polygon class="{cls}" points="' + " ".join(f"{x+dx:.1f},{y+dy:.1f}" for dx, dy in pts) + '"/>'
+    if shape == "plus":
+        t = 1.6
+        return poly([(-t, -r-1), (t, -r-1), (t, -t), (r+1, -t), (r+1, t), (t, t), (t, r+1), (-t, r+1), (-t, t), (-r-1, t), (-r-1, -t), (-t, -t)])
+    if shape == "cross":   # plus rotated 45 degrees
+        t = 1.6
+        pts = [(-t, -r-1), (t, -r-1), (t, -t), (r+1, -t), (r+1, t), (t, t), (t, r+1), (-t, r+1), (-t, t), (-r-1, t), (-r-1, -t), (-t, -t)]
+        return poly([((px - py) * 0.7071, (px + py) * 0.7071) for px, py in pts])
+    if shape == "hexagon":
+        return poly([(r+1, 0), (r/2, (r+1)*0.866), (-r/2, (r+1)*0.866), (-r-1, 0), (-r/2, -(r+1)*0.866), (r/2, -(r+1)*0.866)])
+    if shape == "star":
+        pts = []
+        for k in range(10):
+            rad = (r + 2) if k % 2 == 0 else (r + 2) * 0.45
+            ang = -math.pi / 2 + k * math.pi / 5
+            pts.append((rad * math.cos(ang), rad * math.sin(ang)))
+        return poly(pts)
     return f'<polygon class="{cls}" points="{x:.1f},{y-r-1:.1f} {x+r+1:.1f},{y:.1f} {x:.1f},{y+r+1:.1f} {x-r-1:.1f},{y:.1f}"/>'
 
 
