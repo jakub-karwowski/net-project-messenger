@@ -23,7 +23,8 @@ add_library(app_core STATIC
   ThreadWorkers.cpp
   PeerSession.cpp
   BlockingOutbound.cpp
-  Transport.cpp)
+  Transport.cpp
+  Render.cpp)
 target_include_directories(app_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(app_core PUBLIC TcpSocket TerminalUI Threads::Threads)
 
@@ -78,14 +79,6 @@ add_test(NAME test_store COMMAND test_store)
 add_test(NAME test_render COMMAND test_render)
 add_test(NAME test_main COMMAND test_main)
 add_test(NAME test_logger COMMAND test_logger)
-# --- Render (T3): ChatController / TerminalRender / HeadlessRender ------------
-add_library(Render STATIC Render.cpp)
-target_include_directories(Render PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(Render PUBLIC TcpSocket TerminalUI Threads::Threads)
-foreach(render_user app test_p2p test_workers test_sender test_store test_render test_main test_logger)
-    target_link_libraries(${render_user} PRIVATE Render)
-endforeach()
-
 add_executable(test_headless test_headless.cpp)
-target_link_libraries(test_headless PRIVATE Render TcpSocket TerminalUI Threads::Threads)
+target_link_libraries(test_headless PRIVATE app_core)
 add_test(NAME test_headless COMMAND test_headless)
