@@ -12,6 +12,7 @@
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <sys/epoll.h>
 #include <unordered_map>
 #include <vector>
 
@@ -110,6 +111,7 @@ class TcpConnection {
         std::expected<size_t, SocketError> receive_once(std::span<std::byte> destination, int flags) noexcept;
 
         friend class TcpConnectionPool;
+        friend class EpollConnectionPool;
 
     private:
         std::expected<void, SocketError> apply_options() noexcept;
@@ -303,6 +305,101 @@ private:
 
     PollSet poll_set_;
     ConnectionMap connections_;
+};
+
+// Drop-in alternative to TcpConnectionPool backed by epoll(7) (Linux only).
+//
+// Same contract: receive() must be driven by a single thread; add_connection(),
+// send(), remove_connection() and close_pool() may be called concurrently, and
+// every result/error means exactly the same as in TcpConnectionPool. Unlike the
+// poll() version, producers may call epoll_ctl() while receive() is blocked in
+// epoll_wait(), so no poll-array hand-off is needed at all.
+class EpollConnectionPool {
+public:
+    // Same arguments and semantics as TcpConnectionPool.
+    explicit EpollConnectionPool(
+        std::size_t max_connections = 128,
+        std::chrono::milliseconds idle_timeout = std::chrono::seconds(60),
+        std::size_t max_tx_buffer_bytes = 1024 * 1024);
+
+    ~EpollConnectionPool();
+
+    EpollConnectionPool(const EpollConnectionPool&) = delete;
+    EpollConnectionPool& operator=(const EpollConnectionPool&) = delete;
+    EpollConnectionPool(EpollConnectionPool&&) = delete;
+    EpollConnectionPool& operator=(EpollConnectionPool&&) = delete;
+
+    // Registers a connection and arms EPOLLIN for it. Returns the new id, or -1
+    // when the connection is unusable, the pool is closed, or the descriptor
+    // cannot be registered with epoll.
+    int add_connection(TcpConnection connection) noexcept;
+
+    // Removes and closes a connection; idempotent (false when unknown).
+    bool remove_connection(int connection_id) noexcept;
+
+    // Signals shutdown and breaks a blocked receive().
+    void close_pool() noexcept;
+
+    // Blocks in epoll_wait() until a connection is readable/disconnects, while
+    // flushing pending tx buffers and sweeping idle/over-capacity connections.
+    std::expected<ReceiveResult, SocketError> receive(
+        std::span<std::byte> destination) noexcept;
+
+    // Same fast/slow path as TcpConnectionPool: immediate non-blocking write while
+    // the tx buffer is empty, otherwise queue the remainder and arm EPOLLOUT.
+    std::expected<void, SocketError> send(
+        int connection_id,
+        std::span<const std::byte> source) noexcept;
+
+private:
+    struct Entry {
+        TcpConnection connection;
+        std::int64_t last_active_ms{};       // Monotonic timestamp of last activity
+        std::vector<std::byte> tx_buffer;    // Pending outbound bytes awaiting EPOLLOUT
+        std::size_t tx_offset{0};            // Read cursor into tx_buffer
+        std::uint32_t events{0};             // Currently registered epoll interest
+    };
+
+    using ConnectionMap = std::unordered_map<int, Entry>;
+    using Iterator = ConnectionMap::iterator;
+
+    static std::int64_t now_ms() noexcept;
+    static std::uint32_t desired_events(const Entry& entry) noexcept;
+
+    // Flushes entry.tx_buffer via non-blocking ::send() (caller must hold mutex_).
+    // Returns false on a fatal write error.
+    bool flush_tx_locked(Entry& entry) noexcept;
+
+    // Adjusts the epoll interest of an existing connection (caller holds mutex_).
+    void arm_locked(int id, Entry& entry, std::uint32_t events) noexcept;
+
+    // Sweeps expired connections and enforces max_connections_ (caller holds mutex_).
+    void prune_locked(std::int64_t now) noexcept;
+
+    // epoll-remove + shutdown + erase; returns the iterator that follows.
+    Iterator drop_locked(Iterator it) noexcept;
+
+    void wake() const noexcept;
+    void drain_wake() const noexcept;
+
+    std::mutex mutex_;
+    int epoll_fd_{-1};
+    int wake_fd_{-1};
+    int next_id_{1};
+    std::size_t max_connections_;
+    std::int64_t idle_timeout_ms_;
+    std::size_t max_tx_buffer_bytes_;
+    std::atomic<bool> closed_{false};
+
+    std::int64_t sweep_interval_ms_{0};   // How often receive() sweeps idle/LRU entries
+    std::int64_t next_sweep_ms_{0};       // When the next sweep is due
+
+    ConnectionMap connections_;
+    std::vector<epoll_event> events_;     // receive() only; sized to max_connections_ + 2
+    std::size_t cursor_{0};               // Fairness cursor into events_
+
+    // Connection ids start at 1, so 0 is safe as the wake-descriptor token.
+    static constexpr std::uint64_t kWakeToken = 0;
 };
 
 

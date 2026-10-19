@@ -12,6 +12,7 @@
 #include <poll.h>
 #include <span>
 #include <stdexcept>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -709,5 +710,393 @@ std::expected<void, SocketError> TcpConnectionPool::send(
     // Ask receive() to arm POLLOUT for this connection on its next pass.
     poll_set_.upsert(connection_id, entry.connection.native_handle(), entry.desired_events());
     poll_set_.wake();
+    return {};
+}
+
+EpollConnectionPool::EpollConnectionPool(std::size_t max_connections,
+                                         std::chrono::milliseconds idle_timeout,
+                                         std::size_t max_tx_buffer_bytes)
+    : max_connections_(max_connections == 0 ? 1 : max_connections),
+      idle_timeout_ms_(idle_timeout.count() > 0
+                           ? static_cast<std::int64_t>(idle_timeout.count())
+                           : 0),
+      max_tx_buffer_bytes_(max_tx_buffer_bytes) {
+    epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd_ < 0) {
+        throw SocketException(get_last_socket_error());
+    }
+
+    // The wake-up descriptor lives in the same epoll set, so a blocked
+    // epoll_wait() returns as soon as a producer nudges it.
+    wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (wake_fd_ < 0) {
+        ::close(epoll_fd_);
+        throw SocketException(get_last_socket_error());
+    }
+
+    epoll_event wake_event{};
+    wake_event.events = EPOLLIN;
+    wake_event.data.u64 = kWakeToken;
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &wake_event) < 0) {
+        ::close(wake_fd_);
+        ::close(epoll_fd_);
+        throw SocketException(get_last_socket_error());
+    }
+
+    // +2 covers the wake descriptor plus a transiently over-capacity pool.
+    events_.resize(max_connections_ + 2);
+
+    constexpr std::int64_t kMinSweepMs = 10;
+    constexpr std::int64_t kMaxSweepMs = 250;
+    sweep_interval_ms_ = idle_timeout_ms_ <= 0
+                             ? kMaxSweepMs
+                             : std::clamp<std::int64_t>(idle_timeout_ms_ / 4, kMinSweepMs, kMaxSweepMs);
+    next_sweep_ms_ = now_ms() + sweep_interval_ms_;
+}
+
+EpollConnectionPool::~EpollConnectionPool() {
+    close_pool();
+
+    // Close the sockets outside the lock (closing also drops them from the epoll set).
+    ConnectionMap drained;
+    {
+        std::lock_guard lock(mutex_);
+        drained.swap(connections_);
+    }
+    drained.clear();
+
+    if (wake_fd_ >= 0) {
+        ::close(wake_fd_);
+        wake_fd_ = -1;
+    }
+    if (epoll_fd_ >= 0) {
+        ::close(epoll_fd_);
+        epoll_fd_ = -1;
+    }
+}
+
+std::int64_t EpollConnectionPool::now_ms() noexcept {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+std::uint32_t EpollConnectionPool::desired_events(const Entry& entry) noexcept {
+    return entry.tx_buffer.size() > entry.tx_offset
+               ? static_cast<std::uint32_t>(EPOLLIN | EPOLLOUT)
+               : static_cast<std::uint32_t>(EPOLLIN);
+}
+
+void EpollConnectionPool::wake() const noexcept {
+    if (wake_fd_ < 0) { return; }
+    const std::uint64_t one = 1;
+    // EAGAIN here only means a wake-up is already pending, which is fine.
+    [[maybe_unused]] const ssize_t written = ::write(wake_fd_, &one, sizeof(one));
+}
+
+void EpollConnectionPool::drain_wake() const noexcept {
+    if (wake_fd_ < 0) { return; }
+    std::uint64_t value = 0;
+    while (::read(wake_fd_, &value, sizeof(value)) > 0) {
+    }
+}
+
+void EpollConnectionPool::arm_locked(int id, Entry& entry, std::uint32_t events) noexcept {
+    if (entry.events == events) { return; }
+
+    epoll_event event{};
+    event.events = events;
+    event.data.u64 = static_cast<std::uint64_t>(id);
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, entry.connection.native_handle(), &event) == 0) {
+        entry.events = events;
+    }
+}
+
+int EpollConnectionPool::add_connection(TcpConnection connection) noexcept {
+    const int fd = connection.native_handle();
+    if (fd < 0) { return -1; } // moved-from connection
+
+    connection.with_non_blocking(true);
+
+    std::lock_guard lock(mutex_);
+    if (closed_.load(std::memory_order_relaxed)) { return -1; }
+
+    const std::int64_t now = now_ms();
+    const int id = next_id_++;
+
+    const auto [it, inserted] = connections_.try_emplace(
+        id, Entry{std::move(connection), now, {}, 0, EPOLLIN});
+    (void)inserted;
+
+    epoll_event event{};
+    event.events = EPOLLIN;
+    event.data.u64 = static_cast<std::uint64_t>(id);
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &event) < 0) {
+        // The descriptor cannot be multiplexed; do not keep a cached entry for it.
+        connections_.erase(it); // closes the socket
+        return -1;
+    }
+
+    // Enforce the cap after inserting so the newcomer participates; the LRU
+    // tie-break below prefers older ids, so a same-millisecond burst keeps it.
+    prune_locked(now);
+
+    wake();
+    return id;
+}
+
+bool EpollConnectionPool::remove_connection(int connection_id) noexcept {
+    std::lock_guard lock(mutex_);
+    const auto it = connections_.find(connection_id);
+    if (it == connections_.end()) { return false; }
+
+    drop_locked(it);
+    wake();
+    return true;
+}
+
+void EpollConnectionPool::close_pool() noexcept {
+    closed_.store(true, std::memory_order_relaxed);
+    wake();
+}
+
+EpollConnectionPool::Iterator EpollConnectionPool::drop_locked(Iterator it) noexcept {
+    // DEL before the descriptor is shut down/closed; epoll_ctl is safe while
+    // another thread may be blocked in epoll_wait().
+    (void)::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, it->second.connection.native_handle(), nullptr);
+    it->second.connection.shutdown_quietly();
+    return connections_.erase(it);
+}
+
+void EpollConnectionPool::prune_locked(std::int64_t now) noexcept {
+    if (idle_timeout_ms_ > 0) {
+        for (auto it = connections_.begin(); it != connections_.end();) {
+            if (now - it->second.last_active_ms >= idle_timeout_ms_) {
+                it = drop_locked(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Least recently active first: the freshest additions have the newest
+    // stamps. Ties go to the lower id, so the connection just added is never
+    // the one evicted.
+    while (connections_.size() > max_connections_) {
+        auto oldest = connections_.begin();
+        for (auto it = connections_.begin(); it != connections_.end(); ++it) {
+            const bool older = it->second.last_active_ms < oldest->second.last_active_ms;
+            const bool same_age_lower_id =
+                it->second.last_active_ms == oldest->second.last_active_ms
+                && it->first < oldest->first;
+            if (older || same_age_lower_id) { oldest = it; }
+        }
+        drop_locked(oldest);
+    }
+}
+
+bool EpollConnectionPool::flush_tx_locked(Entry& entry) noexcept {
+    while (entry.tx_offset < entry.tx_buffer.size()) {
+        const std::span<const std::byte> pending{entry.tx_buffer.data() + entry.tx_offset,
+                                                 entry.tx_buffer.size() - entry.tx_offset};
+        const auto sent = entry.connection.send_once(pending, MSG_DONTWAIT);
+        if (!sent) {
+            if (sent.error() == SocketError::Interrupted) { continue; }
+            if (sent.error() == SocketError::WouldBlock) {
+                return true; // still back-pressured: wait for the next EPOLLOUT
+            }
+            return false; // fatal write error
+        }
+        if (*sent == 0) { return false; } // zero-length write on a broken stream
+
+        entry.tx_offset += *sent;
+        entry.last_active_ms = now_ms();
+    }
+
+    entry.tx_buffer.clear();
+    entry.tx_offset = 0;
+    return true;
+}
+
+std::expected<ReceiveResult, SocketError> EpollConnectionPool::receive(
+    std::span<std::byte> destination) noexcept {
+    if (destination.empty()) {
+        // A zero-length recv() would be indistinguishable from a clean EOF.
+        return std::unexpected(SocketError::Unknown);
+    }
+
+    for (;;) {
+        {
+            std::lock_guard lock(mutex_);
+            if (closed_.load(std::memory_order_relaxed)) {
+                return std::unexpected(SocketError::ConnectionClosed);
+            }
+
+            const std::int64_t current = now_ms();
+            if (current >= next_sweep_ms_) {
+                prune_locked(current);
+                next_sweep_ms_ = current + sweep_interval_ms_;
+            }
+        }
+
+        const int timeout_ms = static_cast<int>(
+            std::clamp<std::int64_t>(next_sweep_ms_ - now_ms(), 0, sweep_interval_ms_));
+
+        // No lock is held while blocked. Producers may call epoll_ctl() (arm EPOLLOUT,
+        // delete a connection) concurrently; the kernel serialises that against this
+        // wait, and events_ is touched by this thread only.
+        const int ready = ::epoll_wait(epoll_fd_, events_.data(),
+                                       static_cast<int>(events_.size()), timeout_ms);
+        if (ready < 0) {
+            if (errno == EINTR) { continue; }
+            return std::unexpected(get_last_socket_error());
+        }
+
+        std::lock_guard lock(mutex_);
+        drain_wake();
+
+        if (closed_.load(std::memory_order_relaxed)) {
+            return std::unexpected(SocketError::ConnectionClosed);
+        }
+        if (ready == 0) {
+            continue; // timeout: the next iteration performs the sweep
+        }
+
+        const std::size_t count = static_cast<std::size_t>(ready);
+        std::optional<ReceiveResult> output;
+        std::size_t serviced = 0;
+
+        // Rotate the scan so one perpetually-ready socket cannot starve the rest.
+        for (std::size_t step = 0; step < count; ++step) {
+            const std::size_t idx = (cursor_ + step) % count;
+            const epoll_event& event = events_[idx];
+
+            if (event.data.u64 == kWakeToken) { continue; }
+
+            const int conn_id = static_cast<int>(event.data.u64);
+            const auto it = connections_.find(conn_id);
+            if (it == connections_.end()) { continue; } // removed while waiting
+
+            Entry& entry = it->second;
+
+            if ((event.events & EPOLLOUT) != 0 && entry.tx_buffer.size() > entry.tx_offset) {
+                if (!flush_tx_locked(entry)) {
+                    drop_locked(it);
+                    output = ReceiveResult{.connection_id = conn_id, .bytes_read = 0};
+                    serviced = idx;
+                    break;
+                }
+                // Buffer state changed: disarm EPOLLOUT once it is fully drained.
+                arm_locked(conn_id, entry, desired_events(entry));
+            }
+
+            if ((event.events & EPOLLIN) != 0) {
+                const auto received = entry.connection.receive_once(destination, MSG_DONTWAIT);
+                if (received) {
+                    if (*received > 0) {
+                        entry.last_active_ms = now_ms();
+                        output = ReceiveResult{.connection_id = conn_id, .bytes_read = *received};
+                        serviced = idx;
+                        break;
+                    }
+                    // Clean EOF: the peer shut down its write side.
+                    drop_locked(it);
+                    output = ReceiveResult{.connection_id = conn_id, .bytes_read = 0};
+                    serviced = idx;
+                    break;
+                }
+                if (received.error() != SocketError::WouldBlock
+                    && received.error() != SocketError::Interrupted) {
+                    // Fatal read error: report it as a disconnect.
+                    drop_locked(it);
+                    output = ReceiveResult{.connection_id = conn_id, .bytes_read = 0};
+                    serviced = idx;
+                    break;
+                }
+            }
+
+            if ((event.events & (EPOLLERR | EPOLLHUP)) != 0) {
+                drop_locked(it);
+                output = ReceiveResult{.connection_id = conn_id, .bytes_read = 0};
+                serviced = idx;
+                break;
+            }
+        }
+
+        if (output) {
+            cursor_ = (serviced + 1) % count;
+            return *output;
+        }
+    }
+}
+
+std::expected<void, SocketError> EpollConnectionPool::send(
+    int connection_id,
+    std::span<const std::byte> source) noexcept {
+    std::lock_guard lock(mutex_);
+
+    if (closed_.load(std::memory_order_relaxed)) {
+        return std::unexpected(SocketError::ConnectionClosed);
+    }
+
+    const auto it = connections_.find(connection_id);
+    if (it == connections_.end()) {
+        return std::unexpected(SocketError::ConnectionNotFound);
+    }
+    if (source.empty()) { return {}; }
+
+    Entry& entry = it->second;
+    const std::size_t pending = entry.tx_buffer.size() - entry.tx_offset;
+
+    // Reject up front when the buffer cannot be accepted atomically: either it
+    // is larger than the cap, or it would overflow the already pending bytes.
+    if (source.size_bytes() > max_tx_buffer_bytes_) {
+        return std::unexpected(SocketError::WouldBlock);
+    }
+    if (pending != 0 && source.size_bytes() > max_tx_buffer_bytes_ - pending) {
+        return std::unexpected(SocketError::WouldBlock);
+    }
+
+    std::size_t consumed = 0;
+    if (pending == 0) {
+        entry.tx_buffer.clear();
+        entry.tx_offset = 0;
+
+        while (consumed < source.size_bytes()) {
+            const auto sent = entry.connection.send_once(source.subspan(consumed), MSG_DONTWAIT);
+            if (sent && *sent > 0) {
+                consumed += *sent;
+                continue;
+            }
+            if (!sent && sent.error() == SocketError::Interrupted) { continue; }
+            if (!sent && sent.error() == SocketError::WouldBlock) { break; }
+
+            // Fatal write error (or a zero-length write on a non-empty stream).
+            const SocketError error = sent ? SocketError::ConnectionClosed : sent.error();
+            drop_locked(it);
+            wake();
+            return std::unexpected(error);
+        }
+
+        entry.last_active_ms = now_ms();
+        if (consumed == source.size_bytes()) { return {}; }
+    }
+
+    // Slow path: keep the unsent remainder and let receive() finish it on EPOLLOUT.
+    // Only compact once the dead prefix dominates, so appends stay amortized O(1).
+    if (entry.tx_offset > 0 && entry.tx_offset >= entry.tx_buffer.size() / 2) {
+        entry.tx_buffer.erase(
+            entry.tx_buffer.begin(),
+            entry.tx_buffer.begin() + static_cast<std::ptrdiff_t>(entry.tx_offset));
+        entry.tx_offset = 0;
+    }
+    entry.tx_buffer.insert(entry.tx_buffer.end(),
+                           source.begin() + static_cast<std::ptrdiff_t>(consumed),
+                           source.end());
+    entry.last_active_ms = now_ms();
+
+    // Arm EPOLLOUT; epoll_ctl is safe while receive() may be blocked in epoll_wait().
+    arm_locked(connection_id, entry, desired_events(entry));
+    wake();
     return {};
 }
