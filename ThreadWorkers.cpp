@@ -19,6 +19,7 @@
 
 #include "Chat.hpp"
 #include "Element.hpp"
+#include "Transport.hpp"
 #include "Utils.hpp"
 
 #include <algorithm>
@@ -250,27 +251,11 @@ ReaderWorker::ReaderWorker(
     std::size_t read_chunk,
     std::chrono::milliseconds tick_period,
     Logger logger)
-    : store_queue_(store_queue),
-      activity_(std::move(activity)),
-      peers_(peers),
+    : activity_(std::move(activity)),
       // A zero buffer or timeout would be unusable: fall back to the defaults.
       read_chunk_(read_chunk == 0 ? kDefaultReadChunk : read_chunk),
       tick_period_(tick_period.count() > 0 ? tick_period : kDefaultTickPeriod),
-      logger_(std::move(logger)) {}
-
-void ReaderWorker::remember_assigned_id(uint64_t peer_id, uint64_t assigned_id) {
-    // The peer told us the name it uses for us (either by naming us in its own
-    // ConnectInfo, or by answering ours with a ConnectInfoAck). Keep it in the peer
-    // table: the sender echoes it in the next ConnectInfo it sends that peer, which
-    // is what lets the peer recognise us when our address changes.
-    if (peer_id == 0 || assigned_id == 0) { return; }
-    if (peers_.set_assigned_id(peer_id, assigned_id)) {
-        logger_.info("peer#" + std::to_string(peer_id) + " calls us #"
-                     + std::to_string(assigned_id));
-    } else {
-        logger_.warn("assigned id dropped: peer#" + std::to_string(peer_id) + " unknown");
-    }
-}
+      session_(store_queue, peers, std::move(logger)) {}
 
 void ReaderWorker::operator()() {
     // Report completion on every exit path (including an early return): the watchdog
@@ -287,8 +272,7 @@ void ReaderWorker::operator()() {
     connection.with_receive_timeout(tick_period_);
     std::vector<std::byte> scratch(read_chunk_);
 
-    bool stop = false;
-    while (!stop) {
+    for (;;) {
         // Heartbeat first: an idle-but-healthy reader still proves liveness each
         // iteration, so only a genuinely wedged thread stops ticking.
         activity_->tick.fetch_add(1, std::memory_order_relaxed);
@@ -305,79 +289,12 @@ void ReaderWorker::operator()() {
         // A real read: stamp the reader so the watchdog ranks it above idle ones.
         activity_->last_read_ns.store(steady_now_ns(), std::memory_order_relaxed);
 
-        decoder_.feed(std::span<const std::byte>{scratch.data(), *received});
-
-        for (;;) {
-            auto item = decoder_.next();
-            if (!item) {
-                logger_.warn("malformed frame: closing connection");
-                stop = true;
-                break;
-            }
-            if (!*item) { break; }             // need more bytes
-
-            wire::Message& message = **item;
-            if (const auto* connect = wire::as_connect(message)) {
-                // The peer dialled us and named us via its ConnectInfo. It may also
-                // re-present an id we handed it earlier: adopting that id instead of
-                // minting a new one is what lets a peer that changed address resume
-                // its old conversation. Otherwise we name the peer ourselves. Either
-                // way, remember its endpoints and ask the sender to open our own
-                // write channel and acknowledge (echoing the peer's name for us).
-                const uint64_t returning = connect->assigned_peer_id;
-                const bool adopted = returning != 0 && peers_.lookup(returning).has_value();
-                if (adopted) {
-                    peer_id_ = returning;
-                    logger_.info("peer returned as #" + std::to_string(peer_id_));
-                } else {
-                    peer_id_ = next_local_peer_id();
-                }
-                logger_.info("peer connected: local#" + std::to_string(peer_id_)
-                             + " assigned#" + std::to_string(connect->peer_id));
-                for (const wire::Endpoint& endpoint : connect->endpoints) {
-                    peers_.insert(peer_id_, PeerTable::Address{endpoint.address, endpoint.port});
-                }
-                peers_.set_connection(peer_id_, connection_id_);
-                remember_assigned_id(peer_id_, connect->peer_id);
-                if (!store_queue_.emplace(EventPeerConnected{
-                        peer_id_, connect->peer_id, connect->endpoints, adopted})) {
-                    stop = true; // consumer gone: nothing left to deliver to
-                    break;
-                }
-            } else if (const auto* ack = wire::as_connect_ack(message)) {
-                // The peer answered our ConnectInfo: `ack_peer_id` is the name we
-                // gave the peer, so it is how we refer to the peer from now on; its
-                // `peer_id` is the name it gave us, kept to re-present later.
-                peer_id_ = ack->ack_peer_id;
-                logger_.info("handshake complete: peer#" + std::to_string(peer_id_));
-                peers_.set_connection(peer_id_, connection_id_);
-                remember_assigned_id(peer_id_, ack->peer_id);
-            } else if (const auto* chat = wire::as_message(message)) {
-                // The conversation is local to this node, so the wire's
-                // conversation_id is meaningless here: route by the peer identity
-                // learned from ConnectInfo. A message that arrives before any
-                // identity cannot be attributed to a peer, so it is dropped.
-                if (peer_id_ == 0) {
-                    logger_.warn("dropped message before peer identity");
-                    continue;
-                }
-                if (!store_queue_.emplace(EventMessage{peer_id_, 0, chat->body})) {
-                    stop = true; // consumer gone: nothing left to deliver to
-                    break;
-                }
-            }
+        if (!session_.on_bytes(std::span<const std::byte>{scratch.data(), *received})) {
+            break; // malformed frame, or the consumer is gone
         }
     }
 
-    if (peer_id_ != 0 && peers_.release_connection(peer_id_, connection_id_)) {
-        // Keep the peer in the table so its address stays usable for a later
-        // reconnect; only the status records that it is gone. The store worker
-        // resolves the local conversation and routes the error to its subscriber.
-        // A superseded reader (a newer connection adopted the same peer id) stays
-        // silent: the peer is still live on that newer connection.
-        logger_.info("peer#" + std::to_string(peer_id_) + " disconnected");
-        (void)store_queue_.emplace(EventPeerDisconnected{0, peer_id_});
-    }
+    session_.on_closed();
 }
 
 // --- WatchdogWorker ---------------------------------------------------------
@@ -617,20 +534,6 @@ void ListenerWorker::operator()() {
 
 // --- SenderWorker -----------------------------------------------------------
 
-namespace {
-    // Pushes every byte of `data`; a partial send resumes where the previous one
-    // stopped. Returns false as soon as the socket reports a failure.
-    bool send_all(TcpConnection& connection, std::span<const std::byte> data) {
-        std::size_t sent = 0;
-        while (sent < data.size()) {
-            auto result = connection.send(data.subspan(sent));
-            if (!result || *result == 0) { return false; }
-            sent += *result;
-        }
-        return true;
-    }
-} // namespace
-
 SenderWorker::SenderWorker(
     ThreadQueue<Event>& store_queue,
     ThreadQueue<Event>& sender_queue,
@@ -646,18 +549,38 @@ SenderWorker::SenderWorker(
       local_(std::move(local)),
       send_attempts_(send_attempts == 0 ? 1 : send_attempts),
       retry_delay_(retry_delay),
-      // A zero timeout would mean "block forever", which is exactly what this bound
-      // exists to prevent.
-      send_timeout_(send_timeout.count() > 0 ? send_timeout : kDefaultSendTimeout),
+      owned_transport_(std::make_unique<BlockingOutbound>(
+          // A zero timeout would mean "block forever", which is exactly what this
+          // bound exists to prevent.
+          send_timeout.count() > 0 ? send_timeout : kDefaultSendTimeout)),
+      transport_(owned_transport_.get()),
       logger_(std::move(logger)) {}
 
-TcpConnection* SenderWorker::ensure_connection(uint64_t peer_id) {
+SenderWorker::SenderWorker(
+    ThreadQueue<Event>& store_queue,
+    ThreadQueue<Event>& sender_queue,
+    PeerTable& peers,
+    OutboundTransport& transport,
+    LocalEndpoints local,
+    unsigned send_attempts,
+    std::chrono::milliseconds retry_delay,
+    Logger logger)
+    : store_queue_(store_queue),
+      sender_queue_(sender_queue),
+      peers_(peers),
+      local_(std::move(local)),
+      send_attempts_(send_attempts == 0 ? 1 : send_attempts),
+      retry_delay_(retry_delay),
+      transport_(&transport),
+      logger_(std::move(logger)) {}
+
+std::optional<OutboundTransport::Handle> SenderWorker::ensure_connection(uint64_t peer_id) {
     if (const auto it = connections_.find(peer_id); it != connections_.end()) {
-        return &it->second; // reuse the connection opened for an earlier message
+        return it->second; // reuse the connection opened for an earlier message
     }
 
     const auto entry = peers_.lookup(peer_id);
-    if (!entry) { return nullptr; } // no known address: nothing to dial
+    if (!entry) { return std::nullopt; } // no known address: nothing to dial
 
     // Name the peer (that is what ConnectInfo carries), re-present the name the peer
     // gave us (0 until it has told us) and advertise where we accept connections,
@@ -666,23 +589,16 @@ TcpConnection* SenderWorker::ensure_connection(uint64_t peer_id) {
                 wire::make_connect(peer_id, entry->assigned_id, local_.endpoints));
 }
 
-TcpConnection* SenderWorker::open(uint64_t peer_id,
-                                  const std::string& ip,
-                                  uint16_t port,
-                                  const wire::Message& hello) {
-    auto connected = TcpConnection::connect(ip, port);
-    if (!connected) { return nullptr; }
-
-    connected->with_tcp_nodelay(true).with_keep_alive(true).with_send_timeout(send_timeout_);
-
+std::optional<OutboundTransport::Handle> SenderWorker::open(uint64_t peer_id,
+                                                            const std::string& ip,
+                                                            uint16_t port,
+                                                            const wire::Message& hello) {
     const auto frame = wire::encode(hello);
-    if (!frame || !send_all(*connected, *frame)) {
-        std::ignore = connected->shutdown(TcpConnection::Shutdown::Both);
-        return nullptr;
-    }
-
-    const auto it = connections_.emplace(peer_id, std::move(*connected)).first;
-    return &it->second;
+    if (!frame) { return std::nullopt; }
+    auto handle = transport_->open(ip, port, *frame);
+    if (!handle) { return std::nullopt; }
+    connections_[peer_id] = *handle;
+    return *handle;
 }
 
 void SenderWorker::establish_ack(uint64_t peer_id,
@@ -701,7 +617,7 @@ void SenderWorker::establish_ack(uint64_t peer_id,
     if (endpoints.empty()) { return; }
     const wire::Endpoint& endpoint = endpoints.front();
     const bool sent = open(peer_id, endpoint.address, endpoint.port,
-                           wire::make_connect_ack(peer_id, assigned_peer_id)) != nullptr;
+                           wire::make_connect_ack(peer_id, assigned_peer_id)).has_value();
     if (sent) {
         logger_.info("handshake answer sent: peer#" + std::to_string(peer_id));
     } else {
@@ -719,7 +635,7 @@ void SenderWorker::dial_peer(const EventDialPeer& dial) {
         const auto known = peers_.lookup(dial.peer_id);
         const uint64_t assigned_id = known ? known->assigned_id : 0;
         connected = open(dial.peer_id, dial.ip, dial.port,
-                         wire::make_connect(dial.peer_id, assigned_id, local_.endpoints)) != nullptr;
+                         wire::make_connect(dial.peer_id, assigned_id, local_.endpoints)).has_value();
     }
     if (connected) {
         // Remember where the peer lives: unlike an inbound peer (recorded by the
@@ -737,7 +653,7 @@ void SenderWorker::dial_peer(const EventDialPeer& dial) {
 bool SenderWorker::drop_connection(uint64_t peer_id) {
     const auto it = connections_.find(peer_id);
     if (it == connections_.end()) { return false; }
-    std::ignore = it->second.shutdown(TcpConnection::Shutdown::Both);
+    transport_->close(it->second);
     connections_.erase(it);
     return true;
 }
@@ -754,10 +670,10 @@ void SenderWorker::reconnect_peer(const EventReconnectPeer& reconnect) {
         return;
     }
     drop_connection(reconnect.peer_id);
-    TcpConnection* connection =
+    const auto connection =
         open(reconnect.peer_id, entry->address.ip, entry->address.port,
              wire::make_connect(reconnect.peer_id, entry->assigned_id, local_.endpoints));
-    if (connection != nullptr) {
+    if (connection) {
         peers_.mark_connected(reconnect.peer_id);
         logger_.info("reconnected: peer#" + std::to_string(reconnect.peer_id));
         (void)store_queue_.emplace(EventPeerDialed{reconnect.conversation_id, reconnect.peer_id});
@@ -825,8 +741,8 @@ void SenderWorker::operator()() {
 
         bool delivered = false;
         for (unsigned attempt = 0; frame && attempt < send_attempts_; ++attempt) {
-            TcpConnection* connection = ensure_connection(message->peer_id);
-            if (connection != nullptr && send_all(*connection, *frame)) {
+            const auto connection = ensure_connection(message->peer_id);
+            if (connection && transport_->send(*connection, *frame)) {
                 peers_.mark_connected(message->peer_id);
                 if (reconnecting) {
                     logger_.info("reconnected: peer#" + std::to_string(message->peer_id));
@@ -848,10 +764,16 @@ void SenderWorker::operator()() {
 
 // --- MainWorker -------------------------------------------------------------
 
+MainWorker::MainWorker(AppConfig config) : config_(std::move(config)) {}
+
 MainWorker::MainWorker(std::string local_address, unsigned port, std::string log_path)
-    : local_address_(std::move(local_address)),
-      port_(port),
-      log_path_(std::move(log_path)) {}
+    : config_([&] {
+          AppConfig config;
+          config.address = std::move(local_address);
+          config.port = port;
+          config.log_path = std::move(log_path);
+          return config;
+      }()) {}
 
 void MainWorker::operator()() {
     // The main thread owns the terminal and the render loop; every other worker
@@ -865,35 +787,40 @@ void MainWorker::operator()() {
     // Logging: one queue, one consumer that owns the sink. The file is opened
     // before the logger thread starts and outlives it; stderr is the fallback.
     ThreadQueue<LogRecord> logger_queue;
-    std::ofstream log_file{log_path_};
+    std::ofstream log_file{config_.log_path};
     std::ostream& log_sink = log_file.is_open() ? log_file : std::cerr;
     Logger logger{&logger_queue};
     LoggerWorker logger_worker{logger_queue, log_sink};
 
     StoreWorker store{render_queue, store_queue, sender_queue, logger};
-    SenderWorker sender{store_queue, sender_queue, peers,
-                        LocalEndpoints{{wire::Endpoint{local_address_,
-                                                       static_cast<uint16_t>(port_)}}},
+    // TODO(headless/echo/metrics): config_.headless, config_.echo and
+    // config_.metrics_path are parsed but not wired yet; a later task adds them.
+    NetConfig net;
+    net.address = config_.address;
+    net.port = config_.port;
+    net.max_peers = config_.max_peers;
+    IoStack io = make_io_stack(config_.io, net, store_queue, peers, logger);
+
+    SenderWorker sender{store_queue, sender_queue, peers, *io.outbound,
+                        LocalEndpoints{{wire::Endpoint{config_.address,
+                                                       static_cast<uint16_t>(config_.port)}}},
                         SenderWorker::kDefaultSendAttempts,
                         SenderWorker::kDefaultRetryDelay,
-                        SenderWorker::kDefaultSendTimeout,
                         logger};
     KeyboardListenerWorker keyboard{
         terminal, render_queue,
         KeyboardListenerWorker::kDefaultIdleTimeoutMs,
         KeyboardListenerWorker::kDefaultSequenceTimeoutMs,
         logger};
-    ListenerWorker listener{local_address_, port_, store_queue, peers,
-                            ListenerWorker::kDefaultMaxReaders,
-                            ListenerWorker::kDefaultBacklog, logger};
 
-    logger.info("main: starting on " + local_address_ + ":" + std::to_string(port_));
+    logger.info("main: starting on " + config_.address + ":" + std::to_string(config_.port)
+                + " io=" + std::string{to_string(config_.io)});
 
     std::thread logger_thread{[&logger_worker] { logger_worker(); }};
     std::thread store_thread{[&store] { store(); }};
     std::thread sender_thread{[&sender] { sender(); }};
     std::thread keyboard_thread{[&keyboard] { keyboard(); }};
-    std::thread listener_thread{[&listener] { listener(); }};
+    std::thread listener_thread{[&io] { io.inbound->run(); }};
 
     // Render on the main thread; it returns once the keyboard (Esc / Ctrl+C / EOF)
     // or a /quit command ends it.
@@ -904,7 +831,7 @@ void MainWorker::operator()() {
     // remaining threads finish and can be joined.
     logger.info("main: shutting down");
     keyboard.stop();
-    listener.stop();
+    io.inbound->stop();
     store_queue.graceful_shutdown();
     sender_queue.graceful_shutdown();
     render_queue.graceful_shutdown();
