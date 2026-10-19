@@ -1,6 +1,8 @@
 #include "TerminalUI.hpp"
 #include "Utils.hpp"
+#include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <iostream>
 #include <stdexcept>
 #include <memory>
@@ -20,6 +22,45 @@ namespace ansi {
     inline constexpr std::string_view clear_screen = "\033[2J";
     inline constexpr std::string_view hide_cursor = "\033[?25l";
     inline constexpr std::string_view show_cursor = "\033[?25h";
+}
+
+FrameBuffer::FrameBuffer(int columns, int rows) { resize(columns, rows); }
+
+// Sizes to `columns` x `rows` and blanks every cell, so a renderable always
+// produces a complete frame instead of patching the previous one.
+void FrameBuffer::resize(int columns, int rows) {
+    width = std::max(0, columns);
+    height = std::max(0, rows);
+    cells.assign(static_cast<size_t>(width) * static_cast<size_t>(height), Cell{});
+}
+
+void FrameBuffer::clear() noexcept {
+    std::fill(cells.begin(), cells.end(), Cell{});
+}
+
+bool FrameBuffer::row_equal(const FrameBuffer& other, int row) const noexcept {
+    if (width != other.width || height != other.height) { return false; }
+    if (row < 0 || row >= height) { return true; }
+    const size_t begin = static_cast<size_t>(row) * static_cast<size_t>(width);
+    const size_t end = begin + static_cast<size_t>(width);
+    return std::equal(
+        cells.begin() + static_cast<std::ptrdiff_t>(begin),
+        cells.begin() + static_cast<std::ptrdiff_t>(end),
+        other.cells.begin() + static_cast<std::ptrdiff_t>(begin)
+    );
+}
+
+std::string FrameBuffer::row_text(int row) const {
+    std::string text;
+    if (row < 0 || row >= height) { return text; }
+    text.reserve(static_cast<size_t>(width));
+    for (int column = 0; column < width; ++column) {
+        const Cell& cell = at(row, column);
+        if (cell.continuation) { continue; }
+        if (cell.text.empty()) { text.push_back(' '); }
+        else { text.append(cell.text); }
+    }
+    return text;
 }
 
 struct TerminalUI::TermImpl {

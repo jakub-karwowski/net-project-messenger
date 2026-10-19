@@ -28,19 +28,13 @@ struct FrameBuffer {
     std::vector<Cell> cells;   // row-major, width * height cells
 
     FrameBuffer() = default;
-    FrameBuffer(int columns, int rows) { resize(columns, rows); }
+    FrameBuffer(int columns, int rows);
 
     // Sizes to `columns` x `rows` and blanks every cell, so a renderable always
     // produces a complete frame instead of patching the previous one.
-    void resize(int columns, int rows) {
-        width = std::max(0, columns);
-        height = std::max(0, rows);
-        cells.assign(static_cast<size_t>(width) * static_cast<size_t>(height), Cell{});
-    }
+    void resize(int columns, int rows);
 
-    void clear() noexcept {
-        std::fill(cells.begin(), cells.end(), Cell{});
-    }
+    void clear() noexcept;
 
     bool contains(int row, int column) const noexcept {
         return row >= 0 && row < height && column >= 0 && column < width;
@@ -58,32 +52,11 @@ struct FrameBuffer {
 
     // True when `row` renders identically in both frames. Frames of different
     // sizes never match, so a resize forces a full repaint.
-    bool row_equal(const FrameBuffer& other, int row) const noexcept {
-        if (width != other.width || height != other.height) { return false; }
-        if (row < 0 || row >= height) { return true; }
-        const size_t begin = static_cast<size_t>(row) * static_cast<size_t>(width);
-        const size_t end = begin + static_cast<size_t>(width);
-        return std::equal(
-            cells.begin() + static_cast<std::ptrdiff_t>(begin),
-            cells.begin() + static_cast<std::ptrdiff_t>(end),
-            other.cells.begin() + static_cast<std::ptrdiff_t>(begin)
-        );
-    }
+    bool row_equal(const FrameBuffer& other, int row) const noexcept;
 
     // The bytes that reproduce `row`: one chunk per display column, blanks as
     // spaces, a wide glyph emitted once.
-    std::string row_text(int row) const {
-        std::string text;
-        if (row < 0 || row >= height) { return text; }
-        text.reserve(static_cast<size_t>(width));
-        for (int column = 0; column < width; ++column) {
-            const Cell& cell = at(row, column);
-            if (cell.continuation) { continue; }
-            if (cell.text.empty()) { text.push_back(' '); }
-            else { text.append(cell.text); }
-        }
-        return text;
-    }
+    std::string row_text(int row) const;
 
     bool operator==(const FrameBuffer& other) const = default;
 };
