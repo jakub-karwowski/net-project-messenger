@@ -12,7 +12,9 @@ namespace p2p {
 ThreadedInbound::ThreadedInbound(const NetConfig& net, ThreadQueue<Event>& store_queue,
                                  PeerTable& peers, Logger logger)
     : listener_(net.address, net.port, store_queue, peers, net.max_peers, net.backlog,
-                std::move(logger)) {}
+                std::move(logger)) {
+    listener_.set_metrics(net.metrics);
+}
 
 IoStack make_io_stack(IoMode mode, const NetConfig& net, ThreadQueue<Event>& store_queue,
                       PeerTable& peers, Logger logger) {

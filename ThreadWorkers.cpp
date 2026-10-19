@@ -252,21 +252,30 @@ ReaderWorker::ReaderWorker(
     PeerTable& peers,
     std::size_t read_chunk,
     std::chrono::milliseconds tick_period,
-    Logger logger)
-    : activity_(std::move(activity)),
+    Logger logger,
+    Metrics* metrics)
+    : metrics_(metrics),
+      activity_(std::move(activity)),
       // A zero buffer or timeout would be unusable: fall back to the defaults.
       read_chunk_(read_chunk == 0 ? kDefaultReadChunk : read_chunk),
       tick_period_(tick_period.count() > 0 ? tick_period : kDefaultTickPeriod),
-      session_(store_queue, peers, std::move(logger)) {}
+      session_(store_queue, peers, std::move(logger)) {
+    session_.set_metrics(metrics);
+}
 
 void ReaderWorker::operator()() {
     // Report completion on every exit path (including an early return): the watchdog
     // joins this thread as soon as it observes the flag, so the listener needs no
     // handle to join it with.
+    live_inc(metrics_);
     struct FinishGuard {
         std::atomic<bool>& flag;
-        ~FinishGuard() { flag.store(true, std::memory_order_release); }
-    } finish_guard{activity_->finished};
+        Metrics* metrics;
+        ~FinishGuard() {
+            live_dec(metrics);
+            flag.store(true, std::memory_order_release);
+        }
+    } finish_guard{activity_->finished, metrics_};
 
     TcpConnection& connection = *activity_->connection;
     // The reader owns its polling cadence: a bounded receive keeps the heartbeat
@@ -388,6 +397,7 @@ void WatchdogWorker::adopt(std::shared_ptr<ReaderActivity> activity, std::thread
         if (existing.activity->stopping.load(std::memory_order_relaxed)) { continue; }
         shutdown_reader(existing);
         logger_.info("watchdog: pruned idle reader");
+        bump(metrics_, &Metrics::evictions);
         --need;
     }
 }
@@ -421,6 +431,7 @@ void WatchdogWorker::operator()() {
             if (++entry.stalled_scans < stall_scan_limit_) { return false; }
             shutdown_reader(entry);
             logger_.warn("watchdog: stalled reader shut down");
+            bump(metrics_, &Metrics::evictions);
             return false; // kept: the thread still has to be joined
         });
     }
@@ -510,6 +521,7 @@ void ListenerWorker::operator()() {
         }
         if (!running_.load(std::memory_order_relaxed)) { break; } // drop the wake socket
 
+        bump(metrics_, &Metrics::accepts);
         accepted->with_keep_alive(true)
                 .with_tcp_nodelay(true);
 
@@ -526,7 +538,7 @@ void ListenerWorker::operator()() {
         ReaderWorker reader{store_queue_, activity, peers_,
                             ReaderWorker::kDefaultReadChunk,
                             ReaderWorker::kDefaultTickPeriod,
-                            logger_};
+                            logger_, metrics_};
         watchdog_.adopt(
             std::move(activity),
             std::thread{[reader = std::move(reader)]() mutable { reader(); }});
@@ -680,6 +692,7 @@ void SenderWorker::reconnect_peer(const EventReconnectPeer& reconnect) {
     if (connection) {
         peers_.mark_connected(reconnect.peer_id);
         logger_.info("reconnected: peer#" + std::to_string(reconnect.peer_id));
+        bump(metrics_, &Metrics::reconnects);
         (void)store_queue_.emplace(EventPeerDialed{reconnect.conversation_id, reconnect.peer_id});
     } else {
         logger_.warn("reconnect failed: peer#" + std::to_string(reconnect.peer_id));
@@ -757,7 +770,9 @@ void SenderWorker::operator()() {
             }
             if (sent) {
                 peers_.mark_connected(message->peer_id);
+                bump(metrics_, &Metrics::frames_out);
                 if (reconnecting) {
+                    bump(metrics_, &Metrics::reconnects);
                     logger_.info("reconnected: peer#" + std::to_string(message->peer_id));
                 }
                 delivered = true;
@@ -765,6 +780,7 @@ void SenderWorker::operator()() {
             }
             // The socket is suspect (or the dial failed): drop it so the next
             // attempt starts from a fresh connection.
+            bump(metrics_, &Metrics::send_failures);
             drop_connection(message->peer_id);
             if (attempt + 1 < send_attempts_) {
                 std::this_thread::sleep_for(retry_delay_);
@@ -773,6 +789,7 @@ void SenderWorker::operator()() {
 
         if (dropped) {
             send_backpressure_drops_.fetch_add(1, std::memory_order_relaxed);
+            bump(metrics_, &Metrics::send_backpressure_drops);
             logger_.warn("backpressure: message to peer#" + std::to_string(message->peer_id)
                          + " dropped");
             (void)store_queue_.emplace(EventError{
@@ -815,12 +832,14 @@ void MainWorker::operator()() {
     Logger logger{&logger_queue};
     LoggerWorker logger_worker{logger_queue, log_sink};
 
+    Metrics metrics;
     StoreWorker store{render_queue, store_queue, sender_queue, logger, config_.echo};
-    // TODO(metrics): config_.metrics_path is parsed but not wired yet.
+    store.set_metrics(&metrics);
     NetConfig net;
     net.address = config_.address;
     net.port = config_.port;
     net.max_peers = config_.max_peers;
+    net.metrics = &metrics;
     IoStack io = make_io_stack(config_.io, net, store_queue, peers, logger);
 
     SenderWorker sender{store_queue, sender_queue, peers, *io.outbound,
@@ -829,6 +848,13 @@ void MainWorker::operator()() {
                         SenderWorker::kDefaultSendAttempts,
                         SenderWorker::kDefaultRetryDelay,
                         logger};
+    sender.set_metrics(&metrics);
+    auto snapshot = [&] {
+        return metrics.snapshot_json({render_queue.high_water(), store_queue.high_water(),
+                                      sender_queue.high_water()});
+    };
+    std::optional<MetricsWorker> metrics_worker;
+    if (!config_.metrics_path.empty()) { metrics_worker.emplace(config_.metrics_path, snapshot); }
     std::optional<KeyboardListenerWorker> keyboard;
     std::optional<RenderWorker> terminal_render;
     std::optional<HeadlessRenderWorker> headless_render;
@@ -841,6 +867,7 @@ void MainWorker::operator()() {
     } else {
         headless_render.emplace(render_queue, store_queue, STDIN_FILENO, STDOUT_FILENO,
                                 std::string{to_string(config_.io)}, logger);
+        headless_render->set_stats_provider(snapshot);
         io.inbound->set_ready_callback(
             [&render = *headless_render](std::string listen, std::optional<std::string> error) {
                 render.announce_ready(std::move(listen), std::move(error));
@@ -856,6 +883,8 @@ void MainWorker::operator()() {
     std::thread keyboard_thread;
     if (keyboard) { keyboard_thread = std::thread{[&keyboard] { (*keyboard)(); }}; }
     std::thread listener_thread{[&io] { io.inbound->run(); }};
+    std::thread metrics_thread;
+    if (metrics_worker) { metrics_thread = std::thread{[&metrics_worker] { (*metrics_worker)(); }}; }
 
     // Render on the main thread; it returns once the keyboard (Esc / Ctrl+C / EOF)
     // or a /quit command ends it.
@@ -874,6 +903,7 @@ void MainWorker::operator()() {
     store_thread.join();
     sender_thread.join();
     listener_thread.join();
+    if (metrics_worker) { metrics_worker->stop(); metrics_thread.join(); } // final line
 
     // The log queue is shut down last, after every producer has stopped, so no
     // record is dropped on the way out.
@@ -1046,6 +1076,7 @@ bool StoreWorker::on_message(const EventMessage& message) {
             ? message.conversation_id : conversation_for_peer(message.peer_id);
         if (conversation_id == 0) { return true; } // no identity: nothing to route
         echoed_.fetch_add(1, std::memory_order_relaxed);
+        p2p::bump(metrics_, &p2p::Metrics::echoed);
         return sender_queue_.emplace(
             EventMessage{message.peer_id, conversation_id, message.payload});
     }

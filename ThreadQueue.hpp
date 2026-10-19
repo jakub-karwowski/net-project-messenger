@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <queue>
 #include <mutex>
 #include <condition_variable>
@@ -20,6 +21,7 @@ class ThreadQueue {
                 std::scoped_lock lock(mutex_);
                 if (state_ != QueueState::Open) { return false; }
                 queue_.push(std::move(value));
+                note_size_locked();
             }
             condition_.notify_one();
             return true;
@@ -30,6 +32,7 @@ class ThreadQueue {
                 std::scoped_lock lock(mutex_);
                 if (state_ != QueueState::Open) { return false; }
                 queue_.emplace(std::forward<Args>(args)...);
+                note_size_locked();
             }
             condition_.notify_one();
             return true;
@@ -60,6 +63,16 @@ class ThreadQueue {
             queue_.pop();
             return value;
         }
+        // Current number of queued items (takes the lock; for metrics, not hot paths).
+        [[nodiscard]] std::size_t size() const {
+            std::scoped_lock lock(mutex_);
+            return queue_.size();
+        }
+        // Largest size the queue ever reached (tracked under the push lock).
+        [[nodiscard]] std::size_t high_water() const {
+            std::scoped_lock lock(mutex_);
+            return high_water_;
+        }
         void graceful_shutdown() noexcept { shutdown(ThreadQueue::QueueState::GracefulShutdown); }
         void force_shutdown() noexcept { shutdown( ThreadQueue::QueueState::ForceShutdown); }
     private:
@@ -69,9 +82,12 @@ class ThreadQueue {
             ForceShutdown,
         };
         std::queue<T> queue_;
-        std::mutex mutex_;
+        mutable std::mutex mutex_;
         std::condition_variable condition_;
         QueueState state_{QueueState::Open};
+        std::size_t high_water_{0};
+
+        void note_size_locked() { if (queue_.size() > high_water_) { high_water_ = queue_.size(); } }
 
         void shutdown(const QueueState state) noexcept {
             {

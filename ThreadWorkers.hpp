@@ -3,6 +3,7 @@
 #include "AppConfig.hpp"
 #include "Events.hpp"
 #include "Logger.hpp"
+#include "Metrics.hpp"
 #include "OutboundTransport.hpp"
 #include "PeerSession.hpp"
 #include "TerminalUI.hpp"
@@ -82,6 +83,7 @@ struct StoreWorker {
     void operator()();
     // Number of inbound messages bounced back in echo mode (metrics wiring later).
     uint64_t echoed() const noexcept { return echoed_.load(std::memory_order_relaxed); }
+    void set_metrics(p2p::Metrics* metrics) noexcept { metrics_ = metrics; }
 private:
     struct Subscription {
         SubscriptionFlag level{SubscriptionFlag::Message};
@@ -153,6 +155,7 @@ private:
     ThreadQueue<Event>& sender_queue_;
     bool echo_{false};                   // echo mode: bounce inbound messages, store nothing
     std::atomic<uint64_t> echoed_{0};
+    p2p::Metrics* metrics_{nullptr};
     uint64_t next_conversation_id_{1};                              // next local id to hand out
     std::unordered_set<uint64_t> pending_dials_;                    // dials awaiting an outcome
     std::unordered_map<uint64_t, uint64_t> peer_to_conversation_;   // peer_id -> local id
@@ -295,10 +298,12 @@ struct ReaderWorker {
         PeerTable& peers,
         std::size_t read_chunk = kDefaultReadChunk,
         std::chrono::milliseconds tick_period = kDefaultTickPeriod,
-        Logger logger = {}
+        Logger logger = {},
+        Metrics* metrics = nullptr // counts bytes/frames; live gauge while the reader runs
     );
     void operator()();
 private:
+    Metrics* metrics_;
     std::shared_ptr<ReaderActivity> activity_; // heartbeat + live connection, shared with the watchdog
     std::size_t read_chunk_;                // bytes per receive
     std::chrono::milliseconds tick_period_; // bounded receive: the reader's poll period
@@ -333,6 +338,7 @@ struct WatchdogWorker {
     // shut down and joined immediately, so adopt never leaves an unjoined thread.
     void adopt(std::shared_ptr<ReaderActivity> activity, std::thread thread);
     void stop() noexcept;
+    void set_metrics(Metrics* metrics) noexcept { metrics_ = metrics; } // evictions
     void operator()(); // scans readers: joins finished ones, unsticks stalled ones
 private:
     struct Entry {
@@ -359,6 +365,7 @@ private:
     std::chrono::milliseconds scan_interval_; // watchdog scan cadence
     unsigned stall_scan_limit_;               // scans without a tick before a reader is wedged
     Logger logger_;
+    Metrics* metrics_{nullptr};
     std::atomic<bool> running_{true};
 };
 
@@ -384,7 +391,10 @@ struct ListenerWorker {
     void set_ready_callback(std::function<void(std::string, std::optional<std::string>)> cb) {
         ready_ = std::move(cb);
     }
+    // accepts, connections_live, evictions, bytes_in, frames_in. Set before operator().
+    void set_metrics(Metrics* metrics) noexcept { metrics_ = metrics; watchdog_.set_metrics(metrics); }
 private:
+    Metrics* metrics_{nullptr};
     std::function<void(std::string, std::optional<std::string>)> ready_;
     std::string local_address_;
     unsigned port_;
@@ -433,6 +443,8 @@ struct SenderWorker {
     uint64_t send_backpressure_drops() const noexcept {
         return send_backpressure_drops_.load(std::memory_order_relaxed);
     }
+    // frames_out, send_failures, send_backpressure_drops, reconnects.
+    void set_metrics(Metrics* metrics) noexcept { metrics_ = metrics; }
 private:
     // Returns the cached outbound connection for `peer_id`, creating it from the
     // address in `peers_` on first use and sending a ConnectInfo that names the
@@ -481,5 +493,6 @@ private:
     std::unordered_map<uint64_t, OutboundTransport::Handle> connections_; // outbound, one per peer
     Logger logger_;
     std::atomic<uint64_t> send_backpressure_drops_{0};
+    Metrics* metrics_{nullptr};
 };
 }

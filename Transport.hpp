@@ -4,6 +4,7 @@
 // read, and how outbound ones are written. make_io_stack() picks the variant.
 
 #include "IoMode.hpp"
+#include "Metrics.hpp"
 #include "OutboundTransport.hpp"
 #include "ThreadWorkers.hpp"
 
@@ -41,6 +42,9 @@ struct NetConfig {
     std::size_t max_peers{p2p::ListenerWorker::kDefaultMaxReaders};
     int backlog{p2p::ListenerWorker::kDefaultBacklog};
     std::chrono::milliseconds send_timeout{p2p::SenderWorker::kDefaultSendTimeout};
+    // Optional counters (nullptr: off). A transport counts accepts / connections_live /
+    // evictions itself and hands this to its PeerSessions (see Metrics.hpp).
+    p2p::Metrics* metrics{nullptr};
 };
 
 namespace p2p {

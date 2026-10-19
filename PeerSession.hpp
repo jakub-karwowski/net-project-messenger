@@ -2,6 +2,7 @@
 
 #include "Events.hpp"
 #include "Logger.hpp"
+#include "Metrics.hpp"
 #include "ThreadQueue.hpp"
 #include "Wire.hpp"
 #include <cstddef>
@@ -20,6 +21,8 @@ public:
 
     // Feeds received bytes. Returns false when the connection must be closed
     // (malformed frame, or the store consumer is gone).
+    // Optional counters (bytes_in, frames_in); nullptr disables them.
+    void set_metrics(Metrics* metrics) noexcept { metrics_ = metrics; }
     bool on_bytes(std::span<const std::byte> bytes);
     // The connection is gone: releases ownership of the peer and, unless a newer
     // connection superseded this one, tells the store the peer disconnected.
@@ -31,6 +34,7 @@ private:
     ThreadQueue<Event>& store_queue_;
     PeerTable& peers_;
     Logger logger_;
+    Metrics* metrics_{nullptr};
     wire::Decoder decoder_;
     uint64_t peer_id_{0}; // our name for the peer: minted on handshake, or the id it re-presents
     // Unique owner id of this connection. A session that a newer connection

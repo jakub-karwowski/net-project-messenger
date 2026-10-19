@@ -24,6 +24,7 @@ add_library(app_core STATIC
   PeerSession.cpp
   BlockingOutbound.cpp
   Transport.cpp
+  Metrics.cpp
   Render.cpp)
 target_include_directories(app_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(app_core PUBLIC TcpSocket TerminalUI Threads::Threads)
@@ -95,6 +96,10 @@ add_test(NAME test_stressgen COMMAND test_stressgen)
 add_executable(test_pool_outbound test_pool_outbound.cpp)
 target_link_libraries(test_pool_outbound PRIVATE app_core)
 add_test(NAME test_pool_outbound COMMAND test_pool_outbound)
+
+add_executable(test_metrics test_metrics.cpp)
+target_link_libraries(test_metrics PRIVATE app_core)
+add_test(NAME test_metrics COMMAND test_metrics)
 
 # End-to-end tests: real headless processes (python3 stdlib only).
 find_package(Python3 COMPONENTS Interpreter)

@@ -162,6 +162,43 @@ class Scenarios(E2EBase):
         ev = a.expect("conversations", re=rid)
         self.assertTrue(all(c["unread"] == 0 for c in ev["items"]))
 
+    def test_stats_counts_frames(self):
+        import time
+        a, b = self.started(), self.started()
+        ca, cb = self.connect(a, b)
+        for i in range(5):
+            a.cmd("/send %d m%d" % (ca, i))
+        deadline = time.monotonic() + 10
+        while True:
+            rid = b.cmd("/stats")
+            m = b.expect("stats", re=rid, timeout=10)["metrics"]
+            if m.get("frames_in", 0) >= 6 or time.monotonic() > deadline:
+                break
+            time.sleep(0.05)
+        self.assertGreaterEqual(m["frames_in"], 6)  # ConnectInfo + 5 messages
+        self.assertGreater(m["bytes_in"], 0)
+        self.assertGreaterEqual(m["accepts"], 1)
+        self.assertGreater(m["threads"], 0)
+        self.assertIn("t_ns", m)
+        rid = a.cmd("/stats")
+        self.assertGreaterEqual(a.expect("stats", re=rid)["metrics"]["frames_out"], 5)
+
+    def test_metrics_file(self):
+        import json
+        import tempfile
+        import time
+        path = tempfile.mktemp(suffix=".jsonl")
+        n = self.started(extra_args=["--metrics=" + path])
+        time.sleep(1.3)
+        n.stop()
+        with open(path) as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+        os.unlink(path)
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertLess(rows[0]["t_ns"], rows[-1]["t_ns"])
+        for k in ("frames_in", "utime_us", "nvcsw", "maxrss_kb", "threads", "fds"):
+            self.assertIn(k, rows[-1])
+
     def test_sync_barrier_orders_replies(self):
         n = self.started()
         r1 = n.cmd("/current")

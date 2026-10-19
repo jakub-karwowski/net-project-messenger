@@ -31,6 +31,7 @@ void PeerSession::remember_assigned_id(uint64_t peer_id, uint64_t assigned_id) {
 }
 
 bool PeerSession::on_bytes(std::span<const std::byte> bytes) {
+    if (metrics_) { metrics_->bytes_in.fetch_add(bytes.size(), std::memory_order_relaxed); }
     decoder_.feed(bytes);
 
     for (;;) {
@@ -41,6 +42,7 @@ bool PeerSession::on_bytes(std::span<const std::byte> bytes) {
         }
         if (!*item) { return true; } // need more bytes
 
+        if (metrics_) { metrics_->frames_in.fetch_add(1, std::memory_order_relaxed); }
         wire::Message& message = **item;
         if (const auto* connect = wire::as_connect(message)) {
             // The peer dialled us and named us via its ConnectInfo. It may also
