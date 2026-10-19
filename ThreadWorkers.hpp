@@ -5,7 +5,8 @@
 #include "Logger.hpp"
 #include "Metrics.hpp"
 #include "OutboundTransport.hpp"
-#include "PeerSession.hpp"
+#include "ChannelRef.hpp"
+#include "FrameChannel.hpp"
 #include "TerminalUI.hpp"
 #include "ThreadQueue.hpp"
 #include "TcpSocket.hpp"
@@ -228,25 +229,37 @@ struct PeerTable {
     bool mark_disconnected(uint64_t peer_id);
     bool mark_connected(uint64_t peer_id);
 
-    // Registers `connection_id` (a reader) as the owner of `peer_id`'s inbound
-    // connection and marks the peer connected. A later connection from the same
-    // peer -- e.g. a reconnect that reused the peer id -- replaces the owner.
-    bool set_connection(uint64_t peer_id, uint64_t connection_id);
-    // Releases ownership when a reader exits: marks the peer disconnected and
-    // returns true only while `connection_id` is still the owner. A superseded
-    // reader (whose connection a newer one replaced) gets false, so it must not
-    // report the still-live peer as gone.
-    bool release_connection(uint64_t peer_id, uint64_t connection_id);
+    // Per-peer channel slots. rx is the stream we read the peer's frames from, tx
+    // the one the sender writes on. Simplex: two different channels. Duplex: the
+    // same ChannelRef in both. The slots live apart from the entries, so `insert`
+    // never disturbs them and a slot can exist before an address is known.
+    //
+    // attach_*: sets the slot (the newest wins) and returns the previous ref when
+    // it names a different channel (connection_id differs), else nullopt. A zero
+    // peer id or connection id is rejected (nullopt, nothing changes). attach_rx
+    // also marks a known peer Connected.
+    std::optional<ChannelRef> attach_rx(uint64_t peer_id, ChannelRef ref);
+    std::optional<ChannelRef> attach_tx(uint64_t peer_id, ChannelRef ref);
+    std::optional<ChannelRef> tx_of(uint64_t peer_id) const;
+    // The sender dropped its write channel: empties the tx slot and returns what
+    // it held. Never changes the status.
+    std::optional<ChannelRef> clear_tx(uint64_t peer_id);
+    // A channel closed: clears every slot of `peer_id` whose connection_id matches.
+    // Returns true (and marks the peer Disconnected) only if the rx slot was the
+    // current one, so a duplex channel reports once and a superseded one (or a
+    // tx-only match) returns false and stays silent.
+    bool release(uint64_t peer_id, uint64_t connection_id);
 
     bool erase(uint64_t peer_id);
 
 private:
     mutable std::mutex mutex_;
     std::unordered_map<uint64_t, Entry> peers_;
-    // Which reader currently owns each peer's inbound connection (peer_id ->
-    // connection_id). Kept apart from `peers_` so ownership is independent of
-    // whether an address is known and so `insert` never disturbs it.
-    std::unordered_map<uint64_t, uint64_t> owners_;
+    struct Slots {
+        std::optional<ChannelRef> rx;
+        std::optional<ChannelRef> tx;
+    };
+    std::unordered_map<uint64_t, Slots> slots_;
 };
 
 // Builds and runs the whole application on the main thread: it owns the
@@ -307,7 +320,7 @@ private:
     std::shared_ptr<ReaderActivity> activity_; // heartbeat + live connection, shared with the watchdog
     std::size_t read_chunk_;                // bytes per receive
     std::chrono::milliseconds tick_period_; // bounded receive: the reader's poll period
-    PeerSession session_;                   // protocol state for this connection
+    FrameChannel session_;                   // protocol state for this connection
 };
 
 // Owns every reader thread and the reader population. The listener hands it a
@@ -469,11 +482,12 @@ private:
     void establish_ack(uint64_t peer_id,
                        uint64_t assigned_peer_id,
                        const std::vector<wire::Endpoint>& endpoints,
-                       bool reestablish);
+                       bool reestablish,
+                       int superseded = 0);
     // Reports an unreachable peer: flips it to Disconnected (if known) and tells
     // the store worker the conversation's peer went away.
     void report_unreachable(uint64_t conversation_id, uint64_t peer_id);
-    // Closes and forgets the cached write connection for `peer_id`. Returns false
+    // Closes and forgets the write connection (the peer's tx slot) for `peer_id`. Returns false
     // when none was held. Used when a peer goes away and, before a send, to force a
     // fresh dial for a peer whose connection was closed.
     bool drop_connection(uint64_t peer_id);
@@ -490,7 +504,6 @@ private:
     std::chrono::milliseconds retry_delay_;                    // pause between attempts
     std::unique_ptr<OutboundTransport> owned_transport_;       // set when the sender built its own
     OutboundTransport* transport_;                             // socket ops only; policy stays here
-    std::unordered_map<uint64_t, OutboundTransport::Handle> connections_; // outbound, one per peer
     Logger logger_;
     std::atomic<uint64_t> send_backpressure_drops_{0};
     Metrics* metrics_{nullptr};

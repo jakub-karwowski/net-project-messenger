@@ -59,7 +59,7 @@ void MultiplexedIo<Pool>::run() {
         if (stopping_.load()) { break; } // the wake-up dial
 
         accepted->with_keep_alive(true).with_tcp_nodelay(true);
-        auto session = std::make_shared<PeerSession>(store_queue_, peers_, logger_);
+        auto session = std::make_shared<FrameChannel>(store_queue_, peers_, logger_);
         session->set_metrics(net_.metrics);
         std::lock_guard lock(registry_mutex_);
         const int id = pool_.add_connection(std::move(*accepted));
@@ -97,7 +97,7 @@ void MultiplexedIo<Pool>::io_loop() {
         }
         const int id = received->connection_id;
 
-        std::shared_ptr<PeerSession> session;
+        std::shared_ptr<FrameChannel> session;
         bool known = false;
         {
             std::lock_guard lock(registry_mutex_);

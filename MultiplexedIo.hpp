@@ -6,7 +6,7 @@
 //
 //   accept loop (run) --add_connection--> Pool <--receive()-- I/O thread
 //   SenderWorker      --open/send/close-> Pool                  |
-//                                          inbound bytes -> PeerSession::on_bytes
+//                                          inbound bytes -> FrameChannel::on_bytes
 //
 // Registry scheme (no lost bytes): `registry_` maps pool id -> {session}.
 // Whoever registers a connection holds `registry_mutex_` across
@@ -17,7 +17,7 @@
 
 #include "Logger.hpp"
 #include "OutboundTransport.hpp"
-#include "PeerSession.hpp"
+#include "FrameChannel.hpp"
 #include "Transport.hpp"
 
 #include <atomic>
@@ -57,7 +57,7 @@ public:
 
 private:
     struct Registered {
-        std::shared_ptr<PeerSession> session; // null for an outbound connection
+        std::shared_ptr<FrameChannel> session; // null for an outbound connection
     };
 
     void io_loop();

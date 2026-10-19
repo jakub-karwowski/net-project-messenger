@@ -15,7 +15,7 @@
 #include <memory>
 #include <string>
 
-// Accepts and reads inbound connections, feeding PeerSessions.
+// Accepts and reads inbound connections, feeding FrameChannels.
 class InboundTransport {
 public:
     virtual ~InboundTransport() = default;
@@ -43,7 +43,7 @@ struct NetConfig {
     int backlog{p2p::ListenerWorker::kDefaultBacklog};
     std::chrono::milliseconds send_timeout{p2p::SenderWorker::kDefaultSendTimeout};
     // Optional counters (nullptr: off). A transport counts accepts / connections_live /
-    // evictions itself and hands this to its PeerSessions (see Metrics.hpp).
+    // evictions itself and hands this to its FrameChannels (see Metrics.hpp).
     p2p::Metrics* metrics{nullptr};
 };
 

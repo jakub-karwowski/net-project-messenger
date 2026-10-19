@@ -10,7 +10,7 @@
 //   accept of a connection      -> bump(m, &Metrics::accepts); live_inc(m)
 //   connection closed/dropped   -> live_dec(m)
 //   idle-prune / stalled close  -> bump(m, &Metrics::evictions) (plus live_dec on close)
-//   PeerSession                 -> session.set_metrics(m); it then counts
+//   FrameChannel                 -> session.set_metrics(m); it then counts
 //                                  bytes_in and frames_in by itself
 // Outbound counters (frames_out, send_failures, send_backpressure_drops,
 // reconnects) are counted by SenderWorker; echoed by StoreWorker.

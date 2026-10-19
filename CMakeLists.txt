@@ -21,7 +21,7 @@ add_subdirectory(TerminalUI)
 # Everything the app and the worker tests share (workers, sessions, transports).
 add_library(app_core STATIC
   ThreadWorkers.cpp
-  PeerSession.cpp
+  FrameChannel.cpp
   BlockingOutbound.cpp
   MultiplexedIo.cpp
   Transport.cpp

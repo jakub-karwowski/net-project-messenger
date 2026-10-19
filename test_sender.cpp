@@ -32,6 +32,8 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
+#include <expected>
 
 namespace {
 
@@ -687,7 +689,63 @@ void test_reconnect_reestablishes_connection() {
 
 } // namespace
 
+// A fake duplex transport: records every call, never touches a socket.
+class FakeDuplexTransport final : public OutboundTransport {
+public:
+    std::expected<Handle, SocketError> open(const std::string&, uint16_t,
+                                            std::span<const std::byte>) override {
+        ++opens;
+        return std::unexpected(SocketError::ConnectionNotFound);
+    }
+    std::expected<void, SocketError> send(Handle handle, std::span<const std::byte> data) override {
+        sends.emplace_back(handle, std::vector<std::byte>(data.begin(), data.end()));
+        return {};
+    }
+    void close(Handle handle) noexcept override { closed.push_back(handle); }
+    bool duplex() const noexcept override { return true; }
+
+    int opens{0};
+    std::vector<std::pair<Handle, std::vector<std::byte>>> sends;
+    std::vector<Handle> closed;
+};
+
+// Duplex: the tx slot already holds the accepted socket, so the handshake answer
+// goes out on it; nothing is dialled. A superseded handle is closed.
+void test_duplex_answers_on_tx_slot() {
+    constexpr uint64_t kPeerId = 31;
+    constexpr uint64_t kAssigned = 300;
+    constexpr int kHandle = 5;
+    constexpr int kOld = 4;
+
+    ThreadQueue<Event> store_queue;
+    ThreadQueue<Event> sender_queue;
+    p2p::PeerTable peers;
+    FakeDuplexTransport transport;
+    peers.attach_tx(kPeerId, p2p::ChannelRef{77, kHandle});
+
+    p2p::SenderWorker sender{store_queue, sender_queue, peers, transport};
+    std::thread worker{std::ref(sender)};
+    check(sender_queue.emplace(EventPeerConnected{kPeerId, kAssigned, {{"127.0.0.1", 1}}, false, kOld}),
+          "duplex: peer-connected queued");
+    sender_queue.graceful_shutdown();
+    worker.join();
+
+    check(transport.opens == 0, "duplex: no dial-back");
+    check(transport.sends.size() == 1 && transport.sends[0].first == kHandle,
+          "duplex: ConnectAck sent on the tx slot's handle");
+    if (transport.sends.size() == 1) {
+        wire::Decoder decoder;
+        decoder.feed(transport.sends[0].second);
+        auto item = decoder.next();
+        const auto* ack = item && *item ? wire::as_connect_ack(**item) : nullptr;
+        check(ack != nullptr && ack->peer_id == kPeerId && ack->ack_peer_id == kAssigned,
+              "duplex: the frame is the ConnectAck with both names");
+    }
+    check(transport.closed == std::vector<int>{kOld}, "duplex: superseded handle closed");
+}
+
 int main() {
+    test_duplex_answers_on_tx_slot();
     test_handshake_re_presents_assigned_id();
     test_disconnect_drops_cached_connection();
     test_delivers_and_reuses_connection();

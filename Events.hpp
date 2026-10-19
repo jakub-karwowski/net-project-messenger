@@ -101,10 +101,12 @@ struct EventPeerDisconnected {
 // identified itself. `peer_id` is the name this node generated for the peer (used
 // to route the peer's messages); `assigned_peer_id` is the name the peer assigned
 // to this node (echoed back in the ConnectInfoAck); `endpoints` is where the peer
-// accepts connections. The store forwards it and the sender opens this node's
-// outbound (write) connection, answering with a ConnectInfoAck. The sender skips
-// the dial when it already holds a write connection for the peer, so the two
-// sides converging on one connection cannot loop.
+// accepts connections. The store forwards it and the sender answers with a
+// ConnectInfoAck. Simplex: the sender opens this node's own outbound (write)
+// connection to the peer's endpoints and sends the Ack there (skipping the dial
+// when it already holds a write connection, so the two sides converging on one
+// connection cannot loop). Duplex: the accepted socket is already in the peer's
+// tx slot, so the Ack goes out on it and nothing is dialed.
 struct EventPeerConnected {
     uint64_t peer_id{};
     uint64_t assigned_peer_id{};
@@ -114,6 +116,10 @@ struct EventPeerConnected {
     // socket left over from the previous session (inbound + outbound are one logical
     // connection, and a stale write socket would swallow the next send).
     bool adopted{false};
+    // Duplex transports only: the write handle of a previous channel that this
+    // Connect's channel replaced in the peer's tx slot (0 = none). The sender
+    // closes it. Simplex: always 0.
+    int superseded{0};
 };
 
 // RenderWorker -> StoreWorker -> SenderWorker: dial a peer known only by address.
