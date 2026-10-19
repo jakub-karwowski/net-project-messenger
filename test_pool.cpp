@@ -170,6 +170,34 @@ void test_echo(const std::string& name) {
 }
 
 template <typename Pool>
+void test_shared_ptr_add(const std::string& name) {
+    Endpoint ep = make_endpoint();
+    Pool pool;
+    Driver<Pool> driver(pool);
+    auto pr = make_pair(ep);
+    auto shared = std::make_shared<TcpConnection>(std::move(pr.server));
+    const int id = pool.add_connection(shared);
+    check(id > 0, name + ": shared_ptr add_connection returns an id");
+    check(shared->options().non_blocking, name + ": shared connection set non-blocking");
+    check(pool.add_connection(std::shared_ptr<TcpConnection>{}) == -1,
+          name + ": null shared_ptr rejected");
+
+    const std::string msg = "shared hello";
+    check(pr.peer.send(as_bytes(msg)).has_value(), name + ": shared peer send");
+    check(driver.wait_for([&] { return driver.data(id).size() >= msg.size(); }),
+          name + ": shared connection receives");
+    check(pool.send(id, as_bytes(msg)).has_value(), name + ": shared connection sends");
+    pr.peer.with_receive_timeout(2s);
+    std::array<std::byte, 64> back{};
+    auto n = pr.peer.receive(back);
+    check(n && *n == msg.size(), name + ": shared echo round trip");
+
+    check(shared.use_count() == 2, name + ": pool holds one reference");
+    check(pool.remove_connection(id), name + ": remove shared connection");
+    check(shared.use_count() == 1, name + ": pool released its reference");
+}
+
+template <typename Pool>
 void test_peer_close(const std::string& name) {
     Endpoint ep = make_endpoint();
     Pool pool;
@@ -298,6 +326,7 @@ void test_close_unblocks(const std::string& name) {
 template <typename Pool>
 void run_all(const std::string& name) {
     test_echo<Pool>(name);
+    test_shared_ptr_add<Pool>(name);
     test_peer_close<Pool>(name);
     test_idle_timeout<Pool>(name);
     test_lru<Pool>(name);

@@ -212,6 +212,10 @@ int TcpConnection::native_handle() const noexcept {
     return fd_;
 }
 
+std::expected<void, SocketError> TcpConnection::apply_options_now() noexcept {
+    return apply_options();
+}
+
 std::expected<void, SocketError> TcpConnection::apply_options() noexcept {
     if (options_applied_ || fd_ < 0) { return {}; }
 
@@ -448,17 +452,28 @@ std::int64_t TcpConnectionPool::now_ms() noexcept {
 
 int TcpConnectionPool::add_connection(TcpConnection connection) noexcept {
     if (connection.native_handle() < 0) { return -1; } // moved-from connection
+    try {
+        return add_connection(std::make_shared<TcpConnection>(std::move(connection)));
+    } catch (...) {
+        return -1;
+    }
+}
 
-    // The pool never blocks on a single socket: poll() decides readiness, the raw
-    // hooks pass MSG_DONTWAIT, and this arms O_NONBLOCK on the first hook call too.
-    connection.with_non_blocking(true);
+int TcpConnectionPool::add_connection(std::shared_ptr<TcpConnection> connection) noexcept {
+    if (!connection || connection->native_handle() < 0) { return -1; }
+
+    // The pool never blocks on a single socket: poll() decides readiness and the raw
+    // hooks pass MSG_DONTWAIT. Options are applied eagerly so a connection shared with
+    // another thread (e.g. a TxPoller) never mutates its option state afterwards.
+    connection->with_non_blocking(true);
+    if (!connection->apply_options_now()) { return -1; }
 
     std::lock_guard lock(mutex_);
     if (closed_.load(std::memory_order_relaxed)) { return -1; }
 
     const std::int64_t now = now_ms();
     const int id = next_id_++;
-    const int fd = connection.native_handle();
+    const int fd = connection->native_handle();
 
     connections_.try_emplace(id, Entry{std::move(connection), now, {}, 0});
     poll_set_.upsert(id, fd, POLLIN);
@@ -487,7 +502,7 @@ void TcpConnectionPool::close_pool() noexcept {
 }
 
 TcpConnectionPool::Iterator TcpConnectionPool::drop_locked(Iterator it) noexcept {
-    it->second.connection.shutdown_quietly();
+    it->second.connection->shutdown_quietly();
     poll_set_.erase(it->first);
     return connections_.erase(it);
 }
@@ -525,7 +540,7 @@ bool TcpConnectionPool::flush_tx_locked(Entry& entry) noexcept {
     while (entry.tx_offset < entry.tx_buffer.size()) {
         const std::span<const std::byte> pending{entry.tx_buffer.data() + entry.tx_offset,
                                                  entry.tx_buffer.size() - entry.tx_offset};
-        const auto sent = entry.connection.send_once(pending, MSG_DONTWAIT);
+        const auto sent = entry.connection->send_once(pending, MSG_DONTWAIT);
         if (!sent) {
             if (sent.error() == SocketError::Interrupted) { continue; }
             if (sent.error() == SocketError::WouldBlock) {
@@ -614,11 +629,11 @@ std::expected<ReceiveResult, SocketError> TcpConnectionPool::receive(
                     return true;
                 }
                 // Buffer state changed: re-arm or clear POLLOUT on the next prepare().
-                poll_set_.upsert(conn_id, entry.connection.native_handle(), entry.desired_events());
+                poll_set_.upsert(conn_id, entry.connection->native_handle(), entry.desired_events());
             }
 
             if ((revents & POLLIN) != 0) {
-                const auto received = entry.connection.receive_once(destination, MSG_DONTWAIT);
+                const auto received = entry.connection->receive_once(destination, MSG_DONTWAIT);
                 if (received) {
                     if (*received > 0) {
                         entry.last_active_ms = now_ms();
@@ -685,7 +700,7 @@ std::expected<void, SocketError> TcpConnectionPool::send(
         entry.tx_offset = 0;
 
         while (consumed < source.size_bytes()) {
-            const auto sent = entry.connection.send_once(source.subspan(consumed), MSG_DONTWAIT);
+            const auto sent = entry.connection->send_once(source.subspan(consumed), MSG_DONTWAIT);
             if (sent && *sent > 0) {
                 consumed += *sent;
                 continue;
@@ -719,7 +734,7 @@ std::expected<void, SocketError> TcpConnectionPool::send(
     entry.last_active_ms = now_ms();
 
     // Ask receive() to arm POLLOUT for this connection on its next pass.
-    poll_set_.upsert(connection_id, entry.connection.native_handle(), entry.desired_events());
+    poll_set_.upsert(connection_id, entry.connection->native_handle(), entry.desired_events());
     poll_set_.wake();
     return {};
 }
@@ -818,16 +833,26 @@ void EpollConnectionPool::arm_locked(int id, Entry& entry, std::uint32_t events)
     epoll_event event{};
     event.events = events;
     event.data.u64 = static_cast<std::uint64_t>(id);
-    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, entry.connection.native_handle(), &event) == 0) {
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, entry.connection->native_handle(), &event) == 0) {
         entry.events = events;
     }
 }
 
 int EpollConnectionPool::add_connection(TcpConnection connection) noexcept {
-    const int fd = connection.native_handle();
-    if (fd < 0) { return -1; } // moved-from connection
+    if (connection.native_handle() < 0) { return -1; } // moved-from connection
+    try {
+        return add_connection(std::make_shared<TcpConnection>(std::move(connection)));
+    } catch (...) {
+        return -1;
+    }
+}
 
-    connection.with_non_blocking(true);
+int EpollConnectionPool::add_connection(std::shared_ptr<TcpConnection> connection) noexcept {
+    if (!connection || connection->native_handle() < 0) { return -1; }
+    const int fd = connection->native_handle();
+
+    connection->with_non_blocking(true);
+    if (!connection->apply_options_now()) { return -1; }
 
     std::lock_guard lock(mutex_);
     if (closed_.load(std::memory_order_relaxed)) { return -1; }
@@ -874,8 +899,8 @@ void EpollConnectionPool::close_pool() noexcept {
 EpollConnectionPool::Iterator EpollConnectionPool::drop_locked(Iterator it) noexcept {
     // DEL before the descriptor is shut down/closed; epoll_ctl is safe while
     // another thread may be blocked in epoll_wait().
-    (void)::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, it->second.connection.native_handle(), nullptr);
-    it->second.connection.shutdown_quietly();
+    (void)::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, it->second.connection->native_handle(), nullptr);
+    it->second.connection->shutdown_quietly();
     return connections_.erase(it);
 }
 
@@ -912,7 +937,7 @@ bool EpollConnectionPool::flush_tx_locked(Entry& entry) noexcept {
     while (entry.tx_offset < entry.tx_buffer.size()) {
         const std::span<const std::byte> pending{entry.tx_buffer.data() + entry.tx_offset,
                                                  entry.tx_buffer.size() - entry.tx_offset};
-        const auto sent = entry.connection.send_once(pending, MSG_DONTWAIT);
+        const auto sent = entry.connection->send_once(pending, MSG_DONTWAIT);
         if (!sent) {
             if (sent.error() == SocketError::Interrupted) { continue; }
             if (sent.error() == SocketError::WouldBlock) {
@@ -1012,7 +1037,7 @@ std::expected<ReceiveResult, SocketError> EpollConnectionPool::receive(
             }
 
             if ((event.events & EPOLLIN) != 0) {
-                const auto received = entry.connection.receive_once(destination, MSG_DONTWAIT);
+                const auto received = entry.connection->receive_once(destination, MSG_DONTWAIT);
                 if (received) {
                     if (*received > 0) {
                         entry.last_active_ms = now_ms();
@@ -1084,7 +1109,7 @@ std::expected<void, SocketError> EpollConnectionPool::send(
         entry.tx_offset = 0;
 
         while (consumed < source.size_bytes()) {
-            const auto sent = entry.connection.send_once(source.subspan(consumed), MSG_DONTWAIT);
+            const auto sent = entry.connection->send_once(source.subspan(consumed), MSG_DONTWAIT);
             if (sent && *sent > 0) {
                 consumed += *sent;
                 continue;
