@@ -61,3 +61,11 @@ add_test(NAME test_store COMMAND test_store)
 add_test(NAME test_render COMMAND test_render)
 add_test(NAME test_main COMMAND test_main)
 add_test(NAME test_logger COMMAND test_logger)
+
+# --- stressgen (load generator) ---
+add_executable(stressgen stressgen.cpp)
+target_link_libraries(stressgen PRIVATE TcpSocket Threads::Threads)
+
+add_executable(test_stressgen test_stressgen.cpp)
+target_link_libraries(test_stressgen PRIVATE TcpSocket Threads::Threads)
+add_test(NAME test_stressgen COMMAND test_stressgen)
