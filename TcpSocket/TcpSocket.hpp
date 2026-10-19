@@ -77,6 +77,13 @@ class TcpConnection {
 
         const Options& options() const noexcept;
 
+        // Applies the stored options to the fd right now instead of lazily on the
+        // first I/O call. Once it has succeeded, send_once()/receive_once() only READ
+        // the "applied" flag, so two threads may use one connection concurrently (one
+        // reader, one writer). The with_* setters must NOT be called once a connection
+        // is shared between threads (they mutate unsynchronised state).
+        std::expected<void, SocketError> apply_options_now() noexcept;
+
         // Direction(s) to shut down at the socket level (see shutdown()).
         enum class Shutdown { Read, Write, Both };
 
@@ -113,6 +120,7 @@ class TcpConnection {
 
         friend class TcpConnectionPool;
         friend class EpollConnectionPool;
+        template <class Backend> friend class TxPoller;
 
     private:
         std::expected<void, SocketError> apply_options() noexcept;
@@ -197,6 +205,8 @@ private:
     std::vector<int> ids_;                    // fds_[i + 1] belongs to ids_[i]
 };
 
+template <class Backend> class TxPoller;
+
 // Thread-safe, full-duplex I/O multiplexer for managing a bounded pool of TCP connections.
 //
 // Uses ::poll() inside receive() to drive both incoming reads (POLLIN) and any pending
@@ -229,6 +239,12 @@ public:
     // Returns the unique connection_id assigned to this socket, or -1 when the
     // connection is not usable (moved-from) or the pool has already been closed.
     int add_connection(TcpConnection connection) noexcept;
+
+    // Same, for a connection shared with another holder (e.g. a TxPoller). Sets
+    // non-blocking mode and applies the options eagerly before registering. The
+    // pool only ever reads from it; dropping shuts the socket down and releases
+    // the pool's reference (the last reference closes the fd).
+    int add_connection(std::shared_ptr<TcpConnection> connection) noexcept;
 
     // Explicitly removes and closes a connection by its ID. Not reported by receive().
     bool remove_connection(int connection_id) noexcept;
@@ -272,7 +288,7 @@ public:
 
 private:
     struct Entry {
-        TcpConnection connection;
+        std::shared_ptr<TcpConnection> connection;
         std::int64_t last_active_ms{};       // Monotonic timestamp of last activity
         std::vector<std::byte> tx_buffer;    // Pending outbound bytes awaiting POLLOUT
         std::size_t tx_offset{0};            // Read cursor into tx_buffer to avoid O(N) front erases
@@ -341,6 +357,12 @@ public:
     // cannot be registered with epoll.
     int add_connection(TcpConnection connection) noexcept;
 
+    // Same, for a connection shared with another holder (e.g. a TxPoller). Sets
+    // non-blocking mode and applies the options eagerly before registering. The
+    // pool only ever reads from it; dropping shuts the socket down and releases
+    // the pool's reference (the last reference closes the fd).
+    int add_connection(std::shared_ptr<TcpConnection> connection) noexcept;
+
     // Removes and closes a connection; idempotent (false when unknown).
     bool remove_connection(int connection_id) noexcept;
 
@@ -363,7 +385,7 @@ public:
 
 private:
     struct Entry {
-        TcpConnection connection;
+        std::shared_ptr<TcpConnection> connection;
         std::int64_t last_active_ms{};       // Monotonic timestamp of last activity
         std::vector<std::byte> tx_buffer;    // Pending outbound bytes awaiting EPOLLOUT
         std::size_t tx_offset{0};            // Read cursor into tx_buffer

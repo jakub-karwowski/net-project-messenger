@@ -44,6 +44,9 @@ target_link_libraries(test_socket PRIVATE Threads::Threads TcpSocket)
 add_executable(test_pool test_pool.cpp)
 target_link_libraries(test_pool PRIVATE Threads::Threads TcpSocket)
 
+add_executable(test_tx_poller test_tx_poller.cpp)
+target_link_libraries(test_tx_poller PRIVATE Threads::Threads TcpSocket)
+
 add_executable(test_terminal test_terminal.cpp)
 target_link_libraries(test_terminal PRIVATE TerminalUI)
 
@@ -72,6 +75,7 @@ add_executable(test_logger test_logger.cpp)
 target_link_libraries(test_logger PRIVATE app_core)
 
 add_test(NAME test_pool COMMAND test_pool)
+add_test(NAME test_tx_poller COMMAND test_tx_poller)
 add_test(NAME test_queue COMMAND test_queue)
 add_test(NAME test_wire COMMAND test_wire)
 add_test(NAME test_p2p COMMAND test_p2p)
