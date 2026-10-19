@@ -66,6 +66,7 @@ struct Config {
     double churn = 0;                      // reconnects per second
     double grace = 2;                      // wait for late echoes after the run
     double ramp_timeout = 10;              // max wait for handshakes
+    bool duplex = false;                   // one connection per peer: Ack + echoes come back on the dialed socket
     std::string out;
 };
 
@@ -155,6 +156,7 @@ private:
         std::vector<std::byte> out;
         std::size_t out_off = 0;
         bool want_out = false;
+        bool no_read = false;      // duplex slow peer: EPOLLIN disabled, socket kept open
         std::uint64_t seq = 0;
         std::uint64_t inflight = 0;
         std::int64_t next_send = 0;
@@ -192,6 +194,7 @@ private:
     void on_accept();
     void on_write_conn(int fd, std::uint32_t ev);
     void on_ret_conn(int fd);
+    void on_duplex_read(int fd);
     void on_message(int peer, const wire::ChatMessage& m, std::int64_t now);
     void send_one(int i, std::int64_t now);
     void tick_send(std::int64_t now);
@@ -220,6 +223,11 @@ inline bool Generator::setup(std::string& err) {
         ::setrlimit(RLIMIT_NOFILE, &rl);
     }
     ep_ = ::epoll_create1(0);
+    if (cfg_.duplex) {   // no listener: the node answers on the dialed socket; endpoint advertised is ignored
+        if (ep_ < 0) { err = "epoll_create failed"; return false; }
+        lport_ = cfg_.listen_port;
+        return true;
+    }
     lfd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (ep_ < 0 || lfd_ < 0) { err = "socket/epoll_create failed"; return false; }
     int one = 1;
@@ -253,7 +261,7 @@ inline void Generator::dial(int i) {
     if (rc != 0 && errno != EINPROGRESS) { ::close(fd); ++res_->connect_failures; p.state = State::Dead; return; }
     p.wfd = fd;
     p.state = State::Connecting;
-    p.out.clear(); p.out_off = 0; p.want_out = true; p.inflight = 0;
+    p.out.clear(); p.out_off = 0; p.want_out = true; p.no_read = false; p.inflight = 0;
     add_conn(fd, CType::Write, i, EPOLLIN | EPOLLOUT);
 }
 
@@ -269,12 +277,14 @@ inline void Generator::kill_peer(int i, bool count) {
 
 inline void Generator::maybe_ready(int i) {
     Peer& p = peers_[static_cast<std::size_t>(i)];
+    if (cfg_.duplex) { return; }   // duplex: Ready is set when the Ack arrives
     if (p.state == State::Handshaking && p.rfd >= 0) { p.state = State::Ready; }
 }
 
 inline void Generator::arm_write(int i) {
     Peer& p = peers_[static_cast<std::size_t>(i)];
-    ctl(EPOLL_CTL_MOD, p.wfd, p.want_out ? (EPOLLIN | EPOLLOUT) : EPOLLIN);
+    const std::uint32_t in = p.no_read ? 0u : static_cast<std::uint32_t>(EPOLLIN);
+    ctl(EPOLL_CTL_MOD, p.wfd, p.want_out ? (in | EPOLLOUT) : in);
 }
 
 inline void Generator::flush(int i) {
@@ -318,6 +328,12 @@ inline void Generator::on_write_conn(int fd, std::uint32_t ev) {
         wire::encode_into(p.out, wire::make_connect(p.token, 0, {wire::Endpoint{cfg_.listen_ip, lport_}}));
         flush(i);
         if (p.state != State::Dead) { maybe_ready(i); }
+        return;
+    }
+    if (cfg_.duplex) {
+        if (ev & EPOLLIN) { on_duplex_read(fd); if (p.state == State::Dead) { return; } }
+        if (ev & (EPOLLERR | EPOLLHUP)) { kill_peer(i, true); return; }
+        if (ev & EPOLLOUT) { flush(i); }
         return;
     }
     if (ev & EPOLLIN) {   // the node never sends on this connection; drain / detect EOF
@@ -379,6 +395,41 @@ inline void Generator::on_ret_conn(int fd) {
         const int peer = c.peer;   // EOF or error
         if (peer >= 0 && peers_[static_cast<std::size_t>(peer)].rfd == fd) { kill_peer(peer, true); }
         else { close_conn(fd); }
+        return;
+    }
+}
+
+// Duplex: the dialed socket carries ConnectAck and echoes back.
+inline void Generator::on_duplex_read(int fd) {
+    for (;;) {
+        Conn& c = *conns_[static_cast<std::size_t>(fd)];
+        const int i = c.peer;
+        Peer& p = peers_[static_cast<std::size_t>(i)];
+        const ssize_t n = ::recv(fd, rbuf_.data(), rbuf_.size(), 0);
+        if (n > 0) {
+            const std::int64_t now = now_ns();
+            c.dec.feed(std::span<const std::byte>(rbuf_.data(), static_cast<std::size_t>(n)));
+            for (;;) {
+                auto item = c.dec.next();
+                if (!item) { ++res_->bad_frames; continue; }
+                if (!*item) { break; }
+                if (const auto* ack = wire::as_connect_ack(**item)) {
+                    if (ack->ack_peer_id == p.token && p.state == State::Handshaking) { p.state = State::Ready; }
+                } else if (const auto* m = wire::as_message(**item)) {
+                    if (p.state == State::Ready) { on_message(i, *m, now); }
+                }
+                if (p.kind == Kind::Slow && p.state == State::Ready && !p.no_read) {
+                    p.no_read = true;   // accept the handshake, then never read again
+                    arm_write(i);
+                    return;
+                }
+            }
+            if (static_cast<std::size_t>(n) < rbuf_.size()) { return; }
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { return; }
+        if (n < 0 && errno == EINTR) { continue; }
+        kill_peer(i, true);   // EOF or error
         return;
     }
 }
@@ -510,7 +561,8 @@ inline int Generator::run(Result& res, std::string& err) {
             if (dial_cursor_ >= total && (pending == 0 || now >= ramp_end)) {
                 if (ready == 0) {
                     err = res.connect_failures ? "target unreachable (all connects failed)"
-                                               : "no peer completed the handshake (no ConnectInfoAck on return connection)";
+                                               : cfg_.duplex ? "no peer completed the handshake (no ConnectInfoAck on the dialed socket)"
+                                                         : "no peer completed the handshake (no ConnectInfoAck on return connection)";
                     return res.connect_failures ? 2 : 3;
                 }
                 ms_ = now + static_cast<std::int64_t>(cfg_.warmup * 1e9);
