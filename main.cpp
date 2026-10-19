@@ -17,10 +17,6 @@ int main(int argc, char** argv) {
         std::cerr << "app: " << config.error() << '\n';
         return 2;
     }
-    if (config->io == IoMode::Poll || config->io == IoMode::Epoll) {
-        std::cerr << "app: io mode not implemented yet: " << to_string(config->io) << '\n';
-        return 2;
-    }
 
     p2p::MainWorker main_worker{std::move(*config)};
     main_worker();

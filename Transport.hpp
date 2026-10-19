@@ -66,10 +66,13 @@ private:
     ListenerWorker listener_;
 };
 
-// Owns the inbound and outbound halves. Both pointers are always set.
+// Owns the inbound and outbound halves. Both pointers are always set. They are
+// shared_ptrs so one object can implement both halves (poll/epoll: MultiplexedIo
+// is an InboundTransport and an OutboundTransport; both pointers then share its
+// ownership). Separate halves just hold distinct objects.
 struct IoStack {
-    std::unique_ptr<InboundTransport> inbound;
-    std::unique_ptr<OutboundTransport> outbound;
+    std::shared_ptr<InboundTransport> inbound;
+    std::shared_ptr<OutboundTransport> outbound;
 };
 
 // Throws std::runtime_error for a mode that is not implemented yet.

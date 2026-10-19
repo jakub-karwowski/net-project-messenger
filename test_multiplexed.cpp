@@ -1,0 +1,423 @@
+// test_multiplexed.cpp - harness for MultiplexedIo (--io=poll / --io=epoll).
+//
+// Plain assertions (no framework). Every scenario is templated over both pools:
+//   * inbound ConnectInfo + chat -> EventPeerConnected / EventMessage, peer close
+//     -> EventPeerDisconnected
+//   * a malformed frame closes the connection
+//   * outbound open/send delivers bytes; the peer closing makes the next send
+//     fail with ConnectionNotFound
+//   * max_peers LRU pruning is reported as a disconnect
+//   * 200 concurrent inbound connections are served by the single I/O thread
+//   * a two-node exchange (Store + Sender + make_io_stack) in both modes
+
+#include "MultiplexedIo.hpp"
+#include "ThreadWorkers.hpp"
+#include "TcpSocket.hpp"
+#include "Wire.hpp"
+
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <random>
+#include <span>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+using namespace std::chrono_literals;
+
+int g_failures = 0;
+int g_checks = 0;
+
+void check(bool condition, const std::string& what) {
+    ++g_checks;
+    if (!condition) {
+        ++g_failures;
+        std::cout << "FAIL: " << what << '\n';
+    }
+}
+
+unsigned random_port() {
+    static std::mt19937 rng{std::random_device{}()};
+    return 12000 + rng() % 15000; // below the ephemeral range
+}
+
+bool send_all(TcpConnection& conn, const std::vector<std::byte>& data) {
+    std::size_t sent = 0;
+    while (sent < data.size()) {
+        auto result = conn.send(std::span<const std::byte>{data.data() + sent, data.size() - sent});
+        if (!result || *result == 0) { return false; }
+        sent += *result;
+    }
+    return true;
+}
+
+std::optional<TcpConnection> dial(unsigned port, int attempts = 200) {
+    for (int i = 0; i < attempts; ++i) {
+        auto conn = TcpConnection::connect("127.0.0.1", port);
+        if (conn) { return std::move(*conn); }
+        std::this_thread::sleep_for(10ms);
+    }
+    return std::nullopt;
+}
+
+std::vector<std::byte> hello_bytes(uint64_t name, unsigned port) {
+    return *wire::encode(wire::make_connect(
+        name, 0, std::vector<wire::Endpoint>{{"127.0.0.1", static_cast<uint16_t>(port)}}));
+}
+
+std::vector<std::byte> chat_bytes(uint64_t name, const std::string& body) {
+    return *wire::encode(wire::make_chat_message(name, 1, body));
+}
+
+std::optional<Event> pop_for(ThreadQueue<Event>& queue, std::chrono::milliseconds timeout = 3s) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (auto event = queue.try_pop()) { return event; }
+        std::this_thread::sleep_for(2ms);
+    }
+    return std::nullopt;
+}
+
+template <class T>
+std::optional<T> pop_as(ThreadQueue<Event>& queue, std::chrono::milliseconds timeout = 3s) {
+    auto event = pop_for(queue, timeout);
+    if (!event) { return std::nullopt; }
+    if (auto* typed = std::get_if<T>(&*event)) { return std::move(*typed); }
+    return std::nullopt;
+}
+
+int thread_count() {
+    std::ifstream status{"/proc/self/status"};
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("Threads:", 0) == 0) { return std::stoi(line.substr(8)); }
+    }
+    return -1;
+}
+
+// A MultiplexedIo plus the thread running its accept loop.
+template <class Pool>
+struct Node {
+    static NetConfig make_net(unsigned port, std::size_t max_peers) {
+        NetConfig net;
+        net.port = port;
+        net.max_peers = max_peers;
+        return net;
+    }
+    ThreadQueue<Event> store_queue;
+    p2p::PeerTable peers;
+    unsigned port;
+    p2p::MultiplexedIo<Pool> io;
+    std::thread listener;
+
+    explicit Node(std::size_t max_peers = 16, unsigned fixed_port = 0)
+        : port(fixed_port ? fixed_port : random_port()),
+          io(make_net(port, max_peers), store_queue, peers, Logger{}) {
+        listener = std::thread{[this] { io.run(); }};
+    }
+    ~Node() {
+            io.stop();
+        listener.join();
+    }
+};
+
+// ---------------------------------------------------------------------------
+
+template <class Pool>
+void test_inbound(const std::string& tag) {
+    Node<Pool> node;
+    auto client = dial(node.port);
+    check(client.has_value(), tag + " inbound: connected");
+    if (!client) { return; }
+
+    check(send_all(*client, hello_bytes(77, 1234)), tag + " inbound: hello sent");
+    check(send_all(*client, chat_bytes(77, "hello")), tag + " inbound: chat sent");
+
+    auto connected = pop_as<EventPeerConnected>(node.store_queue);
+    check(connected.has_value(), tag + " inbound: EventPeerConnected");
+    const uint64_t local_id = connected ? connected->peer_id : 0;
+    check(connected && connected->assigned_peer_id == 77, tag + " inbound: peer's name for us");
+
+    auto message = pop_as<EventMessage>(node.store_queue);
+    check(message.has_value() && message->payload == "hello" && message->peer_id == local_id,
+          tag + " inbound: EventMessage routed by peer id");
+
+    client.reset();
+    auto gone = pop_as<EventPeerDisconnected>(node.store_queue);
+    check(gone.has_value() && gone->peer_id == local_id, tag + " inbound: EventPeerDisconnected");
+}
+
+template <class Pool>
+void test_malformed(const std::string& tag) {
+    Node<Pool> node;
+    auto client = dial(node.port);
+    check(client.has_value(), tag + " malformed: connected");
+    if (!client) { return; }
+
+    check(send_all(*client, hello_bytes(5, 1)), tag + " malformed: hello sent");
+    auto connected = pop_as<EventPeerConnected>(node.store_queue);
+    check(connected.has_value(), tag + " malformed: connected");
+
+    check(send_all(*client, std::vector<std::byte>(64, std::byte{0xFF})),
+          tag + " malformed: garbage sent");
+    auto gone = pop_as<EventPeerDisconnected>(node.store_queue);
+    check(gone.has_value(), tag + " malformed: disconnect reported");
+
+    // The server side closed: reading eventually reports EOF/error.
+    client->with_receive_timeout(2s);
+    std::byte scratch[16];
+    auto got = client->receive(std::span<std::byte>{scratch});
+    check(!got || *got == 0, tag + " malformed: socket closed by the node");
+}
+
+template <class Pool>
+void test_outbound(const std::string& tag) {
+    const unsigned port = random_port();
+    TcpListener server("127.0.0.1", port, 4);
+    Node<Pool> node;
+
+    const std::vector<std::byte> hello = hello_bytes(9, 4321);
+    auto handle = node.io.open("127.0.0.1", port, hello);
+    check(handle.has_value(), tag + " outbound: open");
+    if (!handle) { return; }
+
+    auto peer = server.accept_client();
+    check(peer.has_value(), tag + " outbound: server accepted");
+    if (!peer) { return; }
+    peer->with_receive_timeout(2s);
+
+    auto read_exact = [&](std::size_t n) {
+        std::vector<std::byte> got;
+        std::byte scratch[4096];
+        while (got.size() < n) {
+            auto r = peer->receive(std::span<std::byte>{scratch});
+            if (!r || *r == 0) { break; }
+            got.insert(got.end(), scratch, scratch + *r);
+        }
+        return got;
+    };
+
+    check(read_exact(hello.size()) == hello, tag + " outbound: hello delivered first");
+
+    const auto frame = chat_bytes(9, "payload");
+    check(node.io.send(*handle, frame).has_value(), tag + " outbound: send ok");
+    check(read_exact(frame.size()) == frame, tag + " outbound: frame delivered");
+
+    // Bytes arriving on an outbound connection are ignored, not parsed.
+    check(send_all(*peer, chat_bytes(1, "ignored")), tag + " outbound: stray bytes sent");
+    std::this_thread::sleep_for(50ms);
+    check(node.io.send(*handle, frame).has_value(), tag + " outbound: still usable after stray bytes");
+    check(!node.store_queue.try_pop().has_value(), tag + " outbound: stray bytes produce no event");
+
+    // Peer goes away: the I/O thread sees EOF, the next sends fail for good.
+    { auto dead = std::move(*peer); } // closes the server side
+    std::optional<SocketError> last;
+    for (int i = 0; i < 200; ++i) {
+        auto sent = node.io.send(*handle, frame);
+        if (!sent) { last = sent.error(); if (*last == SocketError::ConnectionNotFound) { break; } }
+        std::this_thread::sleep_for(10ms);
+    }
+    check(last == SocketError::ConnectionNotFound, tag + " outbound: dead handle -> ConnectionNotFound");
+    node.io.close(*handle); // idempotent on a dead handle
+
+    { TcpListener closed("127.0.0.1", port + 1, 1); } // bind, then release: refused
+    auto again = node.io.open("127.0.0.1", port + 1, hello); // nobody listens there
+    check(!again.has_value(), tag + " outbound: open to a closed port fails");
+}
+
+template <class Pool>
+void test_prune(const std::string& tag) {
+    // max_peers = 2 -> the shared pool holds 4 connections.
+    Node<Pool> node{2};
+    std::vector<TcpConnection> clients;
+    for (uint64_t i = 0; i < 5; ++i) {
+        auto client = dial(node.port);
+        check(client.has_value(), tag + " prune: connected");
+        if (!client) { return; }
+        check(send_all(*client, hello_bytes(100 + i, 1)), tag + " prune: hello sent");
+        clients.push_back(std::move(*client));
+        std::this_thread::sleep_for(20ms); // distinct activity stamps for the LRU order
+    }
+    // The newcomer that exceeds the cap evicts the LRU peer: 5 connects, 1 disconnect.
+    int connects = 0, disconnects = 0;
+    const auto deadline = std::chrono::steady_clock::now() + 3s;
+    while (std::chrono::steady_clock::now() < deadline && (connects < 5 || disconnects < 1)) {
+        auto event = pop_for(node.store_queue, 200ms);
+        if (!event) { continue; }
+        if (std::holds_alternative<EventPeerConnected>(*event)) { ++connects; }
+        if (std::holds_alternative<EventPeerDisconnected>(*event)) { ++disconnects; }
+    }
+    check(connects == 5, tag + " prune: all five connects seen");
+    check(disconnects == 1, tag + " prune: the evicted peer is reported as disconnected once");
+}
+
+template <class Pool>
+void test_many(const std::string& tag) {
+    constexpr int kClients = 200;
+    const int before = thread_count();
+    Node<Pool> node{256};
+    std::vector<TcpConnection> clients;
+    for (int i = 0; i < kClients; ++i) {
+        auto client = dial(node.port);
+        if (!client) { check(false, tag + " many: connect"); return; }
+        check(send_all(*client, hello_bytes(1000 + i, 1)), tag + " many: hello");
+        check(send_all(*client, chat_bytes(1000 + i, "m" + std::to_string(i))), tag + " many: chat");
+        clients.push_back(std::move(*client));
+    }
+    int connects = 0, messages = 0, other = 0;
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while ((connects < kClients || messages < kClients) &&
+           std::chrono::steady_clock::now() < deadline) {
+        auto event = pop_for(node.store_queue, 1s);
+        if (!event) { continue; }
+        if (std::holds_alternative<EventPeerConnected>(*event)) { ++connects; }
+        else if (std::holds_alternative<EventMessage>(*event)) { ++messages; }
+        else { ++other; }
+    }
+    check(connects == kClients, tag + " many: all connects seen (" + std::to_string(connects) + ")");
+    check(messages == kClients, tag + " many: all messages seen (" + std::to_string(messages) + ")");
+    check(other == 0, tag + " many: no unexpected events");
+
+    // Accept loop (test's thread) + ONE I/O thread, regardless of connection count.
+    const int during = thread_count();
+    check(before > 0 && during - before <= 2,
+          tag + " many: only 2 threads for 200 connections (" + std::to_string(during - before) + ")");
+}
+
+// --- Two nodes: Store + Sender + make_io_stack -------------------------------
+
+struct FullNode {
+    static NetConfig make_net(unsigned port) {
+        NetConfig net;
+        net.port = port;
+        return net;
+    }
+    ThreadQueue<Event> render_queue, store_queue, sender_queue;
+    p2p::PeerTable peers;
+    unsigned port;
+    p2p::IoStack io;
+    StoreWorker store;
+    p2p::SenderWorker sender;
+    std::thread store_t, sender_t, listener_t;
+
+    FullNode(IoMode mode, unsigned port_)
+        : port(port_),
+          io(p2p::make_io_stack(mode, make_net(port_), store_queue, peers, Logger{})),
+          store(render_queue, store_queue, sender_queue),
+          sender(store_queue, sender_queue, peers, *io.outbound,
+                 LocalEndpoints{{wire::Endpoint{"127.0.0.1", static_cast<uint16_t>(port_)}}}) {
+        store_t = std::thread{[this] { store(); }};
+        sender_t = std::thread{[this] { sender(); }};
+        listener_t = std::thread{[this] { io.inbound->run(); }};
+    }
+    ~FullNode() {
+        io.inbound->stop();
+        store_queue.graceful_shutdown();
+        sender_queue.graceful_shutdown();
+        render_queue.graceful_shutdown();
+        store_t.join();
+        sender_t.join();
+        listener_t.join();
+    }
+};
+
+void test_two_nodes(IoMode mode) {
+    const std::string tag = std::string{to_string(mode)} + " e2e:";
+    const unsigned port_a = random_port();
+    unsigned port_b = random_port();
+    if (port_b == port_a) { ++port_b; }
+    FullNode a{mode, port_a};
+    FullNode b{mode, port_b};
+    std::this_thread::sleep_for(100ms); // both listening
+
+    check(a.store_queue.emplace(EventDialPeer{"127.0.0.1", static_cast<uint16_t>(port_b), 0}),
+          tag + " dial queued");
+
+    // A learns the conversation from the dial report; B learns it from the connect.
+    uint64_t conv_a = 0;
+    for (int i = 0; i < 100 && conv_a == 0; ++i) {
+        auto event = pop_for(a.render_queue, 3s);
+        if (!event) { break; }
+        if (auto* dialed = std::get_if<EventPeerDialed>(&*event)) { conv_a = dialed->conversation_id; }
+    }
+    check(conv_a != 0, tag + " A got a dialed conversation");
+
+    uint64_t conv_b = 0;
+    for (int i = 0; i < 100 && conv_b == 0; ++i) {
+        auto event = pop_for(b.render_queue, 3s);
+        if (!event) { break; }
+        if (auto* connected = std::get_if<EventPeerDialed>(&*event)) { conv_b = connected->conversation_id; }
+        else if (auto* notice = std::get_if<EventConversationNotification>(&*event)) { conv_b = notice->conversation_id; }
+    }
+    // Fall back to asking the store what it holds.
+    if (conv_b == 0) {
+        b.store_queue.emplace(EventListConversations{});
+        for (int i = 0; i < 100 && conv_b == 0; ++i) {
+            auto event = pop_for(b.render_queue, 3s);
+            if (!event) { break; }
+            if (auto* list = std::get_if<EventConversationList>(&*event);
+                list && !list->conversations.empty()) {
+                conv_b = list->conversations.front().conversation_id;
+            }
+        }
+    }
+    check(conv_b != 0, tag + " B has a conversation for A");
+    if (conv_a == 0 || conv_b == 0) { return; }
+
+    check(b.store_queue.emplace(EventSubscribe{conv_b, SubscriptionFlag::Message, 0}), tag + " B subscribed");
+    check(a.store_queue.emplace(EventSubscribe{conv_a, SubscriptionFlag::Message, 0}), tag + " A subscribed");
+
+    auto wait_text = [&](FullNode& node, const std::string& text) {
+        for (int i = 0; i < 200; ++i) {
+            auto event = pop_for(node.render_queue, 3s);
+            if (!event) { return false; }
+            auto matches = [&](const std::vector<ConversationStore::Message>& items) {
+                for (const auto& m : items) { if (m.payload == text) { return true; } }
+                return false;
+            };
+            if (auto* delta = std::get_if<EventConversationDelta>(&*event)) {
+                if (matches(delta->messages)) { return true; }
+            } else if (auto* snap = std::get_if<EventConversationSnapshot>(&*event)) {
+                if (snap->store) {
+                    for (const auto& m : snap->store->store) { if (m.payload == text) { return true; } }
+                }
+            }
+        }
+        return false;
+    };
+
+    // Deliver in both directions: each message travels on the sender's own
+    // outbound connection and is read by the other node's I/O thread.
+    check(a.store_queue.emplace(EventComposeMessage{conv_a, "ping"}), tag + " A composes");
+    check(wait_text(b, "ping"), tag + " B received ping");
+    check(b.store_queue.emplace(EventComposeMessage{conv_b, "pong"}), tag + " B composes");
+    check(wait_text(a, "pong"), tag + " A received pong");
+}
+
+} // namespace
+
+int main() {
+    test_inbound<TcpConnectionPool>("poll");
+    test_inbound<EpollConnectionPool>("epoll");
+    test_malformed<TcpConnectionPool>("poll");
+    test_malformed<EpollConnectionPool>("epoll");
+    test_outbound<TcpConnectionPool>("poll");
+    test_outbound<EpollConnectionPool>("epoll");
+    test_prune<TcpConnectionPool>("poll");
+    test_prune<EpollConnectionPool>("epoll");
+    test_many<TcpConnectionPool>("poll");
+    test_many<EpollConnectionPool>("epoll");
+    test_two_nodes(IoMode::Poll);
+    test_two_nodes(IoMode::Epoll);
+
+    std::cout << g_checks << " checks, " << g_failures << " failures\n";
+    return g_failures == 0 ? 0 : 1;
+}

@@ -3,6 +3,8 @@
 #include "Transport.hpp"
 #include "PoolOutbound.hpp"
 
+#include "MultiplexedIo.hpp"
+
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -23,6 +25,16 @@ IoStack make_io_stack(IoMode mode, const NetConfig& net, ThreadQueue<Event>& sto
             return IoStack{
                 std::make_unique<ThreadedInbound>(net, store_queue, peers, std::move(logger)),
                 std::make_unique<BlockingOutbound>(net.send_timeout)};
+        case IoMode::Poll: {
+            auto io = std::make_shared<MultiplexedIo<TcpConnectionPool>>(
+                net, store_queue, peers, std::move(logger));
+            return IoStack{io, io};
+        }
+        case IoMode::Epoll: {
+            auto io = std::make_shared<MultiplexedIo<EpollConnectionPool>>(
+                net, store_queue, peers, std::move(logger));
+            return IoStack{io, io};
+        }
         case IoMode::PoolSender: {
             PoolOutboundOptions options;
             options.max_connections = 2 * net.max_peers;
@@ -30,9 +42,6 @@ IoStack make_io_stack(IoMode mode, const NetConfig& net, ThreadQueue<Event>& sto
                 std::make_unique<ThreadedInbound>(net, store_queue, peers, logger),
                 std::make_unique<PoolOutbound<TcpConnectionPool>>(options, std::move(logger))};
         }
-        case IoMode::Poll:
-        case IoMode::Epoll:
-            break;
     }
     throw std::runtime_error("io mode not implemented yet: " + std::string{to_string(mode)});
 }
