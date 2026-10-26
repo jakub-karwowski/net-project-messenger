@@ -22,16 +22,16 @@ import netlab
 REPO = Path(__file__).resolve().parent.parent
 
 VARIANTS = ["threads", "pool-sender", "poll", "epoll",
-            "poll-duplex", "epoll-duplex", "poll-split", "epoll-split"]
+            "poll-duplex", "epoll-duplex", "poll-split", "epoll-split", "peer-threads"]
 
 
 def is_duplex(variant):
     """duplex/split nodes answer on the dialed socket: stressgen --duplex, ~1 fd per peer."""
-    return variant.endswith(("-duplex", "-split"))
+    return variant.endswith(("-duplex", "-split")) or variant == "peer-threads"
 
 
 def base_variant(variant):
-    return variant.split("-")[0] if is_duplex(variant) else variant
+    return variant.split("-")[0] if is_duplex(variant) and variant != "peer-threads" else variant
 
 
 # --- Build stamp -------------------------------------------------------------
@@ -303,7 +303,9 @@ FAKE = {"threads": (14, 90, 0.9, 1.0), "pool-sender": (12, 80, 0.7, 1.0),
         "poll": (7, 110, 1.4, 0.0), "epoll": (6, 70, 0.2, 0.0),
         # duplex: one shared socket per peer, slightly less syscall work; split: +1 thread, a bit more latency
         "poll-duplex": (6.5, 105, 1.3, 0.0), "epoll-duplex": (5.5, 65, 0.2, 0.0),
-        "poll-split": (7.5, 120, 1.3, 0.0), "epoll-split": (6.5, 80, 0.2, 0.0)}
+        "poll-split": (7.5, 120, 1.3, 0.0), "epoll-split": (6.5, 80, 0.2, 0.0),
+        # one thread per peer like threads, one duplex socket: cheaper than threads, thread-bound at scale
+        "peer-threads": (12, 85, 0.8, 1.0)}
 
 
 def fake_cell(args, sc, x, variant, rep, port, d):
@@ -355,7 +357,7 @@ def fake_cell(args, sc, x, variant, rep, port, d):
             sender_q_hwm=int(rnd.random() * 50), utime_us=int(ut), stime_us=int(stt),
             nvcsw=vcsw, nivcsw=ivcsw, maxrss_kb=20000 + int(live * (60 if thr else 8)) + i * 10,
             threads=int(8 + live * thr + (4 if variant != "threads" else 0) + (1 if variant.endswith("-split") else 0)),
-            fds=live * (1 if is_duplex(variant) else 2) + 10,
+            fds=live * (2 if variant == "peer-threads" or not is_duplex(variant) else 1) + 10,
             tx_queued_sends=int(fin * 0.3) if sc == "S6b" and base_variant(variant) in ("poll", "epoll") and is_duplex(variant) else 0,
             tx_flushes=int(fin * 0.2) if sc == "S6b" and is_duplex(variant) else 0))
     (d / f"rep{rep}.metrics.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")

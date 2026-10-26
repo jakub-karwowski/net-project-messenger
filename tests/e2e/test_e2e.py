@@ -1,6 +1,6 @@
 """End-to-end tests: real `app --headless` processes talking over loopback.
 
-    APP_BIN=build/app E2E_IO=threads,pool-sender,poll,epoll,poll-duplex,epoll-duplex,poll-split,epoll-split python3 -m unittest discover tests/e2e
+    APP_BIN=build/app E2E_IO=threads,pool-sender,poll,epoll,poll-duplex,epoll-duplex,poll-split,epoll-split,peer-threads python3 -m unittest discover tests/e2e
 
 E2E_IO is a comma-separated list of --io modes; every scenario runs once per mode.
 """
