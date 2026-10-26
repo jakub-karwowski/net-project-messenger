@@ -4,6 +4,7 @@
 #include "PoolOutbound.hpp"
 
 #include "MultiplexedIo.hpp"
+#include "PeerThreadIo.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -53,6 +54,10 @@ IoStack make_io_stack(IoMode mode, const NetConfig& net, ThreadQueue<Event>& sto
         case IoMode::EpollSplit: {
             auto io = std::make_shared<MultiplexedIo<EpollConnectionPool, EpollTxPoller>>(
                 net, store_queue, peers, std::move(logger), 1024 * 1024, ConnectionModel::Duplex);
+            return IoStack{io, io};
+        }
+        case IoMode::PeerThreads: {
+            auto io = std::make_shared<PeerThreadIo>(net, store_queue, peers, std::move(logger));
             return IoStack{io, io};
         }
         case IoMode::PoolSender: {

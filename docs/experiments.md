@@ -20,11 +20,16 @@ measure and *why*.
    does halving the sockets save: fds, handshake round trips, latency?
 5. **One I/O thread vs a separate write thread** (`*-duplex` vs `*-split`).
    Does flushing writes on their own thread help once writes actually queue?
+6. **Thread per connection, with one socket** (`peer-threads` vs `threads` and
+   `poll-duplex`). Against `threads`: half the connections and fds, no blocking
+   sender, but the same CPU-starvation ceiling (one runnable thread per peer, so
+   expect the same collapse at 1024 peers on 2 CPUs). Against `poll-duplex`: the
+   cost of a thread per peer instead of one shared poller.
 
 ## 2. The matrix
 
-Every scenario runs **all 8 variants**: `threads`, `pool-sender`, `poll`,
-`epoll`, `poll-duplex`, `epoll-duplex`, `poll-split`, `epoll-split`.
+Every scenario runs **all 9 variants**: `threads`, `pool-sender`, `poll`,
+`epoll`, `poll-duplex`, `epoll-duplex`, `poll-split`, `epoll-split`, `peer-threads`.
 
 Each cell gets 20 s of measurement after a 5 s warmup. Variant order is
 shuffled for every (scenario, value, rep), so slow drift on the machine (heat,
@@ -47,8 +52,8 @@ unprivileged `unshare` namespace started by `run_matrix.py`. When S1–S5 and S6
 are selected together, S1–S5 run first, then S6. Handshakes count if they
 complete during the ramp or inside the measurement window.
 
-**Size of the run:** 29 swept values × 8 variants × 3 repetitions = **696
-cells**, about 25–30 s each, so about **5.5 hours**.
+**Size of the run:** 29 swept values × 9 variants × 3 repetitions = **783
+cells**, about 25–30 s each, so about **6 hours**.
 
 Three repetitions, not the script's default of 5, keeps the run to one sitting.
 The report gives the median and IQR, which are meaningful with 3, and the

@@ -1,6 +1,6 @@
 # I/O modes and the test suite
 
-The node can move bytes in eight ways, selected with `--io=`. Each one is a
+The node can move bytes in nine ways, selected with `--io=`. Each one is a
 different combination of threads, connections and readiness APIs underneath
 the same application pipeline. This document explains how each mode works, how
 it builds its threads, how peers and connections are tracked and named, what is
@@ -8,7 +8,7 @@ measured, how the terminal and headless front ends share one implementation,
 then how the tests and the benchmark harness exercise them.
 
 ```
-app --io=threads|pool-sender|poll|epoll|poll-duplex|epoll-duplex|poll-split|epoll-split
+app --io=threads|pool-sender|poll|epoll|poll-duplex|epoll-duplex|poll-split|epoll-split|peer-threads
     [--headless] [--echo] [--max-peers=N] [--backlog=N] [--address=A] [--port=P]
     [--log=PATH] [--metrics=PATH]
 ```
@@ -133,6 +133,7 @@ Rules that hold in both shapes:
 | `epoll-duplex` | 1 | one pool, one I/O thread | same pool, same socket | I/O thread | `epoll` |
 | `poll-split` | 1 | rx pool + I/O thread | `TxPoller` + tx thread, same socket | I/O + tx thread | `poll()` ×2 |
 | `epoll-split` | 1 | rx pool + I/O thread | `TxPoller` + tx thread, same socket | I/O + tx thread | `epoll` ×2 |
+| `peer-threads` | 1 | 1 owner thread per peer (`poll()` on socket + eventfd) | sender thread writes directly, else queue + wake the owner | watchdog + 1 per peer | `poll()` per thread |
 
 ### `threads`: one thread per connection (the original design)
 
@@ -245,6 +246,43 @@ same as the duplex modes. The difference is how the single socket is driven.
 - **Measures:** whether giving writes their own thread helps compared with one
   thread doing both (`*-duplex`), at the cost of one extra thread.
 
+### `peer-threads`: one owner thread per peer, one connection
+
+`PeerThreadIo` ([PeerThreadIo.hpp](../PeerThreadIo.hpp)) is an
+`InboundTransport` and an `OutboundTransport` (`duplex()` and
+`backpressure_is_drop()` are true), like `MultiplexedIo` in the `Duplex` model.
+The link logic is the same: a `FrameChannel` with a duplex `ChannelRef` is
+registered before the hello goes out, and the Connect/ConnectAck handshake runs
+on that one socket.
+
+- **Each peer gets one owner thread.** It is the only thread that reads the
+  socket, flushes queued writes, closes the link, and calls `on_closed()`. It
+  runs `poll()` on {socket, an eventfd}: `POLLIN` always, `POLLOUT` only while
+  bytes are queued. The poll timeout is 200 ms, and every iteration bumps the
+  `ReaderActivity` tick, so the unchanged `WatchdogWorker` detects stalls and
+  enforces `--max-peers` (it owns and joins the owner threads).
+- **Writes** from `SenderWorker` go through `PeerThreadIo::send`: an immediate
+  non-blocking `send` under the link's `tx_mutex`; the remainder is queued under
+  the same cap and `WouldBlock` rules as the pools (1 MiB, whole frames only),
+  then the owner is woken through the eventfd. Sender and owner writes are
+  serialized by `tx_mutex`, so frames never interleave.
+- **A closed link is detected synchronously**: `send` sees the link's `closed`
+  flag under `tx_mutex` and answers `ConnectionNotFound`, with no round trip
+  through the store.
+- **`close(handle)`** marks the link closed, shuts the socket down and wakes the
+  owner, which exits and calls `on_closed()` (the slots are released a moment
+  later, from the owner thread, not inside `close()`).
+- **Shutdown:** `stop()` wakes `accept()` and stops the watchdog, whose drain
+  shuts every socket down and joins every owner thread. `stop()` joins nothing;
+  the destructor joins the watchdog thread.
+- **Per peer:** 1 thread, 2 fds (socket and eventfd), 1 TCP connection.
+- **Measures:** against `threads`, half the connections and no blocking sender,
+  with the same thread-per-peer scheduling ceiling; against `poll-duplex`, the
+  cost of a thread per peer instead of a shared poller.
+- **Known, shared with every duplex mode:** after a duplex close, the next send
+  fails and the sender retries, and the retry may re-dial the peer. The
+  benchmarks mask it because duplex stressgen advertises port 0.
+
 ## 3. Threads: how each mode builds them
 
 Threads are created at three points. Two happen during startup in
@@ -260,6 +298,7 @@ happens at runtime, and only `threads` and `pool-sender` do it.
    - `PoolOutbound`: the **pump** thread ([PoolOutbound.hpp](../PoolOutbound.hpp)).
    - `MultiplexedIo`: the **I/O** thread, plus the **tx** thread in the split
      modes ([MultiplexedIo.cpp](../MultiplexedIo.cpp)).
+   - `PeerThreadIo`: the **watchdog** thread ([PeerThreadIo.cpp](../PeerThreadIo.cpp)).
 
    These threads already idle on their pools while the rest of the app is still
    being wired up.
@@ -291,6 +330,7 @@ happens at runtime, and only `threads` and `pool-sender` do it.
 | `poll` / `epoll` | `MultiplexedIo::run()`: `accept()`, then hand the socket to the pool | I/O: `pool.receive()` loop, which reads every socket and flushes writes | none | 8 |
 | `*-duplex` | same as `poll` / `epoll` | I/O: same, but every socket has a `FrameChannel` | none | 8 |
 | `*-split` | same; each accepted socket goes into the rx pool and the `TxPoller` | I/O (reads) and tx (`TxPoller::run()`, writes only) | none | 9 |
+| `peer-threads` | `PeerThreadIo::run()`: `accept()`, then start the owner thread and hand it to the watchdog | watchdog | 1 owner thread per peer (inbound and dialed), joined by the watchdog | 7 + 1 + N |
 
 The 7 base threads are main, stdin reader, logger, store, sender, listener and
 metrics. These totals match what the quick benchmark run measured: 8 for
@@ -878,6 +918,7 @@ cmake -B build -S . && cmake --build build -j -- -k   # -k: see "Known issues"
 | `test_tx_poller` | both `TxPoller` backends: fast path, queued flush, `WouldBlock` at cap, fatal write shuts the shared socket down, `remove()` leaves no dangling ref, rx pool + `TxPoller` on one shared socket | `*-split` |
 | `test_pool_outbound` | `PoolOutbound`: hello, peer-close detection, `WouldBlock` → drop, `SenderWorker` over it | `pool-sender` |
 | `test_multiplexed` | `MultiplexedIo` for both pools in all three models: inbound events, malformed frame closes, outbound send and failure. Duplex/split: one connection per pair (`accepts` sums to 1), Ack on the same socket, adopted reconnect closes the old channel, one disconnect per close, sender close releases both slots. Two in-process nodes per mode. | poll, epoll, `*-duplex`, `*-split` |
+| `test_peer_threads` | `PeerThreadIo`: two in-process nodes over one connection; 8 MiB in order to a slow reader; backpressure (`WouldBlock`, nothing partial queued); `close(handle)` (one disconnect, slots released, `ConnectionNotFound`); cap eviction; `stop()` and destruction with 64 live peers under 1 s | `peer-threads` |
 | `test_p2p` | `PeerTable` (rx/tx slots, supersede, simplex vs duplex release); `FrameChannel` closed before or during its bind (2,000-round race); listener/reader/watchdog: loopback, id reuse, cap pruning, stalled reader, superseded reader stays silent | `threads`, plus link logic for all |
 | `test_sender` | `SenderWorker`: handshake, connection reuse, dial-back, retries, reconnect, unreachable; duplex fake transport answers on the existing handle and closes `superseded` | all (policy) |
 | `test_store`, `test_render`, `test_headless`, `test_main`, `test_logger`, `test_queue`, `test_wire`, `test_workers`, `test_metrics` | store subscriptions and echo, command handling, headless JSONL protocol, whole-stack startup and shutdown, logger, queue, wire codec, keyboard, metrics | mode-independent |
@@ -886,7 +927,7 @@ cmake -B build -S . && cmake --build build -j -- -k   # -k: see "Known issues"
 ### End-to-end tests (`tests/e2e/test_e2e.py`)
 
 Real headless `app` processes driven through `tools/node.py`. CMake registers one
-run per mode (`e2e_threads` … `e2e_epoll-split`), passing `E2E_IO=<mode>`.
+run per mode (`e2e_threads` … `e2e_peer-threads`), passing `E2E_IO=<mode>`.
 
 The scenarios are: ready and clean shutdown; stdout is pure JSONL;
 connect events; message round trip; conversation listing; disconnect and

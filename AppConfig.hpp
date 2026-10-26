@@ -1,7 +1,7 @@
 #pragma once
 
 // Command line of the app:
-//   app [--io=threads|pool-sender|poll|epoll|poll-duplex|epoll-duplex|poll-split|epoll-split] [--headless] [--echo] [--max-peers=N]
+//   app [--io=threads|pool-sender|poll|epoll|poll-duplex|epoll-duplex|poll-split|epoll-split|peer-threads] [--headless] [--echo] [--max-peers=N]
 //       [--backlog=N] [--address=A] [--port=P] [--log=PATH] [--metrics=PATH]
 // The old positional form `app [address] [port] [log]` still works.
 

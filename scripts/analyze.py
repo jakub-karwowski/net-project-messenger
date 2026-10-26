@@ -10,15 +10,17 @@ import csv, html, json, math, sys
 from pathlib import Path
 
 VARIANTS = ["threads", "pool-sender", "poll", "epoll",
-            "poll-duplex", "epoll-duplex", "poll-split", "epoll-split"]
+            "poll-duplex", "epoll-duplex", "poll-split", "epoll-split", "peer-threads"]
 # Colour-blind-safe-ish categorical colours (light, dark) + distinct marker shapes.
 COLORS = {"threads": ("#0072B2", "#56B4E9"), "pool-sender": ("#D55E00", "#F0A060"),
           "poll": ("#009E73", "#4FD1A5"), "epoll": ("#CC79A7", "#E8A3C8"),
           # duplex/split: shifted shades of their base poll (green) / epoll (pink) hue
           "poll-duplex": ("#005C42", "#8FE3C2"), "poll-split": ("#8BC34A", "#B5E27A"),
-          "epoll-duplex": ("#7A2E58", "#F5C4DE"), "epoll-split": ("#E040A0", "#FF7FC8")}
+          "epoll-duplex": ("#7A2E58", "#F5C4DE"), "epoll-split": ("#E040A0", "#FF7FC8"),
+          # one thread per peer on one socket: a darker shade of the `threads` blue
+          "peer-threads": ("#003E73", "#9CC3FF")}
 MARKERS = {"threads": "circle", "pool-sender": "square", "poll": "triangle", "epoll": "diamond",
-           "poll-duplex": "cross", "poll-split": "star", "epoll-duplex": "hexagon", "epoll-split": "plus"}
+           "poll-duplex": "cross", "poll-split": "star", "epoll-duplex": "hexagon", "epoll-split": "plus", "peer-threads": "triangle-down"}
 
 # key, label, unit, prefer-log
 METRICS = [
@@ -239,6 +241,8 @@ def marker(shape, x, y, cls):
         return f'<rect class="{cls}" x="{x-r:.1f}" y="{y-r:.1f}" width="{2*r}" height="{2*r}"/>'
     if shape == "triangle":
         return f'<polygon class="{cls}" points="{x:.1f},{y-r-1:.1f} {x+r+1:.1f},{y+r:.1f} {x-r-1:.1f},{y+r:.1f}"/>'
+    if shape == "triangle-down":
+        return f'<polygon class="{cls}" points="{x:.1f},{y+r+1:.1f} {x+r+1:.1f},{y-r:.1f} {x-r-1:.1f},{y-r:.1f}"/>'
     def poly(pts):
         return f'<polygon class="{cls}" points="' + " ".join(f"{x+dx:.1f},{y+dy:.1f}" for dx, dy in pts) + '"/>'
     if shape == "plus":
