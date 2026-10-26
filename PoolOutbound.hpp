@@ -15,6 +15,7 @@
 // and backpressure_is_drop() is true, so SenderWorker drops the message.
 
 #include "Logger.hpp"
+#include "Metrics.hpp"
 #include "OutboundTransport.hpp"
 
 #include <array>
@@ -34,6 +35,7 @@ struct PoolOutboundOptions {
     // Effectively disabled: liveness comes from EOF/errors, not from idleness.
     std::chrono::milliseconds idle_timeout{std::chrono::hours{24 * 365}};
     std::size_t max_tx_buffer_bytes{1024 * 1024};
+    Metrics* metrics{nullptr};   // optional: receives tx_queued_sends / tx_flushes
 };
 
 template <class Pool>
@@ -42,6 +44,7 @@ public:
     explicit PoolOutbound(PoolOutboundOptions options = {}, Logger logger = {})
         : pool_(options.max_connections, options.idle_timeout, options.max_tx_buffer_bytes),
           logger_(std::move(logger)),
+          metrics_(options.metrics),
           pump_([this] { pump(); }) {}
 
     ~PoolOutbound() override { stop(); }
@@ -91,10 +94,18 @@ public:
     bool backpressure_is_drop() const noexcept override { return true; }
 
 private:
+    void publish_tx_stats() noexcept {
+        if (!metrics_) { return; }
+        const TxStats st = pool_.stats();
+        metrics_->tx_queued_sends.store(st.queued_sends, std::memory_order_relaxed);
+        metrics_->tx_flushes.store(st.flushes, std::memory_order_relaxed);
+    }
+
     void pump() {
         std::array<std::byte, 4096> buffer{};
         for (;;) {
             auto result = pool_.receive(std::span<std::byte>{buffer});
+            publish_tx_stats();
             if (!result) { return; } // pool closed
             if (result->bytes_read == 0) {
                 std::lock_guard lock{mutex_};
@@ -112,6 +123,7 @@ private:
 
     Pool pool_;
     Logger logger_;
+    Metrics* metrics_;
     std::mutex mutex_;
     std::unordered_set<int> live_;      // handles not yet reported closed
     std::size_t unexpected_reads_{0};   // pump thread only

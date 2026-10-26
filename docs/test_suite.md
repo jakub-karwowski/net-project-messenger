@@ -607,6 +607,8 @@ null, and a null pointer disables counting.
 | `reconnects` | counter | `SenderWorker` | successful reconnects |
 | `evictions` | counter | watchdog / pools | connections dropped for the peer cap, idleness or a stall |
 | `echoed` | counter | `StoreWorker` | messages bounced back in `--echo` mode |
+| `tx_queued_sends` | counter (mirrored) | `MultiplexedIo`, `PoolOutbound` | `send()` calls that could not finish on the immediate write and left bytes in a `tx_buffer` (the slow path). Copied from the pools' and `TxPoller`'s own relaxed counters (`TxStats`), so TcpSocket does not depend on `Metrics` |
+| `tx_flushes` | counter (mirrored) | `MultiplexedIo`, `PoolOutbound` | flushes of a `tx_buffer` triggered by POLLOUT/EPOLLOUT: by the I/O thread in `*-duplex`, by the `TxPoller` thread in `*-split` |
 
 #### Measured when a snapshot is taken
 
@@ -658,6 +660,7 @@ second, or as fast as `--window` in-flight messages allow.
 | `total_sent`, `total_received` | everything, warmup included |
 | `slow_sent` | messages sent by slow peers |
 | `send_skipped` | messages stressgen itself skipped because its own output buffer was full; this is a load generator limit, not the node's |
+| `handshake_us{p50,p90,p99,max,mean,samples}` | time from starting `connect()` to the peer reaching Ready (simplex: the return connection's `ConnectInfoAck` arrived; duplex: the Ack on the dialed socket), in µs. It covers the first ramp and churn redials. A handshake counts if it completes during the ramp or inside the measurement window (not in warmup or grace); slow peers are excluded. Expect about 3 RTT in simplex and 2 RTT in duplex |
 | `peers_total`, `peers_ready` | peers configured, and peers that completed the handshake |
 | `connect_failures`, `disconnects`, `churn_events`, `bad_frames` | connection health and protocol errors |
 | `config{…}`, `start_unix_ns`, `end_unix_ns` | the parameters used, and wall-clock times for lining up with the node's metrics |
@@ -931,6 +934,34 @@ Exit codes: 0 ok, 2 unreachable, 3 no peer completed the handshake.
 | S3 slow consumers | peers that stop reading | 0, 1, 4 |
 | S4 churn | peers that disconnect and redial | 0, 10, 50 |
 | S5 throughput ceiling | message size (bytes) | 32, 4096, 65536 |
+| S6a WAN churn | link RTT `rtt_ms` (netem delay RTT/2 per end, no rate) | 0, 4, 20, 50 (quick: 0, 20); 32 peers, 100 msg/s, 256 B, `--churn 16` (16 reconnects/s in total) |
+| S6b WAN bottleneck | `rate_mbit` on node→generator only (RTT 4 ms, netem `limit` about 2×BDP, at least 100 packets) | 1000, 200, 50 (quick: 1000, 100); 32 peers, closed loop (`--rate 0 --window 8`), 16 KiB |
+
+`rtt_ms` and `rate_mbit` feed only the network setup, never stressgen. S6a tests
+hypothesis 1: simplex dials back before sending the Ack, so
+`handshake_us` is about 3 RTT in simplex against 2 RTT in duplex (about 60 ms
+against 40 ms at `rtt_ms=20`). S6b tests hypothesis 2: behind a bottleneck the
+node's socket buffers stay full, so `tx_queued_sends` and `tx_flushes` become
+non-zero. S6b is closed loop because open-loop overload would measure netem's
+queue and stressgen's own drops instead of the node.
+
+**S6 network topology (no sudo).** `run_matrix.py` runs S1–S5 in its own process
+and re-executes itself for the S6 scenarios under `unshare -rnm --propagation
+private` (an unprivileged user + network + mount namespace). `scripts/netlab.py`
+then mounts a tmpfs on `/run`, creates the namespace `ns_p2p_gen` and a veth
+pair, and shapes it per cell:
+
+- `veth-node` `10.200.1.1/24` stays in the child's own namespace, where the node
+  runs (`--address=10.200.1.1`); `veth-gen` `10.200.1.2/24` is inside
+  `ns_p2p_gen`, where stressgen runs (`--target 10.200.1.1:<port> --listen-ip 10.200.1.2`).
+- MTU 1500 on both ends, and `ethtool -K … tso off gso off gro off` so netem sees
+  real packets (a failure is recorded as a warning in `meta.json`).
+- `tc qdisc replace … netem delay … [rate …] [limit …]` on each end. The rate
+  applies to `veth-node` egress only, because a symmetric rate would also slow
+  the generator→node direction and the node's tx buffers would barely fill.
+- Each S6 `meta.json` records `netem` (the parameters), `qdiscs` (`tc qdisc show`
+  of both ends) and `netlab` (including warnings). Everything disappears when the
+  child exits: no global interface names, no cleanup.
 
 ```
 scripts/run_matrix.py --app build/app --stressgen build/stressgen --out results

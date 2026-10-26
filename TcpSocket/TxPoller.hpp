@@ -82,6 +82,11 @@ public:
     // Stops run() and rejects further add()/send().
     void close() noexcept;
 
+    // Write-path counters (see TxStats); safe from any thread.
+    TxStats stats() const noexcept {
+        return {queued_sends_.load(std::memory_order_relaxed), flushes_.load(std::memory_order_relaxed)};
+    }
+
     // Flush loop; returns after close(). Never reads from a socket.
     void run();
 
@@ -104,6 +109,8 @@ private:
     std::mutex mutex_;
     std::size_t max_tx_buffer_bytes_;
     std::atomic<bool> closed_{false};
+    std::atomic<std::uint64_t> queued_sends_{0};
+    std::atomic<std::uint64_t> flushes_{0};
     Backend backend_;
     Map entries_;
 };

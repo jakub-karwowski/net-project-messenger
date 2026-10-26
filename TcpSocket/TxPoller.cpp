@@ -189,6 +189,7 @@ std::expected<void, SocketError> TxPoller<Backend>::send(
         if (consumed == source.size_bytes()) { return {}; }
     }
 
+    queued_sends_.fetch_add(1, std::memory_order_relaxed);
     try {
         if (entry.tx_offset > 0 && entry.tx_offset >= entry.tx_buffer.size() / 2) {
             entry.tx_buffer.erase(entry.tx_buffer.begin(),
@@ -237,6 +238,7 @@ void TxPoller<Backend>::run() {
             const auto it = entries_.find(id);
             if (it == entries_.end()) { continue; } // removed meanwhile
             Entry& entry = it->second;
+            flushes_.fetch_add(1, std::memory_order_relaxed);
             if (!flush_locked(entry)) {
                 drop_locked(it, true);
             } else if (entry.tx_buffer.empty()) {

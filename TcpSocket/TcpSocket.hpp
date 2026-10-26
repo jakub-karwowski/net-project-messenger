@@ -205,6 +205,14 @@ private:
     std::vector<int> ids_;                    // fds_[i + 1] belongs to ids_[i]
 };
 
+// Write-path counters of a pool / poller (relaxed atomics, read from any thread).
+//   queued_sends: send() calls that could not complete on the immediate write and left bytes in tx_buffer
+//   flushes:      flushes of tx_buffer triggered by writability (POLLOUT / EPOLLOUT)
+struct TxStats {
+    std::uint64_t queued_sends{0};
+    std::uint64_t flushes{0};
+};
+
 template <class Backend> class TxPoller;
 
 // Thread-safe, full-duplex I/O multiplexer for managing a bounded pool of TCP connections.
@@ -251,6 +259,10 @@ public:
 
     // Signals the pool to shut down and unblocks any thread waiting in receive().
     void close_pool() noexcept;
+    // Write-path counters (see TxStats); safe from any thread.
+    TxStats stats() const noexcept {
+        return {queued_sends_.load(std::memory_order_relaxed), flushes_.load(std::memory_order_relaxed)};
+    }
 
     // Drives the ::poll() event loop: flushes pending outbound tx_buffers on POLLOUT,
     // sweeps idle/over-capacity connections, and blocks until at least one connection
@@ -320,6 +332,8 @@ private:
     std::size_t max_connections_;
     std::int64_t idle_timeout_ms_;
     std::size_t max_tx_buffer_bytes_;
+    std::atomic<std::uint64_t> queued_sends_{0};
+    std::atomic<std::uint64_t> flushes_{0};
     std::atomic<bool> closed_{false};
 
     std::int64_t sweep_interval_ms_{0};   // How often receive() sweeps idle/LRU entries
@@ -368,6 +382,10 @@ public:
 
     // Signals shutdown and breaks a blocked receive().
     void close_pool() noexcept;
+    // Write-path counters (see TxStats); safe from any thread.
+    TxStats stats() const noexcept {
+        return {queued_sends_.load(std::memory_order_relaxed), flushes_.load(std::memory_order_relaxed)};
+    }
 
     // Blocks in epoll_wait() until a connection is readable/disconnects, while
     // flushing pending tx buffers and sweeping idle/over-capacity connections.
@@ -421,6 +439,8 @@ private:
     std::size_t max_connections_;
     std::int64_t idle_timeout_ms_;
     std::size_t max_tx_buffer_bytes_;
+    std::atomic<std::uint64_t> queued_sends_{0};
+    std::atomic<std::uint64_t> flushes_{0};
     std::atomic<bool> closed_{false};
 
     std::int64_t sweep_interval_ms_{0};   // How often receive() sweeps idle/LRU entries
