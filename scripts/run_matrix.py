@@ -70,6 +70,20 @@ def source_stamp():
                 harness_sha256=_sha256(__file__))
 
 
+def build_type(path):
+    """CMAKE_BUILD_TYPE of the build directory holding `path` (from its
+    CMakeCache.txt), or None when it can't be found. A hash doesn't reveal an
+    unoptimised binary; this does."""
+    for d in Path(path).resolve().parents:
+        cache = d / "CMakeCache.txt"
+        if cache.exists():
+            for line in cache.read_text(errors="replace").splitlines():
+                if line.startswith("CMAKE_BUILD_TYPE:"):
+                    return line.split("=", 1)[1].strip() or None
+            return None
+    return None
+
+
 def binary_stamp(path):
     """Identity of one binary at the moment a cell starts (per cell, so a rebuild
     in the middle of a run shows up as a different hash)."""
@@ -78,7 +92,8 @@ def binary_stamp(path):
     except OSError:
         return dict(path=str(path), sha256=None)
     return dict(path=str(Path(path).resolve()), sha256=_sha256(path), size=st.st_size,
-                mtime=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(st.st_mtime)))
+                mtime=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(st.st_mtime)),
+                build_type=build_type(path))
 
 
 def build_stamp(args):
@@ -103,6 +118,15 @@ SCENARIOS = {
     "S5": dict(title="Throughput ceiling", x="size", values=[32, 4096, 65536],
                base=dict(peers=8, rate=0, window=16, size=64, duration=20, warmup=5),
                quick_values=[32, 4096]),
+    # The --max-peers cap exists to keep thread-per-connection modes from starving
+    # the node's CPUs. S1 at 1024 peers runs effectively uncapped (peers + 16) and
+    # threads/pool-sender collapse; here the same load meets a cap. 256 is the
+    # largest S1 peer count every mode sustained on the 2 node CPUs; 1040 repeats
+    # the uncapped S1 cell inside this scenario. x is NOT a stressgen option: it
+    # only sets the node's --max-peers (see max_peers_for).
+    "S7": dict(title="Capped fan-in", x="max_peers", values=[64, 128, 256, 1040],
+               base=dict(peers=1024, rate=100, size=64, duration=20, warmup=5),
+               quick_values=[8, 64]),
 }
 
 
@@ -143,6 +167,10 @@ def cell_params(sc, x, quick):
 
 
 def max_peers_for(p):
+    """The node's --max-peers: an explicit cap (S7), else room for every peer so
+    caps never evict."""
+    if p.get("max_peers"):
+        return int(p["max_peers"])
     return int(p["peers"] + p["idle_peers"] + p["slow_peers"] + 16)
 
 
@@ -353,6 +381,8 @@ def run_with_wan(args, scs, wan_scs, variants, reps):
            "--seed", str(args.seed), "--_in_ns", "--_source", json.dumps(args.source)]
     if args.quick:
         cmd.append("--quick")
+    if args.allow_non_release:
+        cmd.append("--allow-non-release")
     print("S6 cells: re-executing under unshare -rnm", flush=True)
     return max(rc, subprocess.run(cmd).returncode)
 
@@ -381,6 +411,8 @@ def main(parsed=None):
     ap.add_argument("--quit-timeout", type=float, default=30,
                     help="seconds from /quit to exit before a cell is marked dirty")
     ap.add_argument("--fake", action="store_true", help="synthetic results, no binaries")
+    ap.add_argument("--allow-non-release", action="store_true",
+                    help="run with Debug/unknown builds (numbers are not comparable)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--_in_ns", action="store_true", help=argparse.SUPPRESS)   # set by the unshare re-exec
@@ -399,6 +431,10 @@ def main(parsed=None):
         for b in (args.app, args.stressgen):
             if not os.access(b, os.X_OK):
                 sys.exit(f"not executable: {b}")
+            bt = build_type(b)
+            if bt != "Release" and not args.allow_non_release:
+                sys.exit(f"{b} comes from a {bt or 'unknown'} build; benchmark numbers need "
+                         f"Release (cmake -DCMAKE_BUILD_TYPE=Release), or pass --allow-non-release")
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         try:
             resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))

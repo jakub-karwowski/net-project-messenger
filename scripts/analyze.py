@@ -39,6 +39,8 @@ METRICS = [
     ("handshake_p99", "Handshake p99 (connect to Ready)", "us", True),
     ("connect_failures", "Connect failures", "conns", False),
     ("churn_events", "Churn reconnects", "events", False),
+    ("peers_ready", "Peers served at the end", "peers", False),
+    ("disconnects", "Peers disconnected by the node", "peers", False),
     ("send_skipped", "Generator send drops", "msgs", False),
     ("tx_queued_sends", "Sends that queued bytes", "sends", True),
     ("tx_flushes", "Flushes on writability", "flushes", True),
@@ -48,6 +50,7 @@ CHART_KEYS = ["msgs_per_s", "rtt_p50", "rtt_p99", "rtt_p999", "cpu_pct", "nvcsw_
               "maxrss_kb", "threads", "fds"]
 # Per-scenario chart lists override CHART_KEYS (S6 looks at different things).
 SCENARIO_CHARTS = {
+    "S7": ["msgs_per_s", "rtt_p50", "rtt_p99", "peers_ready", "evictions", "cpu_pct", "threads"],
     "S6a": ["handshake_p50", "handshake_p99", "msgs_per_s", "rtt_p99"],
     "S6b": ["msgs_per_s", "rtt_p50", "rtt_p99", "rtt_p999", "tx_queued_sends", "cpu_pct", "nvcsw_rate"],
 }
@@ -110,6 +113,7 @@ def cell_metrics(cell_dir, rep, meta):
     hs = st.get("handshake_us")   # absent in results from before S6
     out.update(handshake_p50=hs["p50"] if hs else None, handshake_p99=hs["p99"] if hs else None,
                connect_failures=st.get("connect_failures"), churn_events=st.get("churn_events"),
+               peers_ready=st.get("peers_ready"), disconnects=st.get("disconnects"),
                send_skipped=st.get("send_skipped"))
     if not mp.exists():
         raise ValueError("missing metrics.jsonl")

@@ -934,6 +934,7 @@ Exit codes: 0 ok, 2 unreachable, 3 no peer completed the handshake.
 | S3 slow consumers | peers that stop reading | 0, 1, 4 |
 | S4 churn | peers that disconnect and redial | 0, 10, 50 |
 | S5 throughput ceiling | message size (bytes) | 32, 4096, 65536 |
+| S7 capped fan-in | the node's `--max-peers` (1024 peers × 100 msg/s) | 64, 128, 256, 1040 (1040 = uncapped, as in S1) |
 | S6a WAN churn | link RTT `rtt_ms` (netem delay RTT/2 per end, no rate) | 0, 4, 20, 50 (quick: 0, 20); 32 peers, 100 msg/s, 256 B, `--churn 16` (16 reconnects/s in total) |
 | S6b WAN bottleneck | `rate_mbit` on node→generator only (RTT 4 ms, netem `limit` about 2×BDP, at least 100 packets) | 1000, 200, 50 (quick: 1000, 100); 32 peers, closed loop (`--rate 0 --window 8`), 16 KiB |
 
