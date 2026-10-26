@@ -134,6 +134,8 @@ int main() {
         check(r.rtt.count() == r.received, "one sample per echo");
         check(r.rtt.quantile(0.5) > 0 && r.rtt.quantile(0.5) < 50'000'000, "p50 sane (<50ms)");
         check(r.rtt.quantile(0.99) >= r.rtt.quantile(0.5) && r.rtt.max() >= r.rtt.quantile(0.999), "quantiles monotone");
+        check(r.handshake.count() >= 64 && r.handshake.quantile(0.5) > 0, "handshake samples present and positive");
+        check(stress::to_json(c, r).find("\"handshake_us\":{\"p50\":") != std::string::npos, "json has handshake_us");
     }
     {   // closed loop window
         FakeNode node;
@@ -153,6 +155,7 @@ int main() {
         stress::Result r; std::string err;
         check(run(c, r, err) == 0, "mixed run completes");
         check(r.churn_events > 10, "churn happened");
+        check(r.handshake.count() > 16 + 4 + 4 && r.handshake.quantile(0.5) > 0, "churn redials add handshake samples");
         check(r.slow_sent > 0 && r.received > 0, "slow peers send, active peers echo");
         check(r.received <= r.sent, "received <= sent");
     }
@@ -166,6 +169,7 @@ int main() {
         check(r.peers_ready == 32, "duplex: all peers ready");
         check(r.sent > 0 && r.lost == 0 && r.received == r.sent, "duplex: received == sent");
         check(r.rtt.count() == r.received, "duplex: one sample per echo");
+        check(r.handshake.count() >= 32 && r.handshake.quantile(0.5) > 0, "duplex: handshake samples present and positive");
     }
     {   // duplex: idle + slow + churn
         FakeNode node(true);
@@ -176,6 +180,7 @@ int main() {
         stress::Result r; std::string err;
         check(run(c, r, err) == 0, "duplex mixed run completes");
         check(r.churn_events > 10, "duplex: churn happened");
+        check(r.handshake.count() > 16 + 4 + 4 && r.handshake.quantile(0.5) > 0, "duplex: churn redials add handshake samples");
         check(r.slow_sent > 0 && r.received > 0, "duplex: slow peers send, active peers echo");
         check(r.received <= r.sent, "duplex: received <= sent");
     }

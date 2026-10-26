@@ -120,6 +120,7 @@ struct Result {
     std::uint64_t lost = 0;           // sent - received
     double msgs_per_s = 0;            // received / duration
     Histogram rtt;
+    Histogram handshake;              // connect() start -> Ready (ramp + churn redials, window rule below)
     std::uint64_t total_sent = 0;     // everything, warmup included
     std::uint64_t total_received = 0;
     std::uint64_t slow_sent = 0;
@@ -160,6 +161,7 @@ private:
         std::uint64_t seq = 0;
         std::uint64_t inflight = 0;
         std::int64_t next_send = 0;
+        std::int64_t dial_ns = 0;  // when connect() was started for the current attempt
     };
     struct Conn {
         CType type;
@@ -189,6 +191,7 @@ private:
     void dial(int i);
     void kill_peer(int i, bool count);
     void maybe_ready(int i);
+    void set_ready(Peer& p, std::int64_t now);
     void flush(int i);
     void arm_write(int i);
     void on_accept();
@@ -260,6 +263,7 @@ inline void Generator::dial(int i) {
     const int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
     if (rc != 0 && errno != EINPROGRESS) { ::close(fd); ++res_->connect_failures; p.state = State::Dead; return; }
     p.wfd = fd;
+    p.dial_ns = now_ns();
     p.state = State::Connecting;
     p.out.clear(); p.out_off = 0; p.want_out = true; p.no_read = false; p.inflight = 0;
     add_conn(fd, CType::Write, i, EPOLLIN | EPOLLOUT);
@@ -275,10 +279,19 @@ inline void Generator::kill_peer(int i, bool count) {
     if (count) { ++res_->disconnects; }
 }
 
+// A handshake counts when it completes during the ramp (no window yet, ms_ == 0)
+// or inside the measurement window [ms_, me_); warmup and grace completions are
+// excluded like for RTT.
+inline void Generator::set_ready(Peer& p, std::int64_t now) {
+    p.state = State::Ready;
+    if (p.kind == Kind::Slow) { return; }
+    if (ms_ == 0 || (now >= ms_ && now < me_)) { res_->handshake.record(now - p.dial_ns); }
+}
+
 inline void Generator::maybe_ready(int i) {
     Peer& p = peers_[static_cast<std::size_t>(i)];
     if (cfg_.duplex) { return; }   // duplex: Ready is set when the Ack arrives
-    if (p.state == State::Handshaking && p.rfd >= 0) { p.state = State::Ready; }
+    if (p.state == State::Handshaking && p.rfd >= 0) { set_ready(p, now_ns()); }
 }
 
 inline void Generator::arm_write(int i) {
@@ -414,7 +427,7 @@ inline void Generator::on_duplex_read(int fd) {
                 if (!item) { ++res_->bad_frames; continue; }
                 if (!*item) { break; }
                 if (const auto* ack = wire::as_connect_ack(**item)) {
-                    if (ack->ack_peer_id == p.token && p.state == State::Handshaking) { p.state = State::Ready; }
+                    if (ack->ack_peer_id == p.token && p.state == State::Handshaking) { set_ready(p, now); }
                 } else if (const auto* m = wire::as_message(**item)) {
                     if (p.state == State::Ready) { on_message(i, *m, now); }
                 }
@@ -597,11 +610,12 @@ inline int Generator::run(Result& res, std::string& err) {
 }
 
 inline std::string to_json(const Config& c, const Result& r) {
-    char b[2048];
+    char b[2560];
     auto us = [](std::int64_t ns) { return static_cast<double>(ns) / 1000.0; };
     std::snprintf(b, sizeof b,
         "{\"sent\":%llu,\"received\":%llu,\"lost\":%llu,\"msgs_per_s\":%.1f,"
         "\"rtt_us\":{\"p50\":%.1f,\"p90\":%.1f,\"p99\":%.1f,\"p999\":%.1f,\"max\":%.1f,\"mean\":%.1f,\"samples\":%llu},"
+        "\"handshake_us\":{\"p50\":%.1f,\"p90\":%.1f,\"p99\":%.1f,\"max\":%.1f,\"mean\":%.1f,\"samples\":%llu},"
         "\"total_sent\":%llu,\"total_received\":%llu,\"slow_sent\":%llu,\"send_skipped\":%llu,"
         "\"peers_total\":%d,\"peers_ready\":%d,\"connect_failures\":%llu,\"disconnects\":%llu,"
         "\"churn_events\":%llu,\"bad_frames\":%llu,"
@@ -611,6 +625,8 @@ inline std::string to_json(const Config& c, const Result& r) {
         (unsigned long long)r.sent, (unsigned long long)r.received, (unsigned long long)r.lost, r.msgs_per_s,
         us(r.rtt.quantile(0.5)), us(r.rtt.quantile(0.9)), us(r.rtt.quantile(0.99)), us(r.rtt.quantile(0.999)),
         us(r.rtt.max()), r.rtt.mean() / 1000.0, (unsigned long long)r.rtt.count(),
+        us(r.handshake.quantile(0.5)), us(r.handshake.quantile(0.9)), us(r.handshake.quantile(0.99)),
+        us(r.handshake.max()), r.handshake.mean() / 1000.0, (unsigned long long)r.handshake.count(),
         (unsigned long long)r.total_sent, (unsigned long long)r.total_received, (unsigned long long)r.slow_sent,
         (unsigned long long)r.send_skipped, r.peers_total, r.peers_ready,
         (unsigned long long)r.connect_failures, (unsigned long long)r.disconnects,

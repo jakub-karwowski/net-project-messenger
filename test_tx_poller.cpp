@@ -134,6 +134,8 @@ void test_immediate(const std::string& name) {
     check(n && *n == msg.size()
               && std::string(reinterpret_cast<const char*>(buf.data()), *n) == msg,
           name + ": peer receives the bytes");
+    check(poller.stats().queued_sends == 0 && poller.stats().flushes == 0,
+          name + ": immediate send is not counted as queued");
 }
 
 template <typename Poller>
@@ -171,6 +173,8 @@ void test_queued(const std::string& name) {
         got += *n;
     }
     check(got == sent, name + ": every queued byte flushed once the peer drains");
+    check(poller.stats().queued_sends > 0, name + ": queued sends counted");
+    check(poller.stats().flushes > 0, name + ": flushes on writability counted");
     check(intact, name + ": bytes arrive in order");
 }
 

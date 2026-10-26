@@ -623,6 +623,7 @@ std::expected<ReceiveResult, SocketError> TcpConnectionPool::receive(
             Entry& entry = it->second;
 
             if ((revents & POLLOUT) != 0 && entry.tx_buffer.size() > entry.tx_offset) {
+                flushes_.fetch_add(1, std::memory_order_relaxed);
                 if (!flush_tx_locked(entry)) {
                     drop_locked(it);
                     output = ReceiveResult{.connection_id = conn_id, .bytes_read = 0};
@@ -720,6 +721,7 @@ std::expected<void, SocketError> TcpConnectionPool::send(
         if (consumed == source.size_bytes()) { return {}; }
     }
 
+    queued_sends_.fetch_add(1, std::memory_order_relaxed);
     // Slow path: keep the unsent remainder and let receive() finish it on POLLOUT.
     // Only compact once the dead prefix dominates, so appends stay amortized O(1).
     if (entry.tx_offset > 0 && entry.tx_offset >= entry.tx_buffer.size() / 2) {
@@ -1026,6 +1028,7 @@ std::expected<ReceiveResult, SocketError> EpollConnectionPool::receive(
             Entry& entry = it->second;
 
             if ((event.events & EPOLLOUT) != 0 && entry.tx_buffer.size() > entry.tx_offset) {
+                flushes_.fetch_add(1, std::memory_order_relaxed);
                 if (!flush_tx_locked(entry)) {
                     drop_locked(it);
                     output = ReceiveResult{.connection_id = conn_id, .bytes_read = 0};
@@ -1129,6 +1132,7 @@ std::expected<void, SocketError> EpollConnectionPool::send(
         if (consumed == source.size_bytes()) { return {}; }
     }
 
+    queued_sends_.fetch_add(1, std::memory_order_relaxed);
     // Slow path: keep the unsent remainder and let receive() finish it on EPOLLOUT.
     // Only compact once the dead prefix dominates, so appends stay amortized O(1).
     if (entry.tx_offset > 0 && entry.tx_offset >= entry.tx_buffer.size() / 2) {

@@ -47,21 +47,23 @@ std::string Metrics::snapshot_json(const QueueMarks& marks) const {
     constexpr auto r = std::memory_order_relaxed;
     using ull = unsigned long long;
 
-    char buf[1024];
+    char buf[1280];
     const int n = std::snprintf(buf, sizeof buf,
         "{\"t_ns\":%lld,\"accepts\":%llu,\"connections_live\":%lld,\"bytes_in\":%llu,"
         "\"frames_in\":%llu,\"frames_out\":%llu,\"send_failures\":%llu,"
         "\"send_backpressure_drops\":%llu,\"reconnects\":%llu,\"evictions\":%llu,"
         "\"echoed\":%llu,\"render_q_hwm\":%zu,\"store_q_hwm\":%zu,\"sender_q_hwm\":%zu,"
         "\"utime_us\":%lld,\"stime_us\":%lld,\"nvcsw\":%ld,\"nivcsw\":%ld,"
-        "\"maxrss_kb\":%ld,\"threads\":%ld,\"fds\":%ld}",
+        "\"maxrss_kb\":%ld,\"threads\":%ld,\"fds\":%ld,"
+        "\"tx_queued_sends\":%llu,\"tx_flushes\":%llu}",
         t_ns, (ull)accepts.load(r), (long long)connections_live.load(r),
         (ull)bytes_in.load(r), (ull)frames_in.load(r), (ull)frames_out.load(r),
         (ull)send_failures.load(r), (ull)send_backpressure_drops.load(r),
         (ull)reconnects.load(r), (ull)evictions.load(r), (ull)echoed.load(r),
         marks.render, marks.store, marks.sender,
         tv_us(ru.ru_utime), tv_us(ru.ru_stime), ru.ru_nvcsw, ru.ru_nivcsw, ru.ru_maxrss,
-        thread_count(), fd_count());
+        thread_count(), fd_count(),
+        (ull)tx_queued_sends.load(r), (ull)tx_flushes.load(r));
     return std::string(buf, n > 0 ? static_cast<std::size_t>(n) : 0);
 }
 

@@ -89,6 +89,8 @@ private:
     static constexpr bool kSplit = !std::is_same_v<Tx, SamePoolTx>;
 
     void io_loop();
+    // Mirrors the pool's (and, in Split, the TxPoller's) write counters into Metrics.
+    void publish_tx_stats() noexcept;
     // Adds the connection to the pool (and the TxPoller in Split); caller holds
     // registry_mutex_. Returns the pool id, or -1.
     int attach_locked(std::shared_ptr<TcpConnection> connection);

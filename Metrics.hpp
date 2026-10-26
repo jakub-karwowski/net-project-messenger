@@ -47,6 +47,10 @@ struct Metrics {
     std::atomic<uint64_t> reconnects{0};
     std::atomic<uint64_t> evictions{0};
     std::atomic<uint64_t> echoed{0};
+    // Write path (pool / TxPoller): sends that had to queue bytes (slow path) and
+    // flushes of the queue on writability. Mirrored from the transport's TxStats.
+    std::atomic<uint64_t> tx_queued_sends{0};
+    std::atomic<uint64_t> tx_flushes{0};
 
     // One flat JSON object: t_ns (steady clock), the counters, queue marks and
     // process stats (rusage, threads, fds). Allocates; call from a stats thread.

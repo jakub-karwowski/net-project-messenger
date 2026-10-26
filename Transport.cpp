@@ -58,6 +58,7 @@ IoStack make_io_stack(IoMode mode, const NetConfig& net, ThreadQueue<Event>& sto
         case IoMode::PoolSender: {
             PoolOutboundOptions options;
             options.max_connections = 2 * net.max_peers;
+            options.metrics = net.metrics;
             return IoStack{
                 std::make_unique<ThreadedInbound>(net, store_queue, peers, logger),
                 std::make_unique<PoolOutbound<TcpConnectionPool>>(options, std::move(logger))};

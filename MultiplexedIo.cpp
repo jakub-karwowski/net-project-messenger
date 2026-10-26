@@ -122,10 +122,24 @@ void MultiplexedIo<Pool, Tx>::stop() noexcept {
 }
 
 template <class Pool, class Tx>
+void MultiplexedIo<Pool, Tx>::publish_tx_stats() noexcept {
+    if (!net_.metrics) { return; }
+    TxStats st = pool_.stats();
+    if constexpr (kSplit) {
+        const TxStats t = tx_.stats();
+        st.queued_sends += t.queued_sends;
+        st.flushes += t.flushes;
+    }
+    net_.metrics->tx_queued_sends.store(st.queued_sends, std::memory_order_relaxed);
+    net_.metrics->tx_flushes.store(st.flushes, std::memory_order_relaxed);
+}
+
+template <class Pool, class Tx>
 void MultiplexedIo<Pool, Tx>::io_loop() {
     std::vector<std::byte> buffer(kReadChunk);
     for (;;) {
         auto received = pool_.receive(std::span<std::byte>{buffer});
+        publish_tx_stats();
         if (!received) {
             if (received.error() == SocketError::ConnectionClosed || stopping_.load()) { break; }
             if (received.error() != SocketError::Interrupted) {

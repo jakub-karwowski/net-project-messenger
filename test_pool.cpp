@@ -167,6 +167,34 @@ void test_echo(const std::string& name) {
     check(n && *n == msg.size()
               && std::string(reinterpret_cast<const char*>(back.data()), *n) == msg,
           name + ": echo round trip");
+    check(pool.stats().queued_sends == 0 && pool.stats().flushes == 0,
+          name + ": small send completes on the immediate write (no queueing)");
+}
+
+template <typename Pool>
+void test_tx_stats(const std::string& name) {
+    Endpoint ep = make_endpoint();
+    Pool pool(16, 60s, 64u * 1024 * 1024);
+    Driver<Pool> driver(pool);
+    auto pr = make_pair(ep);
+    const int id = pool.add_connection(std::move(pr.server));
+    const std::string chunk(64 * 1024, 's');
+    std::size_t sent = 0;
+    while (sent < 16u * 1024 * 1024) {   // peer not reading: kernel buffers fill, the rest queues
+        if (!pool.send(id, as_bytes(chunk))) { break; }
+        sent += chunk.size();
+    }
+    check(pool.stats().queued_sends > 0, name + ": a full socket buffer counts queued sends");
+    pr.peer.with_receive_timeout(3s);
+    std::vector<std::byte> buf(256 * 1024);
+    std::size_t got = 0;
+    while (got < sent) {
+        auto n = pr.peer.receive(buf);
+        if (!n) { break; }
+        got += *n;
+    }
+    check(got == sent, name + ": queued bytes all arrive");
+    check(pool.stats().flushes > 0, name + ": flushes on writability counted");
 }
 
 template <typename Pool>
@@ -326,6 +354,7 @@ void test_close_unblocks(const std::string& name) {
 template <typename Pool>
 void run_all(const std::string& name) {
     test_echo<Pool>(name);
+    test_tx_stats<Pool>(name);
     test_shared_ptr_add<Pool>(name);
     test_peer_close<Pool>(name);
     test_idle_timeout<Pool>(name);

@@ -48,16 +48,20 @@ int main() {
     p2p::Metrics m;
     p2p::bump(&m, &p2p::Metrics::accepts, 3);
     p2p::live_inc(&m);
+    p2p::bump(&m, &p2p::Metrics::tx_queued_sends, 7);
+    p2p::bump(&m, &p2p::Metrics::tx_flushes, 2);
     p2p::bump(nullptr, &p2p::Metrics::accepts); // no-op
     const std::string json = m.snapshot_json({4, 5, 6});
     for (const char* k : {"t_ns", "accepts", "connections_live", "bytes_in", "frames_in", "frames_out",
                           "send_failures", "send_backpressure_drops", "reconnects", "evictions",
                           "echoed", "render_q_hwm", "store_q_hwm", "sender_q_hwm", "utime_us",
-                          "stime_us", "nvcsw", "nivcsw", "maxrss_kb", "threads", "fds"}) {
+                          "stime_us", "nvcsw", "nivcsw", "maxrss_kb", "threads", "fds",
+                          "tx_queued_sends", "tx_flushes"}) {
         check(has(json, k), std::string{"snapshot has "} + k);
     }
     check(flat_numeric_object(json), "snapshot is a flat numeric JSON object: " + json);
     check(json.find("\"accepts\":3,") != std::string::npos, "accepts value");
+    check(json.find("\"tx_queued_sends\":7,\"tx_flushes\":2}") != std::string::npos, "tx counters value");
     check(json.find("\"connections_live\":1,") != std::string::npos, "live gauge");
     check(json.find("\"store_q_hwm\":5,") != std::string::npos, "queue marks");
     check(json.find("\"threads\":0,") == std::string::npos, "threads read from /proc");
