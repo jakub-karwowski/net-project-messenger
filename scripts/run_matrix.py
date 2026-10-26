@@ -5,6 +5,9 @@ Per cell: start the node headless with --echo, wait for the "ready" JSONL
 event, run stressgen against it, send /quit, wait for "bye" + exit.
 Output layout:
   <out>/<scenario>/<param>/<variant>/rep<N>.{stress.json,metrics.jsonl,node.log,meta.json}
+S6 (WAN) scenarios run node and stressgen on both ends of a netem-shaped veth link
+(scripts/netlab.py). That needs no sudo: this script re-executes itself, restricted
+to the S6 scenarios, under `unshare -rnm`; S1-S5 cells run in the normal process.
 Cells whose meta.json has status ok|dirty are skipped on re-run (resume).
 `--fake` writes synthetic results (no binaries) to exercise analyze.py.
 Every meta.json carries a "build" stamp (git commit, uncommitted changes, binary
@@ -12,6 +15,9 @@ hashes) so cells produced by different builds can be told apart.
 """
 import argparse, hashlib, json, math, os, random, resource, subprocess, sys, threading, time, zlib
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import netlab
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -98,6 +104,27 @@ SCENARIOS = {
                base=dict(peers=8, rate=0, window=16, size=64, duration=20, warmup=5),
                quick_values=[32, 4096]),
 }
+
+
+def _s6b_net(rate_mbit):
+    """Rate on the node->generator direction only; RTT 4 ms; netem limit ~2x BDP (>= 100 pkts)."""
+    bdp_bytes = rate_mbit * 1e6 / 8 * 0.004
+    return dict(node_delay_ms=2, gen_delay_ms=2, node_rate_mbit=rate_mbit,
+                limit_pkts=max(100, math.ceil(2 * bdp_bytes / netlab.MTU)))
+
+
+# S6: x is NOT a stressgen option, it only feeds netlab.configure_netem via `net`.
+SCENARIOS.update({
+    "S6a": dict(title="WAN churn", x="rtt_ms", values=[0, 4, 20, 50],
+                base=dict(peers=32, rate=100, size=256, churn=16, duration=20, warmup=5),
+                quick_values=[0, 20],
+                net=lambda rtt: dict(node_delay_ms=rtt / 2, gen_delay_ms=rtt / 2)),
+    "S6b": dict(title="WAN bottleneck", x="rate_mbit", values=[1000, 200, 50],
+                base=dict(peers=32, rate=0, window=8, size=16384, duration=20, warmup=5),
+                quick_values=[1000, 100], net=_s6b_net),
+})
+LAB = None   # netlab.NetLab, set up once in the unshare child when an S6 scenario runs
+S6_EXTRA_TIMEOUT = 15   # seconds of slack on the stressgen timeout for WAN round trips
 QUICK_BASE = dict(duration=2, warmup=0.5)
 QUICK_PEERS_CAP = 16
 GRACE = 1.0
@@ -189,24 +216,38 @@ def run_cell(args, sc, x, variant, rep, port, d):
     meta = dict(scenario=sc, x_name=SCENARIOS[sc]["x"], x=x, variant=variant, rep=rep,
                 port=port, params=p, status="failed", error=None, t_start=time.time(),
                 build=build_stamp(args))
+    wan = "net" in SCENARIOS[sc]
+    if wan:
+        if LAB is None:
+            raise RuntimeError("S6 cells need the netlab namespace (run via run_matrix.py without --_in_ns)")
+        meta["netem"] = dict(SCENARIOS[sc]["net"](x))
+        LAB.configure_netem(**meta["netem"])
+        meta["qdiscs"] = LAB.qdiscs
+        meta["netlab"] = LAB.info()
     node = Node(["taskset", "-c", args.node_cpus, args.app, "--headless", "--echo",
+                 *([f"--address={netlab.NODE_IP}"] if wan else []),
                  f"--io={variant}", f"--max-peers={max_peers_for(p)}", "--backlog=4096", f"--port={port}",
                  f"--log={pre}.node.log", f"--metrics={pre}.metrics.jsonl"])
     try:
         if not node.ready.wait(args.ready_timeout) or node.ready_err or node.p.poll() is not None:
             raise RuntimeError("node not ready: " + (str(node.ready_err) if node.ready_err
                                else "timeout/exited; " + " | ".join(node.tail)))
-        sg = ["taskset", "-c", args.gen_cpus, args.stressgen, "--target", f"127.0.0.1:{port}",
+        sg = ["taskset", "-c", args.gen_cpus, args.stressgen,
+              "--target", f"{netlab.NODE_IP if wan else '127.0.0.1'}:{port}",
+              *(["--listen-ip", netlab.GEN_IP] if wan else []),
               "--peers", str(p["peers"]), "--rate", str(p["rate"]), "--size", str(p["size"]),
               "--duration", str(p["duration"]), "--warmup", str(p["warmup"]),
               "--idle-peers", str(p["idle_peers"]), "--slow-peers", str(p["slow_peers"]),
               "--churn", str(p["churn"]), "--grace", str(0.5 if args.quick else GRACE),
               "--out", f"{pre}.stress.json"]
+        if wan:
+            sg = netlab.in_gen(sg)
         if is_duplex(variant):
             sg += ["--duplex"]
         if p.get("window"):
             sg += ["--window", str(p["window"])]
-        limit = p["duration"] + p["warmup"] + 60 + (p["peers"] + p["idle_peers"]) * 0.02
+        limit = (p["duration"] + p["warmup"] + 60 + (p["peers"] + p["idle_peers"]) * 0.02
+                 + (S6_EXTRA_TIMEOUT if wan else 0))
         r = subprocess.run(sg, capture_output=True, text=True, timeout=limit)
         (d / f"rep{rep}.stressgen.txt").write_text(r.stdout + r.stderr)
         if r.returncode != 0:
@@ -250,11 +291,15 @@ def fake_cell(args, sc, x, variant, rep, port, d):
     mps = min(offered, cap) * noise() * (1 - 0.02 * p["slow_peers"]) * (1 - 0.003 * p["churn"])
     rtt50 = (rtt0 + rttk * (n + p["idle_peers"] * 0.1)) * noise(0.1) * (1 + p["size"] / 40000)
     dur = p["duration"]
+    rtt_net = p["rtt_ms"] * 1000 if sc == "S6a" else 4000 if sc == "S6b" else 0
+    hs = (rtt_net * (2 if is_duplex(variant) else 3) + 300) * noise(0.05)
     st = dict(sent=int(mps * dur), received=int(mps * dur),
               lost=int(rnd.random() < 0.1) * rnd.randint(1, 20), msgs_per_s=round(mps, 1),
               rtt_us=dict(p50=rtt50, p90=rtt50 * 2, p99=rtt50 * 6 * noise(0.2),
                           p999=rtt50 * 30 * noise(0.3), max=rtt50 * 90, mean=rtt50 * 1.3,
                           samples=int(mps * dur)),
+              handshake_us=dict(p50=hs, p90=hs * 1.3, p99=hs * 2, max=hs * 3, mean=hs, samples=n + int(p["churn"] * dur)),
+              send_skipped=0, connect_failures=0, churn_events=int(p["churn"] * dur),
               config=dict(p, target=f"127.0.0.1:{port}"), start_unix_ns=0, end_unix_ns=int(dur * 1e9))
     (d / f"rep{rep}.stress.json").write_text(json.dumps(st))
     live = n + p["idle_peers"] + p["slow_peers"]
@@ -282,7 +327,9 @@ def fake_cell(args, sc, x, variant, rep, port, d):
             sender_q_hwm=int(rnd.random() * 50), utime_us=int(ut), stime_us=int(stt),
             nvcsw=vcsw, nivcsw=ivcsw, maxrss_kb=20000 + int(live * (60 if thr else 8)) + i * 10,
             threads=int(8 + live * thr + (4 if variant != "threads" else 0) + (1 if variant.endswith("-split") else 0)),
-            fds=live * (1 if is_duplex(variant) else 2) + 10))
+            fds=live * (1 if is_duplex(variant) else 2) + 10,
+            tx_queued_sends=int(fin * 0.3) if sc == "S6b" and base_variant(variant) in ("poll", "epoll") and is_duplex(variant) else 0,
+            tx_flushes=int(fin * 0.2) if sc == "S6b" and is_duplex(variant) else 0))
     (d / f"rep{rep}.metrics.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     (d / f"rep{rep}.node.log").write_text("fake\n")
     (d / f"rep{rep}.meta.json").write_text(json.dumps(dict(
@@ -291,7 +338,33 @@ def fake_cell(args, sc, x, variant, rep, port, d):
     return "ok"
 
 
-def main():
+def run_with_wan(args, scs, wan_scs, variants, reps):
+    """S1-S5 here, in this process; the S6 scenarios in a re-executed child under
+    `unshare -rnm` (own network + mount namespace, uid mapped to root, gone on exit)."""
+    rc = 0
+    rest = [sc for sc in scs if sc not in wan_scs]
+    if rest:
+        rc = main_args(args, rest)
+    cmd = ["unshare", "-rnm", "--propagation", "private", sys.executable, os.path.abspath(__file__),
+           "--app", args.app, "--stressgen", args.stressgen, "--out", args.out,
+           "--variants", ",".join(variants), "--scenarios", ",".join(wan_scs), "--reps", str(reps),
+           "--node-cpus", args.node_cpus, "--gen-cpus", args.gen_cpus, "--base-port", str(args.base_port),
+           "--ready-timeout", str(args.ready_timeout), "--quit-timeout", str(args.quit_timeout),
+           "--seed", str(args.seed), "--_in_ns", "--_source", json.dumps(args.source)]
+    if args.quick:
+        cmd.append("--quick")
+    print("S6 cells: re-executing under unshare -rnm", flush=True)
+    return max(rc, subprocess.run(cmd).returncode)
+
+
+def main_args(args, scs):
+    """Runs `scs` (already validated) in this process."""
+    sub = argparse.Namespace(**vars(args))
+    sub.scenarios = ",".join(scs)
+    return main(sub)
+
+
+def main(parsed=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--app", default="build/app")
@@ -310,7 +383,9 @@ def main():
     ap.add_argument("--fake", action="store_true", help="synthetic results, no binaries")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--dry-run", action="store_true")
-    args = ap.parse_args()
+    ap.add_argument("--_in_ns", action="store_true", help=argparse.SUPPRESS)   # set by the unshare re-exec
+    ap.add_argument("--_source", default=None, help=argparse.SUPPRESS)
+    args = parsed or ap.parse_args()
     reps = args.reps or (1 if args.quick else 5)
     variants = [v for v in args.variants.split(",") if v]
     scs = [s for s in args.scenarios.split(",") if s]
@@ -329,10 +404,21 @@ def main():
             resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
         except (ValueError, OSError) as e:
             print(f"warning: cannot raise RLIMIT_NOFILE ({e}); soft={soft}", file=sys.stderr)
-    args.source = source_stamp()
-    if args.source["dirty"] and not args.dry_run:
+    # Git is run once in the parent; the unshare child receives the stamp (no git inside the namespace).
+    args.source = json.loads(args._source) if args._source else source_stamp()
+    if args.source["dirty"] and not args.dry_run and not args._in_ns:
         print(f"warning: uncommitted changes in {', '.join(args.source['dirty_files'])}; "
               f"cells will record commit {args.source['commit']} as dirty", file=sys.stderr)
+    wan_scs = [sc for sc in scs if "net" in SCENARIOS[sc]]
+    if wan_scs and not args.fake and not args.dry_run:
+        if args._in_ns:
+            global LAB
+            LAB = netlab.NetLab()
+            LAB.setup()
+            print(f"netlab: {netlab.NS}, {netlab.NODE_DEV} {netlab.NODE_IP} <-> {netlab.GEN_DEV} {netlab.GEN_IP}"
+                  + (f" (warnings: {LAB.warnings})" if LAB.warnings else ""), flush=True)
+        else:
+            return run_with_wan(args, scs, wan_scs, variants, reps)
     rnd = random.Random(args.seed if args.fake else None)
     # Shuffle variant order within each (scenario, param, rep) to spread drift.
     cells = []

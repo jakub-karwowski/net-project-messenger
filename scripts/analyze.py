@@ -35,9 +35,22 @@ METRICS = [
     ("fds", "Peak fds", "fds", False),
     ("bp_drops", "Backpressure drops", "msgs", False),
     ("evictions", "Evictions", "conns", False),
+    ("handshake_p50", "Handshake p50 (connect to Ready)", "us", True),
+    ("handshake_p99", "Handshake p99 (connect to Ready)", "us", True),
+    ("connect_failures", "Connect failures", "conns", False),
+    ("churn_events", "Churn reconnects", "events", False),
+    ("send_skipped", "Generator send drops", "msgs", False),
+    ("tx_queued_sends", "Sends that queued bytes", "sends", True),
+    ("tx_flushes", "Flushes on writability", "flushes", True),
+    ("accepts", "Accepts", "conns", False),
 ]
 CHART_KEYS = ["msgs_per_s", "rtt_p50", "rtt_p99", "rtt_p999", "cpu_pct", "nvcsw_rate",
               "maxrss_kb", "threads", "fds"]
+# Per-scenario chart lists override CHART_KEYS (S6 looks at different things).
+SCENARIO_CHARTS = {
+    "S6a": ["handshake_p50", "handshake_p99", "msgs_per_s", "rtt_p99"],
+    "S6b": ["msgs_per_s", "rtt_p50", "rtt_p99", "rtt_p999", "tx_queued_sends", "cpu_pct", "nvcsw_rate"],
+}
 
 
 # --- Stats helpers ----------------------------------------------------------
@@ -94,6 +107,10 @@ def cell_metrics(cell_dir, rep, meta):
     st = json.loads(sp.read_text())
     out = dict(msgs_per_s=st["msgs_per_s"], lost=st["lost"], rtt_p50=st["rtt_us"]["p50"],
                rtt_p99=st["rtt_us"]["p99"], rtt_p999=st["rtt_us"]["p999"])
+    hs = st.get("handshake_us")   # absent in results from before S6
+    out.update(handshake_p50=hs["p50"] if hs else None, handshake_p99=hs["p99"] if hs else None,
+               connect_failures=st.get("connect_failures"), churn_events=st.get("churn_events"),
+               send_skipped=st.get("send_skipped"))
     if not mp.exists():
         raise ValueError("missing metrics.jsonl")
     rows = read_jsonl(mp)
@@ -113,6 +130,9 @@ def cell_metrics(cell_dir, rep, meta):
     out["fds"] = max(r.get("fds", 0) for r in rows)
     out["bp_drops"] = rows[-1].get("send_backpressure_drops", 0)
     out["evictions"] = rows[-1].get("evictions", 0)
+    out["tx_queued_sends"] = rows[-1].get("tx_queued_sends")   # absent before S6
+    out["tx_flushes"] = rows[-1].get("tx_flushes")
+    out["accepts"] = rows[-1].get("accepts")
     return out
 
 
@@ -359,11 +379,11 @@ def write_html(path, agg, problems, root, titles):
         xs = sorted({k[2] for k in keys})
         variants = [v for v in VARIANTS if any(k[3] == v for k in keys)]
         o.append(f"<h2>{sc}: {html.escape(titles.get(sc, ''))}</h2><div class=grid3>")
-        for mk in CHART_KEYS:
+        for mk in SCENARIO_CHARTS.get(sc, CHART_KEYS):
             _, label, unit, lg = next(m for m in METRICS if m[0] == mk)
             series = {v: [agg[(sc, xn, x, v)][mk] if (sc, xn, x, v) in agg else None for x in xs] for v in variants}
             o.append(f"<div class=card>{chart(label, unit, xn, xs, series, lg)}</div>")
-        for mk in ("lost", "bp_drops", "evictions"):   # only interesting when nonzero
+        for mk in ("lost", "bp_drops", "evictions", "connect_failures", "send_skipped"):   # only interesting when nonzero
             if any((agg[k][mk][0] or 0) > 0 for k in keys):
                 _, label, unit, lg = next(m for m in METRICS if m[0] == mk)
                 series = {v: [agg[(sc, xn, x, v)][mk] if (sc, xn, x, v) in agg else None for x in xs] for v in variants}
