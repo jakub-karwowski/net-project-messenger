@@ -82,7 +82,7 @@ using Outbound = p2p::PoolOutbound<TcpConnectionPool>;
 // ---------------------------------------------------------------------------
 
 void test_open_send_and_peer_close() {
-    constexpr unsigned kPort = 9971;
+    constexpr unsigned kPort = 9961;
     TcpListener listener("127.0.0.1", kPort, 1);
     Outbound outbound;
 
@@ -108,11 +108,14 @@ void test_open_send_and_peer_close() {
     }
     check(not_found, "close: peer close surfaces as ConnectionNotFound");
     outbound.close(*handle); // idempotent on a dead handle
-    check(!outbound.open("127.0.0.1", 9972, hello).has_value(), "close: dial to a closed port fails");
+    // Claim a port no other test uses and release it, so the dial is reliably refused.
+    constexpr unsigned kClosedPort = 9962;
+    { TcpListener probe("127.0.0.1", kClosedPort, 1); }
+    check(!outbound.open("127.0.0.1", kClosedPort, hello).has_value(), "close: dial to a closed port fails");
 }
 
 void test_backpressure_on_non_reading_peer() {
-    constexpr unsigned kPort = 9973;
+    constexpr unsigned kPort = 9963;
     TcpListener listener("127.0.0.1", kPort, 1);
     p2p::PoolOutboundOptions options;
     options.max_tx_buffer_bytes = 64 * 1024;
@@ -138,7 +141,7 @@ void test_backpressure_on_non_reading_peer() {
 }
 
 void test_sender_delivers_over_pool() {
-    constexpr unsigned kPort = 9974;
+    constexpr unsigned kPort = 9964;
     constexpr uint64_t kPeerId = 7;
     TcpListener listener("127.0.0.1", kPort, 1);
     ThreadQueue<Event> store_queue, sender_queue;
@@ -176,7 +179,7 @@ void test_sender_delivers_over_pool() {
 }
 
 void test_sender_drops_on_backpressure() {
-    constexpr unsigned kPort = 9975;
+    constexpr unsigned kPort = 9965;
     constexpr uint64_t kPeerId = 9;
     TcpListener listener("127.0.0.1", kPort, 1);
     ThreadQueue<Event> store_queue, sender_queue;

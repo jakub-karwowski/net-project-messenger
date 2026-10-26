@@ -643,6 +643,8 @@ std::optional<OutboundTransport::Handle> SenderWorker::open(uint64_t peer_id,
                                                             const std::string& ip,
                                                             uint16_t port,
                                                             const wire::Message& hello) {
+    // Quitting: a dial (and the handshake it starts) can no longer be useful.
+    if (shutting_down_.load(std::memory_order_relaxed)) { return std::nullopt; }
     const auto frame = wire::encode(hello);
     if (!frame) { return std::nullopt; }
     auto handle = transport_->open(ip, port, *frame);
@@ -810,6 +812,14 @@ void SenderWorker::operator()() {
         // fresh rather than writing into a dead one. The reconnect is silent -- the
         // message is simply delivered on the new connection.
         const bool reconnecting = peer->status == PeerTable::Status::Disconnected;
+        // Quitting: only a live write connection is worth one more try. A peer that
+        // would need a (re)dial is dropped here, before any encoding, so even a large
+        // backlog for departed peers drains in moments.
+        const bool stopping = shutting_down_.load(std::memory_order_relaxed);
+        if (stopping && (reconnecting || !peers_.tx_of(message->peer_id))) {
+            shutdown_drops_.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         if (reconnecting && drop_connection(message->peer_id)) {
             logger_.info("reconnect: dropped stale connection to peer#"
                          + std::to_string(message->peer_id));
@@ -822,7 +832,8 @@ void SenderWorker::operator()() {
 
         bool delivered = false;
         bool dropped = false;
-        for (unsigned attempt = 0; frame && attempt < send_attempts_; ++attempt) {
+        const unsigned attempts = stopping ? 1 : send_attempts_; // quitting: no retries
+        for (unsigned attempt = 0; frame && attempt < attempts; ++attempt) {
             // Port 0 is "no dialable address" (a duplex-only peer that advertises
             // none): a redial cannot succeed, so do not sleep through the retries.
             if (!peers_.tx_of(message->peer_id) && peer->address.port == 0) { break; }
@@ -849,7 +860,7 @@ void SenderWorker::operator()() {
             // attempt starts from a fresh connection.
             bump(metrics_, &Metrics::send_failures);
             drop_connection(message->peer_id);
-            if (attempt + 1 < send_attempts_) {
+            if (attempt + 1 < attempts) {
                 std::this_thread::sleep_for(retry_delay_);
             }
         }
@@ -861,9 +872,15 @@ void SenderWorker::operator()() {
                          + " dropped");
             (void)store_queue_.emplace(EventError{
                 "backpressure: message to peer#" + std::to_string(message->peer_id) + " dropped"});
+        } else if (!delivered && stopping) {
+            shutdown_drops_.fetch_add(1, std::memory_order_relaxed); // nobody to tell any more
         } else if (!delivered) {
             report_unreachable(message->conversation_id, message->peer_id);
         }
+    }
+    if (const uint64_t dropped = shutdown_drops(); dropped > 0) {
+        logger_.info("sender: dropped " + std::to_string(dropped)
+                     + " undeliverable message(s) while shutting down");
     }
 }
 
@@ -964,6 +981,7 @@ void MainWorker::operator()() {
     if (keyboard) { keyboard->stop(); }
     io.inbound->stop();
     store_queue.graceful_shutdown();
+    sender.begin_shutdown(); // drain without dialling or retrying departed peers
     sender_queue.graceful_shutdown();
     render_queue.graceful_shutdown();
 

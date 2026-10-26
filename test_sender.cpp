@@ -744,7 +744,84 @@ void test_duplex_answers_on_tx_slot() {
     check(transport.closed == std::vector<int>{kOld}, "duplex: superseded handle closed");
 }
 
+// A simplex fake: records calls; every dial is refused, every send succeeds.
+class FakeRefusingTransport final : public OutboundTransport {
+public:
+    std::expected<Handle, SocketError> open(const std::string&, uint16_t,
+                                            std::span<const std::byte>) override {
+        ++opens;
+        return std::unexpected(SocketError::ConnectionRefused);
+    }
+    std::expected<void, SocketError> send(Handle handle, std::span<const std::byte>) override {
+        sent_on.push_back(handle);
+        return {};
+    }
+    void close(Handle) noexcept override {}
+
+    int opens{0};
+    std::vector<Handle> sent_on;
+};
+
+// Quitting with a backlog for departed peers: nothing is dialled, nothing sleeps
+// through retries, nothing is reported; every such message is dropped and counted.
+// (Without begin_shutdown each one costs send_attempts dials and retry sleeps.)
+void test_shutdown_drops_without_dialing() {
+    constexpr int kMessages = 20;
+    ThreadQueue<Event> store_queue;
+    ThreadQueue<Event> sender_queue;
+    p2p::PeerTable peers;
+    peers.insert(41, {"127.0.0.1", 9});   // known address, no write connection
+    peers.insert(42, {"127.0.0.1", 9});
+    peers.mark_disconnected(42);           // the silent-reconnect case
+    FakeRefusingTransport transport;
+    p2p::SenderWorker sender{store_queue, sender_queue, peers, transport};
+
+    for (int i = 0; i < kMessages; ++i) {
+        check(sender_queue.emplace(EventMessage{i % 2 ? 41u : 42u, 1, "late echo"}),
+              "shutdown: message queued");
+    }
+    sender.begin_shutdown();
+    sender_queue.graceful_shutdown();
+    const auto start = std::chrono::steady_clock::now();
+    std::thread worker{std::ref(sender)};
+    worker.join();
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    check(elapsed < std::chrono::milliseconds{100},
+          "shutdown: drained without retry sleeps ("
+              + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count())
+              + " ms)");
+    check(transport.opens == 0, "shutdown: nothing dialled");
+    check(sender.shutdown_drops() == kMessages, "shutdown: every message counted as dropped");
+    check(!store_queue.try_pop(), "shutdown: no unreachable reports");
+}
+
+// Quitting still delivers on a live write connection: one attempt, no dial.
+void test_shutdown_sends_on_live_connection() {
+    constexpr uint64_t kPeerId = 43;
+    constexpr int kHandle = 7;
+    ThreadQueue<Event> store_queue;
+    ThreadQueue<Event> sender_queue;
+    p2p::PeerTable peers;
+    peers.insert(kPeerId, {"127.0.0.1", 9});
+    peers.attach_tx(kPeerId, p2p::ChannelRef{88, kHandle});
+    FakeRefusingTransport transport;
+    p2p::SenderWorker sender{store_queue, sender_queue, peers, transport};
+
+    check(sender_queue.emplace(EventMessage{kPeerId, 1, "last words"}), "shutdown live: queued");
+    sender.begin_shutdown();
+    sender_queue.graceful_shutdown();
+    std::thread worker{std::ref(sender)};
+    worker.join();
+
+    check(transport.sent_on == std::vector<int>{kHandle}, "shutdown live: sent once on the live handle");
+    check(transport.opens == 0, "shutdown live: nothing dialled");
+    check(sender.shutdown_drops() == 0, "shutdown live: nothing dropped");
+}
+
 int main() {
+    test_shutdown_drops_without_dialing();
+    test_shutdown_sends_on_live_connection();
     test_duplex_answers_on_tx_slot();
     test_handshake_re_presents_assigned_id();
     test_disconnect_drops_cached_connection();

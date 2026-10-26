@@ -458,6 +458,16 @@ struct SenderWorker {
     }
     // frames_out, send_failures, send_backpressure_drops, reconnects.
     void set_metrics(Metrics* metrics) noexcept { metrics_ = metrics; }
+    // The application is quitting: from now on nothing is dialled and nothing is
+    // retried. A queued message still goes out once on a live write connection;
+    // one for a peer without one is dropped (and counted) instead of re-dialling
+    // with retry sleeps, so draining a backlog for departed peers cannot stall
+    // shutdown. Call before shutting the sender queue down; any thread.
+    void begin_shutdown() noexcept { shutting_down_.store(true, std::memory_order_relaxed); }
+    // Messages dropped by the shutdown rule above.
+    uint64_t shutdown_drops() const noexcept {
+        return shutdown_drops_.load(std::memory_order_relaxed);
+    }
 private:
     // Returns the cached outbound connection for `peer_id`, creating it from the
     // address in `peers_` on first use and sending a ConnectInfo that names the
@@ -506,6 +516,8 @@ private:
     OutboundTransport* transport_;                             // socket ops only; policy stays here
     Logger logger_;
     std::atomic<uint64_t> send_backpressure_drops_{0};
+    std::atomic<bool> shutting_down_{false};
+    std::atomic<uint64_t> shutdown_drops_{0};
     Metrics* metrics_{nullptr};
 };
 }
