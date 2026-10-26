@@ -17,7 +17,6 @@
 #include <unordered_map>
 #include <vector>
 
-namespace p2p { class PeerThreadIo; }
 
 enum class SocketError {
     AddressInUse,
@@ -123,7 +122,6 @@ class TcpConnection {
         friend class TcpConnectionPool;
         friend class EpollConnectionPool;
         template <class Backend> friend class TxPoller;
-        friend class p2p::PeerThreadIo; // owner thread / sender: raw non-blocking I/O
 
     private:
         std::expected<void, SocketError> apply_options() noexcept;

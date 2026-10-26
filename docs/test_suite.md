@@ -133,7 +133,7 @@ Rules that hold in both shapes:
 | `epoll-duplex` | 1 | one pool, one I/O thread | same pool, same socket | I/O thread | `epoll` |
 | `poll-split` | 1 | rx pool + I/O thread | `TxPoller` + tx thread, same socket | I/O + tx thread | `poll()` ×2 |
 | `epoll-split` | 1 | rx pool + I/O thread | `TxPoller` + tx thread, same socket | I/O + tx thread | `epoll` ×2 |
-| `peer-threads` | 1 | 1 owner thread per peer (`poll()` on socket + eventfd) | sender thread writes directly, else queue + wake the owner | watchdog + 1 per peer | `poll()` per thread |
+| `peer-threads` | 1 | 1 owner thread per peer, driving a one-connection `TcpConnectionPool` | `pool.send()` from the sender thread (immediate, else queued and flushed by the owner) | watchdog + 1 per peer | `poll()` per thread |
 
 ### `threads`: one thread per connection (the original design)
 
@@ -255,27 +255,44 @@ The link logic is the same: a `FrameChannel` with a duplex `ChannelRef` is
 registered before the hello goes out, and the Connect/ConnectAck handshake runs
 on that one socket.
 
-- **Each peer gets one owner thread.** It is the only thread that reads the
-  socket, flushes queued writes, closes the link, and calls `on_closed()`. It
-  runs `poll()` on {socket, an eventfd}: `POLLIN` always, `POLLOUT` only while
-  bytes are queued. The poll timeout is 200 ms, and every iteration bumps the
-  `ReaderActivity` tick, so the unchanged `WatchdogWorker` detects stalls and
-  enforces `--max-peers` (it owns and joins the owner threads).
-- **Writes** from `SenderWorker` go through `PeerThreadIo::send`: an immediate
-  non-blocking `send` under the link's `tx_mutex`; the remainder is queued under
-  the same cap and `WouldBlock` rules as the pools (1 MiB, whole frames only),
-  then the owner is woken through the eventfd. Sender and owner writes are
-  serialized by `tx_mutex`, so frames never interleave.
-- **A closed link is detected synchronously**: `send` sees the link's `closed`
-  flag under `tx_mutex` and answers `ConnectionNotFound`, with no round trip
-  through the store.
-- **`close(handle)`** marks the link closed, shuts the socket down and wakes the
-  owner, which exits and calls `on_closed()` (the slots are released a moment
-  later, from the owner thread, not inside `close()`).
+- **Each link is a one-connection `TcpConnectionPool`** (the `poll()` pool),
+  driven by its own owner thread. The pool supplies everything a duplex link
+  needs:
+  - `poll()` on the socket plus the pool's wake descriptor;
+  - a thread-safe `send()` with the pools' 1 MiB cap and whole-frame
+    `WouldBlock` rule;
+  - flushing on `POLLOUT`;
+  - a single `{id, 0}` report when the connection ends.
+
+  So `PeerThreadIo` only uses public TcpSocket APIs.
+- **The owner thread** loops on `pool.receive()` and feeds the `FrameChannel`.
+  It is the only thread that reads, the only one that calls `on_closed()`, and it
+  closes the pool when it exits. The unchanged `WatchdogWorker` owns and joins
+  the owner threads and enforces `--max-peers`.
+- **The socket is shared** (`shared_ptr<TcpConnection>`) between the pool and
+  the link's `ReaderActivity`. The only reason is that the watchdog shuts a
+  socket down through `ReaderActivity::connection`; the pool then reports the
+  end and the owner exits.
+- **No stall detection.** `pool.receive()` blocks until data arrives or the
+  pool is closed, so an idle owner can't advance the heartbeat. This
+  transport's watchdog therefore runs with stall detection disabled. It isn't
+  needed: the owner only ever blocks in `receive()`, which `close_pool()` and a
+  shutdown always wake. Cap eviction still ranks by `last_read_ns`.
+- **Writes** from `SenderWorker` are `pool.send()`: an immediate non-blocking
+  write, otherwise queued, with the owner's `poll()` woken by the pool.
+  - The pool's write counters reach `Metrics` both after each `send()` and after
+    each `receive()`, as deltas.
+  - A send to a link that has ended answers `ConnectionNotFound` straight away,
+    because the link is gone from the registry; there is no round trip through
+    the store.
+- **`close(handle)`** closes the link's pool. The owner's `receive()` returns,
+  and the owner exits and calls `on_closed()`. The slots are therefore released
+  a moment later, from the owner thread, not inside `close()`.
 - **Shutdown:** `stop()` wakes `accept()` and stops the watchdog, whose drain
   shuts every socket down and joins every owner thread. `stop()` joins nothing;
   the destructor joins the watchdog thread.
-- **Per peer:** 1 thread, 2 fds (socket and eventfd), 1 TCP connection.
+- **Per peer:** 1 thread, 2 fds (the socket and the pool's wake descriptor), 1
+  TCP connection.
 - **Measures:** against `threads`, half the connections and no blocking sender,
   with the same thread-per-peer scheduling ceiling; against `poll-duplex`, the
   cost of a thread per peer instead of a shared poller.
