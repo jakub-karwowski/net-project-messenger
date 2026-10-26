@@ -32,11 +32,12 @@ METRICS = [
     ("nivcsw_rate", "Involuntary ctx switches", "/s", True),
     ("maxrss_kb", "Peak RSS", "kB", False),
     ("threads", "Peak threads", "threads", False),
+    ("fds", "Peak fds", "fds", False),
     ("bp_drops", "Backpressure drops", "msgs", False),
     ("evictions", "Evictions", "conns", False),
 ]
 CHART_KEYS = ["msgs_per_s", "rtt_p50", "rtt_p99", "rtt_p999", "cpu_pct", "nvcsw_rate",
-              "maxrss_kb", "threads"]
+              "maxrss_kb", "threads", "fds"]
 
 
 # --- Stats helpers ----------------------------------------------------------
@@ -109,6 +110,7 @@ def cell_metrics(cell_dir, rep, meta):
         out.update(cpu_pct=None, nvcsw_rate=None, nivcsw_rate=None)
     out["maxrss_kb"] = max(r.get("maxrss_kb", 0) for r in rows)
     out["threads"] = max(r.get("threads", 0) for r in rows)
+    out["fds"] = max(r.get("fds", 0) for r in rows)
     out["bp_drops"] = rows[-1].get("send_backpressure_drops", 0)
     out["evictions"] = rows[-1].get("evictions", 0)
     return out

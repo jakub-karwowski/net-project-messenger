@@ -7,9 +7,13 @@ Output layout:
   <out>/<scenario>/<param>/<variant>/rep<N>.{stress.json,metrics.jsonl,node.log,meta.json}
 Cells whose meta.json has status ok|dirty are skipped on re-run (resume).
 `--fake` writes synthetic results (no binaries) to exercise analyze.py.
+Every meta.json carries a "build" stamp (git commit, uncommitted changes, binary
+hashes) so cells produced by different builds can be told apart.
 """
-import argparse, json, math, os, random, resource, subprocess, sys, threading, time, zlib
+import argparse, hashlib, json, math, os, random, resource, subprocess, sys, threading, time, zlib
 from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
 
 VARIANTS = ["threads", "pool-sender", "poll", "epoll",
             "poll-duplex", "epoll-duplex", "poll-split", "epoll-split"]
@@ -22,6 +26,57 @@ def is_duplex(variant):
 
 def base_variant(variant):
     return variant.split("-")[0] if is_duplex(variant) else variant
+
+
+# --- Build stamp -------------------------------------------------------------
+
+def _git(*argv, strip=True):
+    try:
+        r = subprocess.run(["git", "-C", str(REPO), *argv], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return None
+        return r.stdout.strip() if strip else r.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _sha256(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def source_stamp():
+    """Git state of the tree the run was started from (once per run). `dirty`
+    means tracked files differ from `commit`; their names are listed so a cell
+    built from uncommitted code says so."""
+    # Porcelain lines are "XY <path>": keep the raw output, the leading status
+    # column may be a space.
+    changed = _git("status", "--porcelain", "--untracked-files=no", strip=False)
+    files = [line[3:] for line in changed.splitlines() if line.strip()] if changed else []
+    return dict(commit=_git("rev-parse", "HEAD"), branch=_git("rev-parse", "--abbrev-ref", "HEAD"),
+                dirty=bool(files) if changed is not None else None, dirty_files=files,
+                harness_sha256=_sha256(__file__))
+
+
+def binary_stamp(path):
+    """Identity of one binary at the moment a cell starts (per cell, so a rebuild
+    in the middle of a run shows up as a different hash)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return dict(path=str(path), sha256=None)
+    return dict(path=str(Path(path).resolve()), sha256=_sha256(path), size=st.st_size,
+                mtime=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(st.st_mtime)))
+
+
+def build_stamp(args):
+    return dict(args.source, app=binary_stamp(args.app), stressgen=binary_stamp(args.stressgen))
 
 # --- Scenario table ---------------------------------------------------------
 # x = the swept parameter name (a stressgen option), values = its values,
@@ -103,30 +158,37 @@ class Node:
         self.ready.set()   # EOF: unblock waiters
         self.bye.set()
 
-    def quit(self, timeout=10):
-        """True if the node said bye and exited within the timeout."""
-        clean = True
+    def quit(self, timeout=30):
+        """Sends /quit and waits (one deadline) for "bye" and the process exit.
+        Returns dict(clean, bye, shutdown_s, killed): clean means both happened in
+        time; shutdown_s is /quit -> exit (or -> kill), so a slow drain shows up as
+        a number rather than only as a dirty flag."""
+        t0 = time.monotonic()
+        deadline = t0 + timeout
+        sent = True
         try:
             self.p.stdin.write("/quit\n")
             self.p.stdin.flush()
         except Exception:
-            clean = False
-        if not self.bye.wait(timeout):
-            clean = False
+            sent = False
+        bye = self.bye.wait(max(0.0, deadline - time.monotonic()))
+        killed = False
         try:
-            self.p.wait(timeout=timeout)
+            self.p.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             self.p.kill()
             self.p.wait()
-            clean = False
-        return clean
+            killed = True
+        return dict(clean=sent and bye and not killed, bye=bye,
+                    shutdown_s=round(time.monotonic() - t0, 3), killed=killed)
 
 
 def run_cell(args, sc, x, variant, rep, port, d):
     p = cell_params(sc, x, args.quick)
     pre = d / f"rep{rep}"
     meta = dict(scenario=sc, x_name=SCENARIOS[sc]["x"], x=x, variant=variant, rep=rep,
-                port=port, params=p, status="failed", error=None, t_start=time.time())
+                port=port, params=p, status="failed", error=None, t_start=time.time(),
+                build=build_stamp(args))
     node = Node(["taskset", "-c", args.node_cpus, args.app, "--headless", "--echo",
                  f"--io={variant}", f"--max-peers={max_peers_for(p)}", "--backlog=4096", f"--port={port}",
                  f"--log={pre}.node.log", f"--metrics={pre}.metrics.jsonl"])
@@ -153,11 +215,14 @@ def run_cell(args, sc, x, variant, rep, port, d):
     except Exception as e:
         meta["error"] = f"{type(e).__name__}: {e}"
     finally:
-        if not node.quit():
+        q = node.quit(args.quit_timeout)
+        meta.update(shutdown_s=q["shutdown_s"], bye=q["bye"], killed=q["killed"])
+        if not q["clean"]:
             meta["node_unclean"] = True
             if meta["status"] == "ok":
                 meta["status"] = "dirty"
-                meta["error"] = "node did not exit cleanly after /quit"
+                meta["error"] = (f"node did not exit cleanly after /quit "
+                                 f"(bye={q['bye']}, killed={q['killed']}, {q['shutdown_s']}s)")
         meta["t_end"] = time.time()
         (d / f"rep{rep}.meta.json").write_text(json.dumps(meta, indent=1))
     return meta["status"]
@@ -222,7 +287,7 @@ def fake_cell(args, sc, x, variant, rep, port, d):
     (d / f"rep{rep}.node.log").write_text("fake\n")
     (d / f"rep{rep}.meta.json").write_text(json.dumps(dict(
         scenario=sc, x_name=SCENARIOS[sc]["x"], x=x, variant=variant, rep=rep, port=port,
-        params=p, status="ok", fake=True), indent=1))
+        params=p, status="ok", fake=True, build=dict(args.source)), indent=1))
     return "ok"
 
 
@@ -240,6 +305,8 @@ def main():
     ap.add_argument("--gen-cpus", default="4-7")
     ap.add_argument("--base-port", type=int, default=21000)
     ap.add_argument("--ready-timeout", type=float, default=15)
+    ap.add_argument("--quit-timeout", type=float, default=30,
+                    help="seconds from /quit to exit before a cell is marked dirty")
     ap.add_argument("--fake", action="store_true", help="synthetic results, no binaries")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--dry-run", action="store_true")
@@ -262,6 +329,10 @@ def main():
             resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
         except (ValueError, OSError) as e:
             print(f"warning: cannot raise RLIMIT_NOFILE ({e}); soft={soft}", file=sys.stderr)
+    args.source = source_stamp()
+    if args.source["dirty"] and not args.dry_run:
+        print(f"warning: uncommitted changes in {', '.join(args.source['dirty_files'])}; "
+              f"cells will record commit {args.source['commit']} as dirty", file=sys.stderr)
     rnd = random.Random(args.seed if args.fake else None)
     # Shuffle variant order within each (scenario, param, rep) to spread drift.
     cells = []
