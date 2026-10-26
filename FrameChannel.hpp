@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <span>
 
 namespace p2p {
@@ -19,15 +20,28 @@ struct PeerTable;
 // PeerTable (and, for a duplex channel, its tx slot too) and forwards messages
 // to the store. It is transport-agnostic: whoever owns the socket feeds it bytes
 // and reports close.
+//
+// Threads: on_bytes() runs on one I/O thread. on_closed() may run on another (a
+// duplex transport's close() is called by the sender) while on_bytes() is still
+// inside a handshake frame. The bind (setting the peer id and attaching slots,
+// plus the event it emits) and on_closed() therefore run under `state_mutex_`,
+// and on_closed() sets `closing_`: a bind that comes after it attaches nothing,
+// so a closed channel can never be left in a slot nobody will release. Chat
+// frames take no lock: the peer id is written only by the I/O thread itself.
 class FrameChannel {
-    // Movable atomic (FrameChannel is moved into ReaderWorker; moves are never concurrent).
-    struct AtomicId {
-        std::atomic<uint64_t> value{0};
-        AtomicId() = default;
-        AtomicId(AtomicId&& other) noexcept : value(other.value.load()) {}
-        AtomicId& operator=(AtomicId&& other) noexcept { value.store(other.value.load()); return *this; }
-        AtomicId& operator=(uint64_t v) noexcept { value.store(v); return *this; }
-        operator uint64_t() const noexcept { return value.load(); }
+    // Movable wrappers (FrameChannel is moved into ReaderWorker before its thread
+    // starts; moves are never concurrent with use).
+    struct MovableMutex {
+        std::mutex value;
+        MovableMutex() = default;
+        MovableMutex(MovableMutex&&) noexcept {}
+        MovableMutex& operator=(MovableMutex&&) noexcept { return *this; }
+    };
+    struct MovableFlag {
+        std::atomic<bool> value{false};
+        MovableFlag() = default;
+        MovableFlag(MovableFlag&& other) noexcept : value(other.value.load()) {}
+        MovableFlag& operator=(MovableFlag&& other) noexcept { value.store(other.value.load()); return *this; }
     };
 
 public:
@@ -44,7 +58,9 @@ public:
     bool on_bytes(std::span<const std::byte> bytes);
     // The connection is gone: releases its slot(s) of the peer and, unless a newer
     // connection superseded this one, tells the store the peer disconnected.
+    // Idempotent; after it, on_bytes() binds nothing and returns false.
     void on_closed();
+    bool closing() const noexcept { return closing_.value.load(); }
 
 private:
     void remember_assigned_id(uint64_t peer_id, uint64_t assigned_id);
@@ -54,9 +70,11 @@ private:
     Logger logger_;
     Metrics* metrics_{nullptr};
     wire::Decoder decoder_;
-    // Atomic: close() on the sender thread may call on_closed() while the I/O thread
-    // is inside on_bytes().
-    AtomicId peer_id_; // our name for the peer: minted on handshake, or the id it re-presents
+    // Our name for the peer: minted on handshake, or the id it re-presents. Written
+    // by the I/O thread under state_mutex_; read by on_closed() under it.
+    uint64_t peer_id_{0};
+    MovableMutex state_mutex_;
+    MovableFlag closing_; // set once by on_closed()
     // This stream's slot identity (unique connection_id). A channel that a newer
     // one superseded must not report the (still live) peer as gone on close.
     ChannelRef ref_;

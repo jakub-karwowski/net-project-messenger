@@ -14,6 +14,7 @@
 #include "Wire.hpp"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <iostream>
@@ -22,6 +23,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -169,6 +171,90 @@ void test_peer_table_slots() {
     check(live && live->connection_id == 32, "slots: superseded release leaves the new tx");
     auto ds = duplex.lookup(2);
     check(ds && ds->status == p2p::PeerTable::Status::Connected, "slots: superseded release keeps peer connected");
+}
+
+std::vector<std::byte> frame_of(const wire::Message& message) {
+    auto bytes = wire::encode(message);
+    return bytes ? std::move(*bytes) : std::vector<std::byte>{};
+}
+
+// A duplex channel closed (by the sender's close()) before its handshake frame is
+// processed must not bind afterwards: no slot may be left pointing at it.
+void test_channel_closed_before_bind() {
+    using p2p::ChannelRef;
+    using p2p::PeerTable;
+    // Dialer side: we named the peer 7 and attached our dialed handle as tx.
+    {
+        ThreadQueue<Event> store;
+        PeerTable peers;
+        peers.insert(7, {"127.0.0.1", 5100});
+        p2p::FrameChannel channel{store, peers, {}, ChannelRef{40, 3}, true};
+        peers.attach_tx(7, {41, 3}); // the sender's open()
+        peers.clear_tx(7);           // the sender's drop_connection() ...
+        channel.on_closed();         // ... then close(): peer id still unknown
+        check(channel.closing(), "closed-first: channel is closing");
+        
+        const auto ack = frame_of(wire::make_connect_ack(99, 7));
+        check(!channel.on_bytes(ack), "closed-first: a late Ack is refused");
+        check(peers.tx_of(7) == std::nullopt, "closed-first: late Ack attaches no tx");
+        check(!peers.release(7, 40), "closed-first: late Ack attached no rx");
+        check(!store.try_pop(), "closed-first: no events");
+    }
+    // Acceptor side: a late Connect must neither bind nor announce the peer.
+    {
+        ThreadQueue<Event> store;
+        PeerTable peers;
+        p2p::FrameChannel channel{store, peers, {}, ChannelRef{50, 4}, true};
+        channel.on_closed();
+        const auto connect = frame_of(wire::make_connect(8, 0, {}));
+        check(!channel.on_bytes(connect), "closed-first: a late Connect is refused");
+        check(!store.try_pop(), "closed-first: no EventPeerConnected after close");
+    }
+    // Bound first, then closed twice: slots released, one disconnect.
+    {
+        ThreadQueue<Event> store;
+        PeerTable peers;
+        peers.insert(9, {"127.0.0.1", 5101});
+        p2p::FrameChannel channel{store, peers, {}, ChannelRef{60, 5}, true};
+        check(channel.on_bytes(frame_of(wire::make_connect_ack(98, 9))), "bound: Ack accepted");
+        check(peers.tx_of(9).has_value(), "bound: Ack attached tx");
+        channel.on_closed();
+        channel.on_closed();
+        check(peers.tx_of(9) == std::nullopt, "bound: close released tx");
+        int disconnects = 0;
+        while (auto event = store.try_pop()) {
+            if (std::holds_alternative<EventPeerDisconnected>(*event)) { ++disconnects; }
+        }
+        check(disconnects == 1, "bound: exactly one disconnect for a double close");
+    }
+}
+
+// Close racing the handshake bind from another thread: whatever the interleaving,
+// the peer ends with no slot naming the closed channel and at most one disconnect.
+void test_channel_close_races_bind() {
+    using p2p::ChannelRef;
+    using p2p::PeerTable;
+    const auto ack = frame_of(wire::make_connect_ack(97, 11));
+    int leaked = 0;
+    for (int round = 0; round < 2000; ++round) {
+        ThreadQueue<Event> store;
+        PeerTable peers;
+        peers.insert(11, {"127.0.0.1", 5102});
+        const uint64_t id = 1000 + static_cast<uint64_t>(round);
+        p2p::FrameChannel channel{store, peers, {}, ChannelRef{id, 6}, true};
+        std::atomic<bool> go{false};
+        std::thread closer{[&] {
+            while (!go.load()) {}
+            channel.on_closed();
+        }};
+        go.store(true);
+        (void)channel.on_bytes(ack);
+        closer.join();
+        const auto tx = peers.tx_of(11);
+        if ((tx && tx->connection_id == id) || peers.release(11, id)) { ++leaked; }
+    }
+    check(leaked == 0, "race: no slot survives a close racing the bind ("
+                           + std::to_string(leaked) + " leaked)");
 }
 
 // A reader whose tick never advances must be unstuck by the watchdog.
@@ -758,6 +844,8 @@ int main() {
     test_peer_table();
     test_peer_table_connection_owner();
     test_peer_table_slots();
+    test_channel_closed_before_bind();
+    test_channel_close_races_bind();
     test_watchdog_stops_stalled_reader();
     test_watchdog_prunes_oldest_reader();
     test_listener_roundtrip();

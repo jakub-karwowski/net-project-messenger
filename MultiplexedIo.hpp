@@ -27,7 +27,8 @@
 // bytes for an id whose entry is not there yet. In Dual mode an outbound id has a null
 // channel; in Duplex/Split every entry has one. Channels are driven by the I/O thread
 // only, except that close() (sender thread) calls on_closed() in Duplex/Split mode;
-// FrameChannel::on_closed is safe for that (atomic peer id, idempotent release).
+// FrameChannel serializes that with its handshake bind and marks itself closing,
+// so a bind racing the close attaches nothing (see FrameChannel.hpp).
 
 #include "Logger.hpp"
 #include "OutboundTransport.hpp"

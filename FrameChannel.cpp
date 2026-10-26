@@ -55,6 +55,10 @@ bool FrameChannel::on_bytes(std::span<const std::byte> bytes) {
             // its old conversation. Otherwise we name the peer ourselves. Either
             // way, remember its endpoints and ask the sender to open our own
             // write channel and acknowledge (echoing the peer's name for us).
+            // The event is emitted under the lock too, so a concurrent close's
+            // EventPeerDisconnected can only follow it.
+            std::lock_guard lock(state_mutex_.value);
+            if (closing()) { return false; } // closed meanwhile: bind nothing
             const uint64_t returning = connect->assigned_peer_id;
             const bool adopted = returning != 0 && peers_.lookup(returning).has_value();
             if (adopted) {
@@ -88,6 +92,8 @@ bool FrameChannel::on_bytes(std::span<const std::byte> bytes) {
             // The peer answered our ConnectInfo: `ack_peer_id` is the name we
             // gave the peer, so it is how we refer to the peer from now on; its
             // `peer_id` is the name it gave us, kept to re-present later.
+            std::lock_guard lock(state_mutex_.value);
+            if (closing()) { return false; } // closed meanwhile: bind nothing
             peer_id_ = ack->ack_peer_id;
             logger_.info("handshake complete: peer#" + std::to_string(peer_id_));
             (void)peers_.attach_rx(peer_id_, ref_);
@@ -101,6 +107,7 @@ bool FrameChannel::on_bytes(std::span<const std::byte> bytes) {
             // conversation_id is meaningless here: route by the peer identity
             // learned from ConnectInfo. A message that arrives before any
             // identity cannot be attributed to a peer, so it is dropped.
+            if (closing()) { return false; }
             if (peer_id_ == 0) {
                 logger_.warn("dropped message before peer identity");
                 continue;
@@ -113,6 +120,11 @@ bool FrameChannel::on_bytes(std::span<const std::byte> bytes) {
 }
 
 void FrameChannel::on_closed() {
+    // Serialized with the bind in on_bytes(): either the bind already attached the
+    // slots (and they are released here) or it runs later, sees `closing_` and
+    // attaches nothing.
+    std::lock_guard lock(state_mutex_.value);
+    if (closing_.value.exchange(true)) { return; } // already closed
     if (peer_id_ != 0 && peers_.release(peer_id_, ref_.connection_id)) {
         // Keep the peer in the table so its address stays usable for a later
         // reconnect; only the status records that it is gone. The store worker
