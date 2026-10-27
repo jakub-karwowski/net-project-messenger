@@ -12,10 +12,12 @@
 #include "PeerThreadIo.hpp"
 #include "ThreadWorkers.hpp"
 #include "TcpSocket.hpp"
+#include "TestPorts.hpp"
 #include "Wire.hpp"
 
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <cstddef>
 #include <iostream>
 #include <memory>
@@ -41,10 +43,7 @@ void check(bool condition, const std::string& what) {
     }
 }
 
-unsigned random_port() {
-    static std::mt19937 rng{std::random_device{}()};
-    return 12000 + rng() % 15000; // below the ephemeral range
-}
+unsigned random_port() { return test_ports::random_port(); }
 
 bool send_all(TcpConnection& conn, const std::vector<std::byte>& data) {
     std::size_t sent = 0;
@@ -56,7 +55,7 @@ bool send_all(TcpConnection& conn, const std::vector<std::byte>& data) {
     return true;
 }
 
-std::optional<TcpConnection> dial(unsigned port, int attempts = 200) {
+std::optional<TcpConnection> dial(unsigned port, int attempts = 1000) {
     for (int i = 0; i < attempts; ++i) {
         auto conn = TcpConnection::connect("127.0.0.1", port);
         if (conn) { return std::move(*conn); }
@@ -70,7 +69,11 @@ std::vector<std::byte> hello_bytes(uint64_t name, unsigned port) {
         name, 0, std::vector<wire::Endpoint>{{"127.0.0.1", static_cast<uint16_t>(port)}}));
 }
 
-std::optional<Event> pop_for(ThreadQueue<Event>& queue, std::chrono::milliseconds timeout = 3s) {
+// Positive waits use a generous deadline (they return as soon as the event is
+// there); only "nothing else arrives" checks pass a short one.
+constexpr auto kEventWait = 10s;
+
+std::optional<Event> pop_for(ThreadQueue<Event>& queue, std::chrono::milliseconds timeout = kEventWait) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
         if (auto event = queue.try_pop()) { return event; }
@@ -80,7 +83,7 @@ std::optional<Event> pop_for(ThreadQueue<Event>& queue, std::chrono::millisecond
 }
 
 template <class T>
-std::optional<T> pop_as(ThreadQueue<Event>& queue, std::chrono::milliseconds timeout = 3s) {
+std::optional<T> pop_as(ThreadQueue<Event>& queue, std::chrono::milliseconds timeout = kEventWait) {
     auto event = pop_for(queue, timeout);
     if (!event) { return std::nullopt; }
     if (auto* typed = std::get_if<T>(&*event)) { return std::move(*typed); }
@@ -88,7 +91,7 @@ std::optional<T> pop_as(ThreadQueue<Event>& queue, std::chrono::milliseconds tim
 }
 
 template <class Pred>
-bool wait_until(Pred pred, std::chrono::milliseconds timeout = 5s) {
+bool wait_until(Pred pred, std::chrono::milliseconds timeout = kEventWait) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
         if (pred()) { return true; }
@@ -109,15 +112,24 @@ struct Node {
     p2p::Metrics metrics;
     ThreadQueue<Event> store_queue;
     p2p::PeerTable peers;
-    unsigned port;
+    unsigned port{0};
     std::unique_ptr<p2p::PeerThreadIo> io;
     std::thread listener;
 
-    explicit Node(std::size_t max_peers = 128)
-        : port(random_port()),
-          io(std::make_unique<p2p::PeerThreadIo>(make_net(port, max_peers, &metrics), store_queue,
-                                                 peers, Logger{})) {
-        listener = std::thread{[this] { io->run(); }};
+    // Listening before the constructor returns. A random port another process
+    // holds (ctest -j8) makes the bind fail: that node is discarded and the port
+    // redrawn, instead of the test dialling someone else's listener.
+    explicit Node(std::size_t max_peers = 128) {
+        for (int attempt = 0; attempt < 20; ++attempt) {
+            port = random_port();
+            io = std::make_unique<p2p::PeerThreadIo>(make_net(port, max_peers, &metrics),
+                                                     store_queue, peers, Logger{});
+            if (test_ports::start_listening(*io, listener) || attempt == 19) { return; }
+            io->stop();
+            listener.join();
+            io.reset();
+            while (store_queue.try_pop()) {} // the failed bind's EventError
+        }
     }
     ~Node() {
         io->stop();
@@ -154,6 +166,7 @@ struct FullNode {
     StoreWorker store;
     p2p::SenderWorker sender;
     std::thread store_t, sender_t, listener_t;
+    bool listening{false}; // the listen socket is bound (see make_full_node)
 
     FullNode(unsigned port_)
         : port(port_),
@@ -163,7 +176,7 @@ struct FullNode {
                  LocalEndpoints{{wire::Endpoint{"127.0.0.1", static_cast<uint16_t>(port_)}}}) {
         store_t = std::thread{[this] { store(); }};
         sender_t = std::thread{[this] { sender(); }};
-        listener_t = std::thread{[this] { io.inbound->run(); }};
+        listening = test_ports::start_listening(*io.inbound, listener_t);
     }
     ~FullNode() {
         io.inbound->stop();
@@ -176,21 +189,29 @@ struct FullNode {
     }
 };
 
+// A FullNode that is listening: a random port another process holds is redrawn.
+std::unique_ptr<FullNode> make_full_node() {
+    for (int attempt = 0;; ++attempt) {
+        auto node = std::make_unique<FullNode>(random_port());
+        if (node->listening || attempt == 19) { return node; }
+    }
+}
+
 void test_two_nodes() {
     const std::string tag = "peer-threads e2e:";
-    const unsigned port_a = random_port();
-    unsigned port_b = random_port();
-    if (port_b == port_a) { ++port_b; }
-    FullNode a{port_a};
-    FullNode b{port_b};
-    std::this_thread::sleep_for(100ms);
+    auto node_a = make_full_node();
+    auto node_b = make_full_node();
+    FullNode& a = *node_a;
+    FullNode& b = *node_b;
+    const unsigned port_b = b.port;
+    check(a.listening && b.listening, tag + " both listening");
 
     check(a.store_queue.emplace(EventDialPeer{"127.0.0.1", static_cast<uint16_t>(port_b), 0}),
           tag + " dial queued");
 
     uint64_t conv_a = 0;
     for (int i = 0; i < 100 && conv_a == 0; ++i) {
-        auto event = pop_for(a.render_queue, 3s);
+        auto event = pop_for(a.render_queue);
         if (!event) { break; }
         if (auto* dialed = std::get_if<EventPeerDialed>(&*event)) { conv_a = dialed->conversation_id; }
     }
@@ -198,7 +219,7 @@ void test_two_nodes() {
 
     uint64_t conv_b = 0;
     for (int i = 0; i < 100 && conv_b == 0; ++i) {
-        auto event = pop_for(b.render_queue, 3s);
+        auto event = pop_for(b.render_queue);
         if (!event) { break; }
         if (auto* connected = std::get_if<EventPeerDialed>(&*event)) { conv_b = connected->conversation_id; }
         else if (auto* notice = std::get_if<EventConversationNotification>(&*event)) { conv_b = notice->conversation_id; }
@@ -206,7 +227,7 @@ void test_two_nodes() {
     if (conv_b == 0) {
         (void)b.store_queue.emplace(EventListConversations{});
         for (int i = 0; i < 100 && conv_b == 0; ++i) {
-            auto event = pop_for(b.render_queue, 3s);
+            auto event = pop_for(b.render_queue);
             if (!event) { break; }
             if (auto* list = std::get_if<EventConversationList>(&*event);
                 list && !list->conversations.empty()) {
@@ -222,7 +243,7 @@ void test_two_nodes() {
 
     auto wait_text = [&](FullNode& node, const std::string& text) {
         for (int i = 0; i < 200; ++i) {
-            auto event = pop_for(node.render_queue, 3s);
+            auto event = pop_for(node.render_queue);
             if (!event) { return false; }
             if (auto* delta = std::get_if<EventConversationDelta>(&*event)) {
                 for (const auto& m : delta->messages) { if (m.payload == text) { return true; } }
@@ -252,8 +273,8 @@ void test_two_nodes() {
 
 void test_order() {
     const std::string tag = "peer-threads order:";
-    const unsigned port = random_port();
-    TcpListener server("127.0.0.1", port, 4);
+    unsigned port = 0;
+    TcpListener server = test_ports::listen_on_random_port(port, 4); // redraws if taken
     Node node;
     const auto hello = hello_bytes(9, node.port);
     auto handle = node.io->open("127.0.0.1", port, hello);
@@ -262,7 +283,7 @@ void test_order() {
     auto peer = server.accept_client();
     check(peer.has_value(), tag + " accepted");
     if (!peer) { return; }
-    peer->with_receive_timeout(5s);
+    peer->with_receive_timeout(kEventWait);
 
     constexpr std::size_t kChunk = 64 * 1024, kChunks = 128; // 8 MiB
     auto expected_byte = [](std::size_t chunk, std::size_t i) {
@@ -306,8 +327,8 @@ void test_order() {
 
 void test_backpressure() {
     const std::string tag = "peer-threads backpressure:";
-    const unsigned port = random_port();
-    TcpListener server("127.0.0.1", port, 4);
+    unsigned port = 0;
+    TcpListener server = test_ports::listen_on_random_port(port, 4); // redraws if taken
     Node node;
     const auto hello = hello_bytes(9, node.port);
     auto handle = node.io->open("127.0.0.1", port, hello);
@@ -333,7 +354,7 @@ void test_backpressure() {
     check(!r && r.error() == SocketError::WouldBlock, tag + " a frame over the cap is refused whole");
 
     // Nothing partial was queued: draining delivers exactly the accepted bytes.
-    peer->with_receive_timeout(2s);
+    peer->with_receive_timeout(kEventWait);
     const auto got = read_exact(*peer, accepted_bytes);
     check(got.size() == accepted_bytes, tag + " peer receives exactly the accepted bytes ("
                                             + std::to_string(got.size()) + " of "
@@ -348,8 +369,8 @@ void test_backpressure() {
 
 void test_close() {
     const std::string tag = "peer-threads close:";
-    const unsigned port = random_port();
-    TcpListener server("127.0.0.1", port, 4);
+    unsigned port = 0;
+    TcpListener server = test_ports::listen_on_random_port(port, 4); // redraws if taken
     Node node;
     constexpr uint64_t kPeer = 555;
     node.peers.insert(kPeer, p2p::PeerTable::Address{"127.0.0.1", static_cast<uint16_t>(port)});
@@ -362,11 +383,11 @@ void test_close() {
 
     auto remote = server.accept_client();
     if (!remote) { check(false, tag + " accepted"); return; }
-    remote->with_receive_timeout(2s);
+    remote->with_receive_timeout(kEventWait);
     (void)read_exact(*remote, hello_bytes(9, node.port).size());
     check(send_all(*remote, *wire::encode(wire::make_connect_ack(9, kPeer))), tag + " ack sent back");
     std::optional<p2p::ChannelRef> tx;
-    for (int i = 0; i < 200; ++i) {
+    for (int i = 0; i < 2000; ++i) { // up to 10 s, until the ack was processed
         tx = node.peers.tx_of(kPeer);
         if (tx && tx->connection_id != kSenderId) { break; }
         std::this_thread::sleep_for(5ms);
@@ -406,11 +427,17 @@ void test_eviction() {
     check(wait_until([&] { return node.metrics.evictions.load() == 1; }),
           tag + " exactly one eviction");
     // Events arrive in either order (the third connect races the eviction's close).
+    // Wait (generously) for the expected 3 + 1, then make sure nothing else follows.
     int connected = 0, disconnected = 0;
-    while (auto event = pop_for(node.store_queue, 500ms)) {
-        if (std::holds_alternative<EventPeerConnected>(*event)) { ++connected; }
-        else if (std::holds_alternative<EventPeerDisconnected>(*event)) { ++disconnected; }
+    auto count = [&](const Event& event) {
+        if (std::holds_alternative<EventPeerConnected>(event)) { ++connected; }
+        else if (std::holds_alternative<EventPeerDisconnected>(event)) { ++disconnected; }
+    };
+    const auto deadline = std::chrono::steady_clock::now() + kEventWait;
+    while ((connected < 3 || disconnected < 1) && std::chrono::steady_clock::now() < deadline) {
+        if (auto event = pop_for(node.store_queue, 100ms)) { count(*event); }
     }
+    while (auto event = pop_for(node.store_queue, 300ms)) { count(*event); }
     check(connected == 3, tag + " three connects seen (" + std::to_string(connected) + ")");
     check(disconnected == 1, tag + " evicted peer reported disconnected exactly once ("
                                  + std::to_string(disconnected) + ")");
@@ -455,24 +482,23 @@ void test_shutdown() {
 
         const auto t1 = std::chrono::steady_clock::now();
         const auto* m = &node->metrics;
-        check(wait_until([&] { return m->connections_live.load() == 0; }, 1s),
+        check(wait_until([&] { return m->connections_live.load() == 0; }),
               tag + " every owner thread exited (live=" + std::to_string(m->connections_live.load()) + ")");
         node.reset(); // destructor joins the watchdog (and so every owner thread)
         const auto destroy_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::steady_clock::now() - t1).count();
         check(destroy_ms < 1000, tag + " destruction under 1 s (" + std::to_string(destroy_ms) + " ms)");
         // Clients see EOF.
-        clients.front().with_receive_timeout(1s);
+        clients.front().with_receive_timeout(kEventWait);
         std::byte scratch[16];
         auto eof = clients.front().receive(std::span<std::byte>{scratch});
         check(!eof || *eof == 0, tag + " peers see their socket closed");
     }
-    // A node with no peers also shuts down at once. (It first gets time to listen: a
+    // A node with no peers also shuts down at once. (Node waits until it listens: a
     // stop() racing the bind can make its wake-up dial wait one SYN retransmit, 1 s;
     // that race exists in every transport and is not what this checks.)
     {
         Node idle;
-        std::this_thread::sleep_for(100ms);
         const auto t0 = std::chrono::steady_clock::now();
         idle.io->stop();
         idle.listener.join();
