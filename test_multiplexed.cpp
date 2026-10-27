@@ -378,7 +378,7 @@ void test_two_nodes(IoMode mode) {
 
     uint64_t conv_b = 0;
     for (int i = 0; i < 100 && conv_b == 0; ++i) {
-        auto event = pop_for(b.render_queue);
+        auto event = pop_for(b.render_queue, 3s); // a probe: the list request below is the fallback
         if (!event) { break; }
         if (auto* connected = std::get_if<EventPeerDialed>(&*event)) { conv_b = connected->conversation_id; }
         else if (auto* notice = std::get_if<EventConversationNotification>(&*event)) { conv_b = notice->conversation_id; }
