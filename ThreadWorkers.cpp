@@ -16,6 +16,7 @@
 // there is no per-reader handle for the listener to track.
 
 #include "ThreadWorkers.hpp"
+#include "ThreadName.hpp"
 
 #include "Chat.hpp"
 #include "Element.hpp"
@@ -545,7 +546,8 @@ void ListenerWorker::operator()() {
         return;
     }
 
-    watchdog_thread_ = std::thread([this] { watchdog_(); });
+    watchdog_thread_ = std::thread([this] { set_thread_name("watchdog"); watchdog_(); });
+    std::uint64_t readers_spawned = 0; // names the reader threads rd-1, rd-2, ...
 
     while (running_.load(std::memory_order_relaxed)) {
         auto accepted = listener->accept_client();
@@ -575,7 +577,10 @@ void ListenerWorker::operator()() {
                             logger_, metrics_};
         watchdog_.adopt(
             std::move(activity),
-            std::thread{[reader = std::move(reader)]() mutable { reader(); }});
+            std::thread{[reader = std::move(reader), n = ++readers_spawned]() mutable {
+                set_thread_name("rd", n);
+                reader();
+            }});
     }
 
     watchdog_.stop();
@@ -962,14 +967,15 @@ void MainWorker::operator()() {
     logger.info("main: starting on " + config_.address + ":" + std::to_string(config_.port)
                 + " io=" + std::string{to_string(config_.io)});
 
-    std::thread logger_thread{[&logger_worker] { logger_worker(); }};
-    std::thread store_thread{[&store] { store(); }};
-    std::thread sender_thread{[&sender] { sender(); }};
+    set_thread_name("main");
+    std::thread logger_thread{[&logger_worker] { set_thread_name("logger"); logger_worker(); }};
+    std::thread store_thread{[&store] { set_thread_name("store"); store(); }};
+    std::thread sender_thread{[&sender] { set_thread_name("sender"); sender(); }};
     std::thread keyboard_thread;
-    if (keyboard) { keyboard_thread = std::thread{[&keyboard] { (*keyboard)(); }}; }
-    std::thread listener_thread{[&io] { io.inbound->run(); }};
+    if (keyboard) { keyboard_thread = std::thread{[&keyboard] { set_thread_name("keyboard"); (*keyboard)(); }}; }
+    std::thread listener_thread{[&io] { set_thread_name("listener"); io.inbound->run(); }};
     std::thread metrics_thread;
-    if (metrics_worker) { metrics_thread = std::thread{[&metrics_worker] { (*metrics_worker)(); }}; }
+    if (metrics_worker) { metrics_thread = std::thread{[&metrics_worker] { set_thread_name("metrics"); (*metrics_worker)(); }}; }
 
     // Render on the main thread; it returns once the keyboard (Esc / Ctrl+C / EOF)
     // or a /quit command ends it.

@@ -2,6 +2,8 @@
 
 #include "MultiplexedIo.hpp"
 
+#include "ThreadName.hpp"
+
 #include <algorithm>
 #include <exception>
 #include <optional>
@@ -29,8 +31,8 @@ MultiplexedIo<Pool, Tx>::MultiplexedIo(const NetConfig& net, ThreadQueue<Event>&
                 + (model_ == ConnectionModel::Dual ? 0 : 16),
             kIdleTimeout, max_tx_buffer_bytes),
       tx_(max_tx_buffer_bytes) {
-    if constexpr (kSplit) { tx_thread_ = std::thread{[this] { tx_.run(); }}; }
-    io_thread_ = std::thread{[this] { io_loop(); }};
+    if constexpr (kSplit) { tx_thread_ = std::thread{[this] { set_thread_name("tx"); tx_.run(); }}; }
+    io_thread_ = std::thread{[this] { set_thread_name("io"); io_loop(); }};
 }
 
 template <class Pool, class Tx>

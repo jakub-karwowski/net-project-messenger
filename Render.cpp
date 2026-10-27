@@ -3,6 +3,7 @@
 // and HeadlessRender (fd in, JSON lines out, behind HeadlessRenderWorker).
 
 #include "Render.hpp"
+#include "ThreadName.hpp"
 
 #include "Chat.hpp"
 #include "Element.hpp"
@@ -758,7 +759,7 @@ struct HeadlessRenderWorker::Impl final : RenderSink {
     // --- input ---
 
     void start_reader() {
-        reader_ = std::thread{[this] { read_lines(); }};
+        reader_ = std::thread{[this] { p2p::set_thread_name("stdin"); read_lines(); }};
     }
 
     void stop_reader() {
