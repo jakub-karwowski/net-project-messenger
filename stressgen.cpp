@@ -11,9 +11,10 @@ static void usage() {
         "usage: stressgen --target ip:port [--peers N] [--rate R] [--window W] [--size B]\n"
         "                 [--duration S] [--warmup S] [--idle-peers M] [--slow-peers K]\n"
         "                 [--churn C] [--grace S] [--listen-ip IP] [--listen-port P] [--out file.json]\n"
-        "                 [--duplex]\n"
+        "                 [--duplex] [--slow-rcvbuf B]\n"
         "  rate: msgs/s/peer (0 = as fast as possible); window: max in-flight/peer (0 = unlimited)\n"
         "  --duplex: single connection per peer (node replies Ack+echoes on the dialed socket; no listener)\n"
+        "  --slow-rcvbuf: SO_RCVBUF of the socket slow peers stop reading (default 4096, 0 = kernel default)\n"
         "  idle/slow peers are extra peers on top of --peers. exit: 0 ok, 2 unreachable, 3 no handshakes\n";
 }
 
@@ -45,6 +46,7 @@ int main(int argc, char** argv) {
         else if (a == "--grace") { c.grace = std::atof(v.c_str()); }
         else if (a == "--listen-ip") { c.listen_ip = v; }
         else if (a == "--listen-port") { c.listen_port = static_cast<std::uint16_t>(std::atoi(v.c_str())); }
+        else if (a == "--slow-rcvbuf") { c.slow_rcvbuf = std::atoi(v.c_str()); }
         else if (a == "--out") { c.out = v; }
         else { std::cerr << "unknown option " << a << "\n"; usage(); return 1; }
     }

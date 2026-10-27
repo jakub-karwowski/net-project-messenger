@@ -721,6 +721,25 @@ second, or as fast as `--window` in-flight messages allow.
 | `peers_total`, `peers_ready` | peers configured, and peers that completed the handshake |
 | `connect_failures`, `disconnects`, `churn_events`, `bad_frames` | connection health and protocol errors |
 | `config{…}`, `start_unix_ns`, `end_unix_ns` | the parameters used, and wall-clock times for lining up with the node's metrics |
+| `window_start_mono_ns`, `window_end_mono_ns` | the measurement window `[start, end)` on `CLOCK_MONOTONIC` (`std::chrono::steady_clock`), the same clock as the node's metrics `t_ns`; `end − start` is `--duration` |
+| `received_raw` | in-window echoes before any clamping (equal to `received`); with `duplicates` it shows whether `lost` hides extra echoes |
+| `duplicates` | in-window echoes whose (peer, seq) was already seen. `lost` stays clamped (`sent − min(sent, received)`), so a duplicate can mask a loss; check `duplicates` first. The grace wait ends on unique echoes (`received − duplicates`) |
+| `handshake_failures` | dial attempts (ramp and churn redials) that never reached Ready before the peer was killed or the run ended; read it with `handshake_us.samples` and `peers_ready` to see the survivorship bias in the handshake histogram. An Ack for a peer not in the handshaking state is ignored |
+| `slow_unread_bytes` | sum over slow peers of bytes still unread (`ioctl FIONREAD`) on the socket they stopped reading (duplex: the dialed socket; simplex: the accepted return connection), taken at the end. Non-zero means the slow path was exercised; bounded by `slow_rcvbuf` |
+| `gen_cpu{utime_us,stime_us,nvcsw,nivcsw}` | stressgen's own `getrusage(RUSAGE_SELF)` deltas over the measurement window |
+| `sched_lag_max_us` | largest `now − next_send` seen in the window (rate mode): how late the generator's schedule ran; above about 5 ms means the generator, not the node, may be the limit |
+| `slow_rcvbuf` | the `--slow-rcvbuf` value used |
+
+**Slow peers and `--slow-rcvbuf`.** Not reading is not enough to create
+backpressure: loopback buffering can absorb megabytes. Slow peers therefore get
+`SO_RCVBUF` = `--slow-rcvbuf` (default 4096, 0 = kernel default, the old
+behaviour) on the socket they stop reading. Duplex: set on the dialed socket
+before `connect()`, so the SYN advertises a matching window scale. Simplex: the
+return connection is only known to be a slow peer's after the Ack arrives, so
+it is set after `accept()`; the window scale was already fixed at the SYN-ACK,
+but the advertised window is still bounded by the locked buffer (the kernel
+doubles the value, so about 8 KiB). A few KiB can still sit in the sender's
+socket buffer before it sees `EAGAIN`. Churn never picks slow peers.
 
 The one-line summary on stdout gives the same core numbers.
 
@@ -974,7 +993,7 @@ cmake -B build -S . && cmake --build build -j -- -k   # -k: see "Known issues"
 | `test_p2p` | `PeerTable` (rx/tx slots, supersede, simplex vs duplex release); `FrameChannel` closed before or during its bind (2,000-round race); listener/reader/watchdog: loopback, id reuse, cap pruning, stalled reader, superseded reader stays silent | `threads`, plus link logic for all |
 | `test_sender` | `SenderWorker`: handshake, connection reuse, dial-back, retries, reconnect, unreachable; duplex fake transport answers on the existing handle and closes `superseded` | all (policy) |
 | `test_store`, `test_render`, `test_headless`, `test_main`, `test_logger`, `test_queue`, `test_wire`, `test_workers`, `test_metrics` | store subscriptions and echo, command handling, headless JSONL protocol, whole-stack startup and shutdown, logger, queue, wire codec, keyboard, metrics | mode-independent |
-| `test_stressgen` | stressgen against an in-process fake node, in both two-connection and `--duplex` shapes, including idle, slow and churn peers | harness |
+| `test_stressgen` | stressgen against an in-process fake node, in both two-connection and `--duplex` shapes, including idle, slow and churn peers; histogram accuracy (constants, uniform ranges, power-of-two edges); partial ramp (`handshake_failures`); slow-peer backpressure in both shapes (node sees `EAGAIN`, `slow_unread_bytes > 0`); duplicates; window fields | harness |
 
 ### End-to-end tests (`tests/e2e/test_e2e.py`)
 
