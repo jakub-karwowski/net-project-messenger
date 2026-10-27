@@ -20,6 +20,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -66,6 +67,7 @@ struct Config {
     double churn = 0;                      // reconnects per second
     double grace = 2;                      // wait for late echoes after the run
     double ramp_timeout = 10;              // max wait for handshakes
+    int slow_rcvbuf = 4096;                // SO_RCVBUF for the socket a slow peer stops reading, 0 = default
     bool duplex = false;                   // one connection per peer: Ack + echoes come back on the dialed socket
     std::string out;
 };
@@ -129,6 +131,14 @@ struct Result {
     std::uint64_t connect_failures = 0, disconnects = 0, churn_events = 0, bad_frames = 0;
     std::int64_t start_wall_ns = 0, end_wall_ns = 0;
     double measured_seconds = 0;
+    // Added for harness correctness (F3, F7, F11, F12).
+    std::int64_t window_start_mono_ns = 0, window_end_mono_ns = 0;  // [ms_, me_) on steady_clock
+    std::uint64_t received_raw = 0;       // echoes in the window before any clamping (== received)
+    std::uint64_t duplicates = 0;         // in-window echoes whose (peer, seq) was already seen
+    std::uint64_t handshake_failures = 0; // dials (ramp + churn) that never reached Ready
+    std::uint64_t slow_unread_bytes = 0;  // FIONREAD of slow peers' non-read sockets at the end
+    std::uint64_t gen_utime_us = 0, gen_stime_us = 0, gen_nvcsw = 0, gen_nivcsw = 0;  // rusage delta over the window
+    std::int64_t sched_lag_max_ns = 0;    // max (now - next_send) seen in the window (rate mode)
 };
 
 // --- Generator ---------------------------------------------------------------
@@ -162,6 +172,7 @@ private:
         std::uint64_t inflight = 0;
         std::int64_t next_send = 0;
         std::int64_t dial_ns = 0;  // when connect() was started for the current attempt
+        std::vector<bool> seen;    // in-window seqs already received (duplicate detection)
     };
     struct Conn {
         CType type;
@@ -217,6 +228,8 @@ private:
     std::vector<std::byte> rbuf_ = std::vector<std::byte>(64 * 1024);
     std::int64_t churn_next_ = 0;
     int dial_cursor_ = 0;
+    rusage ru0_{};
+    bool ru0_taken_ = false;
 };
 
 inline bool Generator::setup(std::string& err) {
@@ -253,15 +266,20 @@ inline bool Generator::setup(std::string& err) {
 inline void Generator::dial(int i) {
     Peer& p = peers_[static_cast<std::size_t>(i)];
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (fd < 0) { ++res_->connect_failures; p.state = State::Dead; return; }
+    if (fd < 0) { ++res_->connect_failures; ++res_->handshake_failures; p.state = State::Dead; return; }
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    // Duplex slow peer: the dialed socket is the one never read. A small SO_RCVBUF must be set
+    // before connect() so the SYN advertises a matching window scale.
+    if (cfg_.duplex && p.kind == Kind::Slow && cfg_.slow_rcvbuf > 0) {
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &cfg_.slow_rcvbuf, sizeof cfg_.slow_rcvbuf);
+    }
     sockaddr_in a{};
     a.sin_family = AF_INET;
     a.sin_port = htons(cfg_.target_port);
     ::inet_pton(AF_INET, cfg_.target_ip.c_str(), &a.sin_addr);
     const int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
-    if (rc != 0 && errno != EINPROGRESS) { ::close(fd); ++res_->connect_failures; p.state = State::Dead; return; }
+    if (rc != 0 && errno != EINPROGRESS) { ::close(fd); ++res_->connect_failures; ++res_->handshake_failures; p.state = State::Dead; return; }
     p.wfd = fd;
     p.dial_ns = now_ns();
     p.state = State::Connecting;
@@ -272,6 +290,7 @@ inline void Generator::dial(int i) {
 inline void Generator::kill_peer(int i, bool count) {
     Peer& p = peers_[static_cast<std::size_t>(i)];
     if (p.state == State::Dead) { return; }
+    if (p.state == State::Connecting || p.state == State::Handshaking) { ++res_->handshake_failures; }
     close_conn(p.wfd); close_conn(p.rfd);
     p.wfd = p.rfd = -1;
     p.state = State::Dead;
@@ -367,6 +386,10 @@ inline void Generator::on_message(int peer, const wire::ChatMessage& m, std::int
     if (ts >= ms_ && ts < me_) {
         ++res_->received;
         res_->rtt.record(now - ts);
+        if (seq < p.seq) {   // duplicate detection (seq beyond what we sent is bogus: not tracked)
+            if (p.seen.size() <= seq) { p.seen.resize(std::max<std::size_t>(seq + 1, p.seen.size() * 2), false); }
+            if (p.seen[seq]) { ++res_->duplicates; } else { p.seen[seq] = true; }
+        }
     }
 }
 
@@ -386,11 +409,16 @@ inline void Generator::on_ret_conn(int fd) {
                     auto it = by_token_.find(ack->ack_peer_id);
                     if (it == by_token_.end()) { continue; }
                     Peer& p = peers_[static_cast<std::size_t>(it->second)];
-                    if (p.state == State::Dead) { close_conn(fd); return; }
+                    if (p.state != State::Handshaking) { close_conn(fd); return; }   // stale / duplicate Ack (F11)
                     if (p.rfd >= 0 && p.rfd != fd) { close_conn(p.rfd); }
                     c.peer = it->second;
                     p.rfd = fd;
                     if (p.kind == Kind::Slow) {   // accept, but never read again
+                        // Small receive buffer set after accept: the window scale was fixed at the SYN-ACK, but
+                        // the advertised window is still bounded by the new (locked) rcvbuf.
+                        if (cfg_.slow_rcvbuf > 0) {
+                            ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &cfg_.slow_rcvbuf, sizeof cfg_.slow_rcvbuf);
+                        }
                         ::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr);
                         maybe_ready(it->second);
                         return;
@@ -470,6 +498,7 @@ inline void Generator::tick_send(std::int64_t now) {
         if (p.state != State::Ready || p.kind == Kind::Idle) { continue; }
         const int i = static_cast<int>(k);
         if (interval > 0) {
+            if (now >= ms_ && now < me_ && ms_ != 0) { res_->sched_lag_max_ns = std::max(res_->sched_lag_max_ns, now - p.next_send); }
             if (now - p.next_send > 100'000'000) { p.next_send = now; }   // don't replay a long stall
             int budget = 256;
             while (p.next_send <= now && budget-- > 0) {
@@ -496,7 +525,7 @@ inline void Generator::tick_churn(std::int64_t now) {
         churn_next_ += step;
         std::vector<int> ready;
         for (std::size_t k = 0; k < peers_.size(); ++k) {
-            if (peers_[k].state == State::Ready && peers_[k].kind != Kind::Idle) { ready.push_back(static_cast<int>(k)); }
+            if (peers_[k].state == State::Ready && peers_[k].kind == Kind::Active) { ready.push_back(static_cast<int>(k)); }
         }
         if (ready.empty()) { continue; }
         const int i = ready[rng_() % ready.size()];
@@ -587,9 +616,18 @@ inline int Generator::run(Result& res, std::string& err) {
                 phase = Phase::Run;
             }
         } else if (phase == Phase::Run) {
+            if (!ru0_taken_ && now >= ms_) { ::getrusage(RUSAGE_SELF, &ru0_); ru0_taken_ = true; }
             tick_send(now);
             tick_churn(now);
             if (now >= send_end) {
+                if (!ru0_taken_) { ::getrusage(RUSAGE_SELF, &ru0_); ru0_taken_ = true; }
+                rusage ru1{};
+                ::getrusage(RUSAGE_SELF, &ru1);
+                auto us = [](const timeval& t) { return static_cast<std::int64_t>(t.tv_sec) * 1'000'000 + t.tv_usec; };
+                res.gen_utime_us = static_cast<std::uint64_t>(std::max<std::int64_t>(0, us(ru1.ru_utime) - us(ru0_.ru_utime)));
+                res.gen_stime_us = static_cast<std::uint64_t>(std::max<std::int64_t>(0, us(ru1.ru_stime) - us(ru0_.ru_stime)));
+                res.gen_nvcsw = static_cast<std::uint64_t>(std::max<long>(0, ru1.ru_nvcsw - ru0_.ru_nvcsw));
+                res.gen_nivcsw = static_cast<std::uint64_t>(std::max<long>(0, ru1.ru_nivcsw - ru0_.ru_nivcsw));
                 sending_ = false;
                 grace_end = now + static_cast<std::int64_t>(cfg_.grace * 1e9);
                 phase = Phase::Grace;
@@ -598,10 +636,23 @@ inline int Generator::run(Result& res, std::string& err) {
             for (std::size_t k = 0; k < peers_.size(); ++k) {
                 if (peers_[k].state != State::Dead && !peers_[k].out.empty()) { flush(static_cast<int>(k)); }
             }
-            if (res.received >= sent_meas_ || now >= grace_end) { phase = Phase::Done; }
+            if (res.received - std::min(res.received, res.duplicates) >= sent_meas_ || now >= grace_end) { phase = Phase::Done; }
         }
     }
-    for (const Peer& p : peers_) { if (p.state == State::Ready) { ++res.peers_ready; } }
+    for (const Peer& p : peers_) {
+        if (p.state == State::Ready) { ++res.peers_ready; }
+        else if (p.state == State::Connecting || p.state == State::Handshaking) { ++res.handshake_failures; }
+        if (p.kind == Kind::Slow && p.state != State::Dead) {
+            const int sfd = cfg_.duplex ? p.wfd : p.rfd;   // the socket the peer stopped reading
+            int pending = 0;
+            if (sfd >= 0 && ::ioctl(sfd, FIONREAD, &pending) == 0 && pending > 0) {
+                res.slow_unread_bytes += static_cast<std::uint64_t>(pending);
+            }
+        }
+    }
+    res.received_raw = res.received;
+    res.window_start_mono_ns = ms_;
+    res.window_end_mono_ns = me_;
     res.lost = res.sent - std::min(res.sent, res.received);
     res.measured_seconds = cfg_.duration;
     res.msgs_per_s = cfg_.duration > 0 ? static_cast<double>(res.received) / cfg_.duration : 0;
@@ -610,7 +661,7 @@ inline int Generator::run(Result& res, std::string& err) {
 }
 
 inline std::string to_json(const Config& c, const Result& r) {
-    char b[2560];
+    char b[4096];
     auto us = [](std::int64_t ns) { return static_cast<double>(ns) / 1000.0; };
     std::snprintf(b, sizeof b,
         "{\"sent\":%llu,\"received\":%llu,\"lost\":%llu,\"msgs_per_s\":%.1f,"
@@ -621,7 +672,11 @@ inline std::string to_json(const Config& c, const Result& r) {
         "\"churn_events\":%llu,\"bad_frames\":%llu,"
         "\"config\":{\"target\":\"%s:%u\",\"peers\":%d,\"idle_peers\":%d,\"slow_peers\":%d,\"rate\":%g,"
         "\"window\":%d,\"size\":%d,\"duration\":%g,\"warmup\":%g,\"churn\":%g,\"grace\":%g},"
-        "\"start_unix_ns\":%lld,\"end_unix_ns\":%lld}\n",
+        "\"start_unix_ns\":%lld,\"end_unix_ns\":%lld,"
+        "\"window_start_mono_ns\":%lld,\"window_end_mono_ns\":%lld,"
+        "\"received_raw\":%llu,\"duplicates\":%llu,\"handshake_failures\":%llu,\"slow_unread_bytes\":%llu,"
+        "\"gen_cpu\":{\"utime_us\":%llu,\"stime_us\":%llu,\"nvcsw\":%llu,\"nivcsw\":%llu},"
+        "\"sched_lag_max_us\":%.1f,\"slow_rcvbuf\":%d}\n",
         (unsigned long long)r.sent, (unsigned long long)r.received, (unsigned long long)r.lost, r.msgs_per_s,
         us(r.rtt.quantile(0.5)), us(r.rtt.quantile(0.9)), us(r.rtt.quantile(0.99)), us(r.rtt.quantile(0.999)),
         us(r.rtt.max()), r.rtt.mean() / 1000.0, (unsigned long long)r.rtt.count(),
@@ -632,7 +687,13 @@ inline std::string to_json(const Config& c, const Result& r) {
         (unsigned long long)r.connect_failures, (unsigned long long)r.disconnects,
         (unsigned long long)r.churn_events, (unsigned long long)r.bad_frames,
         c.target_ip.c_str(), c.target_port, c.peers, c.idle_peers, c.slow_peers, c.rate, c.window, c.size,
-        c.duration, c.warmup, c.churn, c.grace, (long long)r.start_wall_ns, (long long)r.end_wall_ns);
+        c.duration, c.warmup, c.churn, c.grace, (long long)r.start_wall_ns, (long long)r.end_wall_ns,
+        (long long)r.window_start_mono_ns, (long long)r.window_end_mono_ns,
+        (unsigned long long)r.received_raw, (unsigned long long)r.duplicates,
+        (unsigned long long)r.handshake_failures, (unsigned long long)r.slow_unread_bytes,
+        (unsigned long long)r.gen_utime_us, (unsigned long long)r.gen_stime_us,
+        (unsigned long long)r.gen_nvcsw, (unsigned long long)r.gen_nivcsw,
+        us(r.sched_lag_max_ns), c.slow_rcvbuf);
     return b;
 }
 
