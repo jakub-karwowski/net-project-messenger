@@ -42,7 +42,8 @@ background load) spreads across variants instead of biasing one.
 | **S3** slow consumers | peers that stop reading: 0, 1, 4 | 16 active peers × 200 msg/s, 64 B | loopback |
 | **S4** churn | reconnects per second: 0, 10, 50 | 64 peers × 50 msg/s, 64 B | loopback |
 | **S5** throughput ceiling | message size: 32, 4096, 65536 B | 8 peers, closed loop (window 16) | loopback |
-| **S6a** WAN churn | RTT: 0, 4, 20, 50 ms | 32 peers × 100 msg/s, 256 B, 16 reconnects/s | veth, MTU 1500, netem delay |
+| **S6a** WAN churn | RTT: 0, 4, 20, 30, 40, 50 ms | 32 peers × 100 msg/s, 256 B, 16 reconnects/s | veth, MTU 1500, netem delay |
+| **S6c** WAN churn, half rate | RTT: 50 ms | as S6a but 8 reconnects/s | as S6a |
 | **S6b** WAN bottleneck | node→generator rate: 1000, 200, 50 Mbit/s | 32 peers, closed loop (window 8), 16 KiB | veth, MTU 1500, 4 ms RTT, rate on the node side |
 | **S7** capped fan-in | the node's `--max-peers`: 64, 128, 256, 1040 | 1024 peers × 100 msg/s, 64 B | loopback |
 
@@ -52,8 +53,14 @@ unprivileged `unshare` namespace started by `run_matrix.py`. When S1–S5 and S6
 are selected together, S1–S5 run first, then S6. Handshakes count if they
 complete during the ramp or inside the measurement window.
 
-**Size of the run:** 29 swept values × 9 variants × 3 repetitions = **783
-cells**, about 25–30 s each, so about **6 hours**.
+S6a's extra points (30 and 40 ms) bracket the RTT where the node's single
+blocking sender saturates (16 reconnects/s × 2·RTT > 1 s, about 31 ms); S6c
+repeats RTT 50 ms with half the churn to see whether the collapse is a cliff or
+a slope.
+
+**Size of the run:** 32 swept values × 9 variants × 3 repetitions = **864
+cells**, about 25–30 s each, so about **6.5–7 hours**. (Before the S6a
+extension it was 29 values, 783 cells.)
 
 Three repetitions, not the script's default of 5, keeps the run to one sitting.
 The report gives the median and IQR, which are meaningful with 3, and the
@@ -238,22 +245,49 @@ S1 and most of S2) already showed. Everything else is a prediction.
    `report.html`.
 5. **Resuming:** an interrupted run continues when the same command is run
    again. Cells marked `ok` or `dirty` are kept, and `failed` ones are retried.
-   Only resume with the **same build**: check that the `build` stamp in new
-   cells matches the old ones.
+   Only resume with the **same build**: `run_matrix.py` compares the `build`
+   stamps already in `--out` (commit, dirty, app and stressgen sha256, app
+   build type) with the current ones and exits with a message listing the
+   differences unless `--force-mixed` is given.
 
 ## 5. When a result counts
 
-- **`ok`:** valid.
-- **`dirty`:** the node didn't exit within the 30 s `--quit-timeout`. The data
-  from the measurement window is still valid, and `analyze.py` keeps it and
-  lists the cell. Use `shutdown_s` in `meta.json` to see how long shutdown took.
-  After the sender shutdown fix, a dirty cell is unusual and worth a look.
+- **`ok`:** the run completed and passed the validity checks below.
+- **`dirty`:** the node didn't say `bye` and exit with status 0 within the 30 s
+  `--quit-timeout` (EOF on its stdout does not count as `bye`; a crash or a
+  non-zero exit is dirty, `node_rc` is in `meta.json`). If the node had to be
+  killed, `rep<N>.hang.txt` holds every thread's state, wait channel and
+  syscall. A dirty cell that passes the validity checks stays in the medians and
+  is listed; use `shutdown_s` to see how long shutdown took. After the sender
+  shutdown fix, a dirty cell is unusual and worth a look.
+- **`degraded`:** `ok` or `dirty`, but a validity check failed. `analyze.py`
+  decides this itself from the files (so it also works on old results;
+  `meta.json` of new runs additionally records `validity` {ok, reasons}). The
+  cell is listed under Problems with its reasons and **excluded from medians
+  and IQR**; `summary.csv` has `reps` and `reps_valid`. The checks
+  (`analyze.validity`, thresholds are constants at the top of `analyze.py`):
+  - `peers_ready == peers_total`; with churn at least 90 %; in S7 at least 90 %
+    of `min(peers, max_peers)`.
+  - Open-loop cells (rate > 0, not S7, no churn): `sent` ≥ 98 % of
+    peers × rate × duration.
+  - `connect_failures == 0` (not in S7, where the cap refuses connections),
+    `bad_frames == 0`, `send_skipped == 0`.
+  - No stall: the node's `frames_in` still grows within 3 s of the generator's
+    window end (stressgen's monotonic bounds). Results without the bounds map
+    the wall-clock end onto the metrics clock, about 1 s uncertain, and use 5 s.
+
+  A degraded cell is a collapsed or partly ramped run, not a finding about the
+  variant's speed: report it as "collapsed" next to the medians (for example S6a
+  at 50 ms RTT).
 - **`failed`:** no data, for example when the node wasn't ready or stressgen
   exited with an error. Investigate it; never ignore it.
 - **Overload is a result, not a failure.** A cell with high `lost`, a huge RTT
   and a full CPU is the "where does it break" answer. Report it as such.
 - **Never mix builds within one results directory.** All cells must share one
-  `build.commit` with `dirty: false`, and the same binary hashes.
+  `build.commit` with `dirty: false`, and the same binary hashes. `analyze.py`
+  prints and shows a "Build" section with a cell count per distinct stamp and a
+  red banner when there is more than one (cells without a stamp count as
+  "unknown").
 - **Compare variants within one scenario value.** Numbers across scenarios use
   different loads and aren't comparable.
 
