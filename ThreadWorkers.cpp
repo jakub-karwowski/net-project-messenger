@@ -16,6 +16,7 @@
 // there is no per-reader handle for the listener to track.
 
 #include "ThreadWorkers.hpp"
+#include "ThreadName.hpp"
 
 #include "Chat.hpp"
 #include "Element.hpp"
@@ -545,7 +546,8 @@ void ListenerWorker::operator()() {
         return;
     }
 
-    watchdog_thread_ = std::thread([this] { watchdog_(); });
+    watchdog_thread_ = std::thread([this] { set_thread_name("watchdog"); watchdog_(); });
+    std::uint64_t readers_spawned = 0; // names the reader threads rd-1, rd-2, ...
 
     while (running_.load(std::memory_order_relaxed)) {
         auto accepted = listener->accept_client();
@@ -575,7 +577,10 @@ void ListenerWorker::operator()() {
                             logger_, metrics_};
         watchdog_.adopt(
             std::move(activity),
-            std::thread{[reader = std::move(reader)]() mutable { reader(); }});
+            std::thread{[reader = std::move(reader), n = ++readers_spawned]() mutable {
+                set_thread_name("rd", n);
+                reader();
+            }});
     }
 
     watchdog_.stop();
@@ -631,6 +636,14 @@ std::optional<OutboundTransport::Handle> SenderWorker::ensure_connection(uint64_
 
     const auto entry = peers_.lookup(peer_id);
     if (!entry) { return std::nullopt; } // no known address: nothing to dial
+    // Port 0 is "no dialable address" (a duplex-only peer that advertises no
+    // listener). This must be decided HERE, on the same tx-slot snapshot that found
+    // the slot empty: the I/O thread can release the slot at any moment (the peer's
+    // socket closed), so a check made by the caller before this call is stale. A
+    // connect() to port 0 is never refused on Linux -- it blocks for the whole SYN
+    // retry budget (~130 s), which wedged the sender (no more handshake answers or
+    // echoes) and then MainWorker's join at /quit (S4 churn=10 poll-split rep3).
+    if (entry->address.port == 0) { return std::nullopt; }
 
     // Name the peer (that is what ConnectInfo carries), re-present the name the peer
     // gave us (0 until it has told us) and advertise where we accept connections,
@@ -645,6 +658,8 @@ std::optional<OutboundTransport::Handle> SenderWorker::open(uint64_t peer_id,
                                                             const wire::Message& hello) {
     // Quitting: a dial (and the handshake it starts) can no longer be useful.
     if (shutting_down_.load(std::memory_order_relaxed)) { return std::nullopt; }
+    // Never dial port 0 (see ensure_connection): it would block, not fail.
+    if (port == 0) { return std::nullopt; }
     const auto frame = wire::encode(hello);
     if (!frame) { return std::nullopt; }
     auto handle = transport_->open(ip, port, *frame);
@@ -834,10 +849,14 @@ void SenderWorker::operator()() {
         bool dropped = false;
         const unsigned attempts = stopping ? 1 : send_attempts_; // quitting: no retries
         for (unsigned attempt = 0; frame && attempt < attempts; ++attempt) {
+            // One tx-slot lookup per attempt, inside ensure_connection(): it either
+            // returns the live handle or decides about dialling on that same
+            // snapshot (a separate "no slot and port 0?" check here raced the I/O
+            // thread releasing the slot and let a port-0 dial through).
+            const auto connection = ensure_connection(message->peer_id);
             // Port 0 is "no dialable address" (a duplex-only peer that advertises
             // none): a redial cannot succeed, so do not sleep through the retries.
-            if (!peers_.tx_of(message->peer_id) && peer->address.port == 0) { break; }
-            const auto connection = ensure_connection(message->peer_id);
+            if (!connection && peer->address.port == 0) { break; }
             auto sent = connection ? transport_->send(*connection, *frame)
                                    : std::unexpected(SocketError::ConnectionNotFound);
             if (!sent && sent.error() == SocketError::WouldBlock &&
@@ -962,14 +981,15 @@ void MainWorker::operator()() {
     logger.info("main: starting on " + config_.address + ":" + std::to_string(config_.port)
                 + " io=" + std::string{to_string(config_.io)});
 
-    std::thread logger_thread{[&logger_worker] { logger_worker(); }};
-    std::thread store_thread{[&store] { store(); }};
-    std::thread sender_thread{[&sender] { sender(); }};
+    set_thread_name("main");
+    std::thread logger_thread{[&logger_worker] { set_thread_name("logger"); logger_worker(); }};
+    std::thread store_thread{[&store] { set_thread_name("store"); store(); }};
+    std::thread sender_thread{[&sender] { set_thread_name("sender"); sender(); }};
     std::thread keyboard_thread;
-    if (keyboard) { keyboard_thread = std::thread{[&keyboard] { (*keyboard)(); }}; }
-    std::thread listener_thread{[&io] { io.inbound->run(); }};
+    if (keyboard) { keyboard_thread = std::thread{[&keyboard] { set_thread_name("keyboard"); (*keyboard)(); }}; }
+    std::thread listener_thread{[&io] { set_thread_name("listener"); io.inbound->run(); }};
     std::thread metrics_thread;
-    if (metrics_worker) { metrics_thread = std::thread{[&metrics_worker] { (*metrics_worker)(); }}; }
+    if (metrics_worker) { metrics_thread = std::thread{[&metrics_worker] { set_thread_name("metrics"); (*metrics_worker)(); }}; }
 
     // Render on the main thread; it returns once the keyboard (Esc / Ctrl+C / EOF)
     // or a /quit command ends it.

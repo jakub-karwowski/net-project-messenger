@@ -2,6 +2,8 @@
 
 #include "PeerThreadIo.hpp"
 
+#include "ThreadName.hpp"
+
 #include <chrono>
 #include <exception>
 #include <limits>
@@ -47,7 +49,7 @@ PeerThreadIo::PeerThreadIo(const NetConfig& net, ThreadQueue<Event>& store_queue
       max_tx_buffer_bytes_(max_tx_buffer_bytes),
       watchdog_(net.max_peers, WatchdogWorker::kDefaultScanInterval, kNoStallDetection, logger) {
     watchdog_.set_metrics(net_.metrics);
-    watchdog_thread_ = std::thread{[this] { watchdog_(); }};
+    watchdog_thread_ = std::thread{[this] { set_thread_name("watchdog"); watchdog_(); }};
 }
 
 PeerThreadIo::~PeerThreadIo() {
@@ -103,7 +105,10 @@ std::shared_ptr<PeerThreadIo::Link> PeerThreadIo::attach(TcpConnection&& connect
 
     std::thread owner;
     try {
-        owner = std::thread{[this, link] { owner_loop(link); }};
+        owner = std::thread{[this, link] {
+            set_thread_name("pt", static_cast<std::uint64_t>(link->handle));
+            owner_loop(link);
+        }};
     } catch (const std::exception&) {
         live_dec(net_.metrics);
         std::lock_guard lock(registry_mutex_);

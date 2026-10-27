@@ -17,6 +17,7 @@
 #include "Logger.hpp"
 #include "Metrics.hpp"
 #include "OutboundTransport.hpp"
+#include "ThreadName.hpp"
 
 #include <array>
 #include <atomic>
@@ -45,7 +46,7 @@ public:
         : pool_(options.max_connections, options.idle_timeout, options.max_tx_buffer_bytes),
           logger_(std::move(logger)),
           metrics_(options.metrics),
-          pump_([this] { pump(); }) {}
+          pump_([this] { set_thread_name("pump"); pump(); }) {}
 
     ~PoolOutbound() override { stop(); }
 

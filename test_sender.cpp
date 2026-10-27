@@ -23,6 +23,7 @@
 #include "Wire.hpp"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <functional>
@@ -819,7 +820,84 @@ void test_shutdown_sends_on_live_connection() {
     check(sender.shutdown_drops() == 0, "shutdown live: nothing dropped");
 }
 
+
+// A duplex peer that dialled us and advertised no listener (port 0, as stressgen
+// --duplex does) must never be dialled back. The sender used to check "no tx slot
+// and port 0" and then look the tx slot up AGAIN inside ensure_connection(); when
+// the I/O thread released the slot in between (the peer's socket closed), the
+// sender dialled 127.0.0.1:0, and a blocking connect() to port 0 hangs for the whole
+// SYN-retry budget (~130 s on Linux) -- the sender stopped answering handshakes and
+// the node could not quit (S4 churn=10 poll-split rep3). Here a racer thread
+// attaches and releases the tx slot as fast as it can while the sender works through
+// a backlog of echoes; the fake transport counts every dial (and refuses it at once,
+// so a regression fails the check instead of hanging the test).
+class FakeDuplexCountingTransport final : public OutboundTransport {
+public:
+    std::expected<Handle, SocketError> open(const std::string&, uint16_t port,
+                                            std::span<const std::byte>) override {
+        opens.fetch_add(1);
+        if (port == 0) { port_zero_opens.fetch_add(1); }
+        return std::unexpected(SocketError::ConnectionRefused);
+    }
+    std::expected<void, SocketError> send(Handle, std::span<const std::byte>) override {
+        sends.fetch_add(1);
+        return {};
+    }
+    void close(Handle) noexcept override {}
+    bool backpressure_is_drop() const noexcept override { return true; }
+    bool duplex() const noexcept override { return true; }
+
+    std::atomic<int> opens{0};
+    std::atomic<int> port_zero_opens{0};
+    std::atomic<int> sends{0};
+};
+
+void test_duplex_never_dials_port_zero_while_slot_flaps() {
+    constexpr uint64_t kPeerId = 51;
+    constexpr int kMessages = 50000;
+    ThreadQueue<Event> store_queue;
+    ThreadQueue<Event> sender_queue;
+    p2p::PeerTable peers;
+    peers.insert(kPeerId, {"127.0.0.1", 0}); // a duplex-only peer: nothing to dial
+    FakeDuplexCountingTransport transport;
+    p2p::SenderWorker sender{store_queue, sender_queue, peers, transport,
+                             LocalEndpoints{}, p2p::SenderWorker::kDefaultSendAttempts,
+                             std::chrono::milliseconds{0}};
+
+    for (int i = 0; i < kMessages; ++i) {
+        (void)sender_queue.emplace(EventMessage{kPeerId, 1, "echo"});
+    }
+    sender_queue.graceful_shutdown();
+
+    // Stands in for the I/O thread: a channel binds the slot (Connect) and its
+    // close releases it again, over and over.
+    std::atomic<bool> stop{false};
+    std::thread racer{[&] {
+        uint64_t connection_id = 1'000'000;
+        while (!stop.load(std::memory_order_relaxed)) {
+            ++connection_id;
+            (void)peers.attach_tx(kPeerId, p2p::ChannelRef{connection_id, 9});
+            (void)peers.release(kPeerId, connection_id);
+        }
+    }};
+    const auto start = std::chrono::steady_clock::now();
+    std::thread worker{std::ref(sender)};
+    worker.join();
+    stop.store(true);
+    racer.join();
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    check(transport.port_zero_opens.load() == 0,
+          "flapping slot: never dialled port 0 (dialled "
+              + std::to_string(transport.port_zero_opens.load()) + " times in "
+              + std::to_string(kMessages) + " messages, "
+              + std::to_string(transport.sends.load()) + " sent)");
+    check(transport.opens.load() == 0, "flapping slot: nothing dialled at all");
+    check(elapsed < std::chrono::seconds{20}, "flapping slot: bounded time");
+}
+
 int main() {
+    test_duplex_never_dials_port_zero_while_slot_flaps();
     test_shutdown_drops_without_dialing();
     test_shutdown_sends_on_live_connection();
     test_duplex_answers_on_tx_slot();
