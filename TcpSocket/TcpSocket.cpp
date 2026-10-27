@@ -252,6 +252,11 @@ std::expected<void, SocketError> TcpConnection::apply_options() noexcept {
 }
 
 std::expected<TcpConnection, SocketError> TcpConnection::connect(std::string_view server_address, unsigned port) noexcept {
+    // Port 0 is not a destination: Linux does not refuse such a connect(), the SYN
+    // just goes unanswered and the call blocks for the whole SYN-retry budget
+    // (~130 s with tcp_syn_retries=6). Fail fast instead (and reject what htons()
+    // would silently truncate).
+    if (port == 0 || port > 65535) { return std::unexpected(SocketError::InvalidAddress); }
     int client_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (client_fd < 0) { 
         return std::unexpected(get_last_socket_error()); 

@@ -471,10 +471,12 @@ struct SenderWorker {
 private:
     // Returns the cached outbound connection for `peer_id`, creating it from the
     // address in `peers_` on first use and sending a ConnectInfo that names the
-    // peer. Returns nullopt when the peer is unknown or the dial fails.
+    // peer. Returns nullopt when the peer is unknown, has no dialable address
+    // (port 0) or the dial fails.
     std::optional<OutboundTransport::Handle> ensure_connection(uint64_t peer_id);
     // Dials `ip:port`, sends `hello` as the first frame and caches the connection
-    // under `peer_id`. Returns nullopt (nothing left open) on any failure.
+    // under `peer_id`. Returns nullopt (nothing left open) on any failure, and
+    // without dialling for port 0.
     std::optional<OutboundTransport::Handle> open(uint64_t peer_id,
                                                   const std::string& ip,
                                                   uint16_t port,

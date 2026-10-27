@@ -99,6 +99,7 @@ class TcpConnection {
         std::expected<size_t, SocketError> send(std::span<const std::byte> source) noexcept;
         std::expected<size_t, SocketError> receive(std::span<std::byte> destination) noexcept;
     
+        // Blocking connect. Port 0 (or > 65535) fails at once with InvalidAddress.
         static std::expected<TcpConnection, SocketError> connect(std::string_view server_address, unsigned port) noexcept;
 
     protected:

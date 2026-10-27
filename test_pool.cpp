@@ -365,9 +365,29 @@ void run_all(const std::string& name) {
     test_close_unblocks<Pool>(name);
 }
 
+// connect() to port 0 must fail at once. Linux never refuses it: the SYN goes
+// unanswered and a plain blocking connect() hangs for the SYN-retry budget (~130 s),
+// which is how a dial-back to a duplex-only peer (advertised port 0) wedged the
+// sender. Run on a detached thread so a regression fails the check instead of
+// hanging the test binary.
+void test_connect_port_zero_fails_fast() {
+    auto done = std::make_shared<std::atomic<int>>(0); // 0 pending, 1 failed, 2 connected
+    std::thread{[done] {
+        auto connected = TcpConnection::connect("127.0.0.1", 0);
+        done->store(connected ? 2 : 1);
+    }}.detach();
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (done->load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(5ms);
+    }
+    check(done->load() == 1, "connect to port 0 fails within 2 s (state "
+                                 + std::to_string(done->load()) + ")");
+}
+
 } // namespace
 
 int main() {
+    test_connect_port_zero_fails_fast();
     run_all<TcpConnectionPool>("poll");
     run_all<EpollConnectionPool>("epoll");
 
