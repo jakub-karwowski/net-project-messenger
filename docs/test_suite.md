@@ -109,9 +109,18 @@ Rules that hold in both shapes:
   connection's tx buffer (1 MiB) is full. `backpressure_is_drop()` is true for
   these transports, so the sender **drops the message and counts it**, with no
   retry and no sleep.
-- A peer with no tx channel and no dialable address (port 0) is reported
-  unreachable immediately, without the retry sleeps. Duplex stressgen peers
-  advertise port 0.
+- **Port 0 means "never dial"** (see `Endpoint` in [Wire.hpp](../Wire.hpp)).
+  Duplex stressgen peers advertise it. A peer with no tx channel whose address is
+  port 0 is reported unreachable immediately, without the retry sleeps. The rule
+  is enforced in three places:
+  - **`ensure_connection()` decides, on the same tx-slot lookup that found the
+    slot empty.** A separate check made by the caller is stale, because the I/O
+    thread can release the slot at any moment. That stale check was the cause of
+    the S4 `poll-split` hang.
+  - **`SenderWorker::open()` refuses port 0.**
+  - **`TcpConnection::connect()` fails at once with `InvalidAddress`.** On Linux
+    a `connect()` to port 0 is not refused: it blocks for about 130 s, which
+    froze the sender thread and then `MainWorker`'s join at `/quit`.
 - **While quitting** (`SenderWorker::begin_shutdown()`, called by `MainWorker`
   before it shuts the sender queue down), nothing is dialled and nothing is
   retried:
@@ -297,8 +306,10 @@ on that one socket.
   with the same thread-per-peer scheduling ceiling; against `poll-duplex`, the
   cost of a thread per peer instead of a shared poller.
 - **Known, shared with every duplex mode:** after a duplex close, the next send
-  fails and the sender retries, and the retry may re-dial the peer. The
-  benchmarks mask it because duplex stressgen advertises port 0.
+  fails and the sender retries, and the retry may re-dial the peer. For port-0
+  peers, which is every duplex stressgen peer, the dial never happens (see the
+  port-0 rule in §1). A dial-back to a real but unresponsive address can still
+  block the sender in `connect()`. That is out of scope for now.
 
 ## 3. Threads: how each mode builds them
 
@@ -337,6 +348,30 @@ happens at runtime, and only `threads` and `pool-sender` do it.
      goes straight to the watchdog through `adopt()`, so the watchdog owns it,
      joins it when it finishes, and shuts down the least recently active readers
      when there are more than `--max-peers`.
+
+### Thread names
+
+Every node thread is named with `p2p::set_thread_name`
+([ThreadName.hpp](../ThreadName.hpp), truncated to 15 characters), so
+`/proc/<pid>/task/*/comm` and the harness's hang dump (`rep<N>.hang.txt`) show
+which thread is stuck:
+
+| Name | Thread |
+|---|---|
+| `main` | main thread |
+| `logger` | logger |
+| `store` | store |
+| `sender` | sender |
+| `keyboard` | keyboard |
+| `stdin` | headless stdin reader |
+| `listener` | accept loop |
+| `metrics` | metrics |
+| `io` | `MultiplexedIo` I/O thread |
+| `tx` | split modes' tx thread |
+| `pump` | `PoolOutbound` pump |
+| `watchdog` | watchdog |
+| `rd-<n>` | reader threads |
+| `pt-<handle>` | `peer-threads` owner threads |
 
 ### Per mode
 
@@ -1104,8 +1139,19 @@ checks, not results.
 - `test_terminal.cpp` hasn't compiled since commit `0998ebb`
   ("TerminalUI header cleanup"): `Renderable::DrawCommand` no longer exists.
   It isn't registered with ctest, but it makes a plain build fail, hence `-- -k`.
-- Under a parallel `ctest -j`, `test_pool_outbound`, `test_stressgen` and
-  `e2e_epoll-split` have each failed once and then passed every rerun. These are
-  timing-sensitive under load; root cause not yet found.
+- **Test flakiness under parallel load: two causes fixed, a remainder
+  accepted.**
+  - Test ports used to collide between binaries running at once:
+    `test_pool_outbound` shared fixed ports with `test_p2p`, and random-port
+    tests could draw a port another process held, which made
+    `test_multiplexed` abort.
+  - Fixed tests now use a distinct range. Random-port tests use
+    [TestPorts.hpp](../TestPorts.hpp), which draws again on a collision and waits
+    for the listener's ready callback instead of sleeping.
+  - A normal `ctest -j8` passes 26/26.
+  - Running 6–8 copies of the network-heavy test binaries at once still fails
+    about 2% of runs. These are fixed deadlines in two-node checks expiring
+    under that artificial load. Accepted, because removing them would add
+    disproportionate test machinery.
 - Nothing tests `stressgen --duplex` against a two-connection node (expected
   exit 3). The fixture for it hung on teardown.

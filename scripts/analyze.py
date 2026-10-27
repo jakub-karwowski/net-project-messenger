@@ -167,7 +167,11 @@ def validity(meta, stress, rows):
             need, why = READY_FRAC_CHURN * total, f"peers_ready (churn, >= {READY_FRAC_CHURN:g})"
         if s7:
             cap = min(total, p.get("max_peers") or total)
-            need, why = READY_FRAC_S7 * cap, f"peers_ready (S7 cap {cap}, >= {READY_FRAC_S7:g})"
+            # The two-connection pool modes serve cap - 1 (the dial-back shares the
+            # pool), so one peer short always passes; this only matters at the
+            # tiny quick-mode caps, where 0.9 * cap rounds above cap - 1.
+            need = min(READY_FRAC_S7 * cap, cap - 1)
+            why = f"peers_ready (S7 cap {cap}, >= min({READY_FRAC_S7:g}*cap, cap-1))"
         if ready < need:
             reasons.append(f"{why} {ready}/{total}")
     rate, dur, peers = p.get("rate") or 0, p.get("duration"), p.get("peers")

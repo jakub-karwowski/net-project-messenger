@@ -1,6 +1,30 @@
 
 # Benchmark harness correctness report
 
+> **Status of the findings at `23f4335` (2026-10-27).** The report below reviews
+> `fca6b9e`, and its line links point at that version's code. Since then:
+>
+> | Finding | Status | Where |
+> |---|---|---|
+> | F1, collapsed or partial cells counted as `ok` | **fixed**: per-cell validity gate; failing cells are `degraded` and excluded from medians | `8756f4e` (`analyze.validity`) |
+> | F1b, a hung node kept as `dirty` data | **fixed**: the stall check in the gate, plus a hang dump before kill. **The node bug itself is fixed too**: the port-0 race in the sender | `8756f4e`, `77f6be1` |
+> | F2, S6a at 50 ms RTT measures the blocking sender | **addressed in the experiment**: RTT points 30 and 40 ms, S6c at half the churn, `sender_q_hwm` charted; collapsed cells are flagged by the gate | `8756f4e` |
+> | F3, S3 slow peers not like-for-like | **fixed**: `--slow-rcvbuf` (4 KiB), `slow_unread_bytes`, a backpressure self-test | `2bb579b` |
+> | F4, builds mixed silently | **fixed**: a resume guard (`--force-mixed`) and a build census and banner in the report | `8756f4e` |
+> | F5, node exit code ignored | **fixed**: `node_rc`, a real `bye` required | `8756f4e` |
+> | F6, window anchored to the first frame | **fixed**: stressgen exports its window on the node's clock; the analysis uses it | `2bb579b`, `8756f4e` |
+> | F7, `lost` clamped | **fixed**: `received_raw`, `duplicates` | `2bb579b` |
+> | F9, netem drops not measured | **fixed**: `netem_stats` per S6 cell; counters reset between cells | `8756f4e` |
+> | F10, shuffle not reproducible | **fixed**: seeded per cell; the order is recorded | `8756f4e` |
+> | F11, handshake survivorship and stale-Ack race | **fixed**: `handshake_failures`; stale Acks ignored | `2bb579b` |
+> | F12, generator cost not recorded | **fixed**: `gen_cpu`, `sched_lag_max_us` | `2bb579b` |
+> | F8, offered load depends on the system under test during churn | open (interpretation) | — |
+> | F13, cosmetic | partly (churn no longer resets slow peers) | `2bb579b` |
+>
+> Missing tests added: a histogram quantile bound, a partial ramp, slow-peer
+> backpressure and duplicates (`2bb579b`); `load()`, `aggregate()` and the
+> report writers (`8756f4e`).
+
 Commit under review: `fca6b9e` (branch `io-variants`). The system under test is the **measurement harness**, not the chat node. That means the load generator (`stressgen`), the WAN lab (`scripts/netlab.py` and the S6 parts of `run_matrix.py`), and the runner and analysis scripts (`run_matrix.py`, `analyze.py`).
 
 ## 0. Scope and method

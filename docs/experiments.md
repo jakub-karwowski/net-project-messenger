@@ -62,6 +62,24 @@ a slope.
 cells**, about 25–30 s each, so about **6.5–7 hours**. (Before the S6a
 extension it was 29 values, 783 cells.)
 
+**Status (2026-10-27): ready for the full rerun at `23f4335`.**
+
+- **The smoke run passed:** `results-smoke-23f4335`, 153 cells over every
+  scenario and all 9 variants. Every cell is `ok` and valid, from one clean
+  Release build, with no hang dumps and every node exit code 0. One S7 cell was
+  initially flagged at quick mode's cap of 8, for serving 7 of 8 peers; see the S7
+  rule in §5.
+- **What the rerun has to replace.** Everything changed since `results-9ba50b3`
+  and `results-fca6b9e`:
+  - **the node sender**, by the port-0 race fix, which matters for duplex churn
+    cells: S4, S6a, S6c;
+  - **stressgen**, by the slow-peer receive buffer (S3), counting unique echoes,
+    and the handshake statistics;
+  - **the analysis**, by the window bounds and the validity gates;
+  - **the matrix itself**, by `peer-threads`, S6a at 30 and 40 ms, and S6c.
+
+  Those directories stay valid only as records of their own builds.
+
 Three repetitions, not the script's default of 5, keeps the run to one sitting.
 The report gives the median and IQR, which are meaningful with 3, and the
 earlier runs showed small spread between repetitions for everything except
@@ -131,7 +149,12 @@ S1 and most of S2) already showed. Everything else is a prediction.
   large in S3. This tests the premise of S6b: if queueing is common already on
   loopback, S6b's point becomes "the bottleneck makes queueing the normal case",
   not "loopback hides it".
-- **Look at:** RTT p99/p99.9, backpressure drops, `tx_queued_sends`, lost.
+- **Slow peers now have a 4 KiB receive buffer** (`--slow-rcvbuf`, from
+  `07082c3`), so they create backpressure the same way in both shapes. Before
+  that, duplex slow peers never made the node queue (`tx_queued_sends` was 0 in
+  `results-9ba50b3`), so S3 from older runs isn't like-for-like across shapes.
+- **Look at:** RTT p99/p99.9, backpressure drops, `tx_queued_sends`,
+  `slow_unread_bytes`, lost.
 
 ### S4: churn
 
@@ -142,6 +165,15 @@ S1 and most of S2) already showed. Everything else is a prediction.
   reconnect.** Expect higher CPU and more context switches as churn grows.
 - **Look at:** `handshake_p50/p99` (new with S6), churn events, connect
   failures, throughput, CPU %, `accepts`.
+- **Seen in `results-9ba50b3`: a node bug, fixed in `77f6be1`.** One `poll-split`
+  cell at churn 10 stalled.
+  - **What happened:** the sender raced the I/O thread on the tx slot and
+    dialled a churned duplex peer at port 0. That `connect()` blocks for about
+    130 s, so no further ConnectAcks went out (`peers_ready` 0) and the node
+    hung at `/quit`.
+  - **Scope:** any duplex mode could hit it, about 1 in 20 runs at churn 50.
+    Duplex churn cells from before `23f4335` may therefore contain stalls; the
+    validity gate now flags them.
 
 ### S5: throughput ceiling
 
@@ -266,8 +298,11 @@ S1 and most of S2) already showed. Everything else is a prediction.
   cell is listed under Problems with its reasons and **excluded from medians
   and IQR**; `summary.csv` has `reps` and `reps_valid`. The checks
   (`analyze.validity`, thresholds are constants at the top of `analyze.py`):
-  - `peers_ready == peers_total`; with churn at least 90 %; in S7 at least 90 %
-    of `min(peers, max_peers)`.
+  - `peers_ready == peers_total`; with churn at least 90 %.
+  - In S7, at least `min(0.9 × cap, cap − 1)`, where cap = `min(peers, max_peers)`.
+    The two-connection pool modes serve cap − 1, because the dial-back shares
+    the pool. One peer short therefore always passes, which matters only at
+    quick mode's tiny caps.
   - Open-loop cells (rate > 0, not S7, no churn): `sent` ≥ 98 % of
     peers × rate × duration.
   - `connect_failures == 0` (not in S7, where the cap refuses connections),

@@ -114,6 +114,12 @@ constexpr std::string_view to_string(WireError err) noexcept {
 // An address a peer can be reached at. `address` is a textual IPv4 address
 // (dotted quad, e.g. "127.0.0.1") so it feeds straight into TcpListener /
 // TcpConnection::connect without extra conversion.
+//
+// Port 0 means "this side accepts no connections: never dial it". Port 0 is
+// reserved and can never be connected to, so it is the natural sentinel; a duplex
+// peer that only dials (stressgen --duplex) advertises it. Receivers must not dial
+// it: on Linux a connect() to port 0 is not refused but blocks for the whole SYN
+// retry budget (~130 s). TcpConnection::connect() rejects port 0 up front.
 struct Endpoint {
     std::string address;
     std::uint16_t port = 0;

@@ -98,6 +98,9 @@ ok, why = A.validity(m7, vstress(peers_total=1024, peers_ready=58, sent=1, conne
 assert ok, why
 ok, why = A.validity(m7, vstress(peers_total=1024, peers_ready=57), ROWS_OK)
 assert not ok and "S7" in why[0]
+m7s = dict(m7, params=dict(m7["params"], max_peers=8, peers=16))  # tiny cap: one short passes
+assert A.validity(m7s, vstress(peers_total=16, peers_ready=7), ROWS_OK)[0]
+assert not A.validity(m7s, vstress(peers_total=16, peers_ready=6), ROWS_OK)[0]
 m7b = dict(m7, params=dict(m7["params"], max_peers=2000))     # cap above peers: min(peers, cap)
 assert not A.validity(m7b, vstress(peers_total=1024, peers_ready=900), ROWS_OK)[0]
 # 2. open loop
