@@ -11,12 +11,30 @@ Topology (all addresses /24, MTU 1500, TSO/GSO/GRO off so netem sees real packet
 setup() is called once; configure_netem() is called per cell. The `ip netns`
 registry needs a writable /run, hence the private tmpfs mounted on it.
 """
-import subprocess
+import re, subprocess
 
 NS = "ns_p2p_gen"
 NODE_DEV, GEN_DEV = "veth-node", "veth-gen"
 NODE_IP, GEN_IP = "10.200.1.1", "10.200.1.2"
 MTU = 1500
+
+
+def parse_tc_stats(text):
+    """Parse `tc -s qdisc show dev X` text -> dict(kind, sent_bytes, sent_pkts, dropped,
+    overlimits, requeues, backlog_bytes, backlog_pkts); missing pieces are None.
+    The counters are those of the root qdisc (the first block)."""
+    out = dict(kind=None, sent_bytes=None, sent_pkts=None, dropped=None, overlimits=None,
+               requeues=None, backlog_bytes=None, backlog_pkts=None)
+    m = re.search(r"^qdisc (\S+)", text, re.M)
+    if m:
+        out["kind"] = m.group(1)
+    m = re.search(r"Sent (\d+) bytes (\d+) pkt \(dropped (\d+), overlimits (\d+) requeues (\d+)\)", text)
+    if m:
+        out.update(zip(("sent_bytes", "sent_pkts", "dropped", "overlimits", "requeues"), map(int, m.groups())))
+    m = re.search(r"backlog (\d+)b (\d+)p", text)
+    if m:
+        out["backlog_bytes"], out["backlog_pkts"] = int(m.group(1)), int(m.group(2))
+    return out
 
 
 class NetLabError(RuntimeError):
@@ -59,9 +77,10 @@ class NetLab:
         return self.info()
 
     def _tc(self, dev, pre, args):
-        if args is None:   # back to the default qdisc
-            _run(pre + ["tc", "qdisc", "del", "dev", dev, "root"], check=False)
-        else:
+        # Always delete first: `replace` on an existing netem keeps its counters, and
+        # the per-cell drop statistics (qdisc_stats) must start from zero.
+        _run(pre + ["tc", "qdisc", "del", "dev", dev, "root"], check=False)
+        if args is not None:
             _run(pre + ["tc", "qdisc", "replace", "dev", dev, "root", "netem"] + args)
 
     def configure_netem(self, node_delay_ms, gen_delay_ms, node_rate_mbit=None, limit_pkts=None):
@@ -84,6 +103,19 @@ class NetLab:
     def show_qdiscs(self):
         return {NODE_DEV: _run(["tc", "qdisc", "show", "dev", NODE_DEV]).stdout.strip(),
                 GEN_DEV: _run(in_gen(["tc", "qdisc", "show", "dev", GEN_DEV])).stdout.strip()}
+
+    def qdisc_stats(self):
+        """`tc -s qdisc show` of both ends, parsed (parse_tc_stats) plus the raw text.
+        Call after a cell and before the next configure_netem (which resets them).
+        A failure is returned as {"error": ...} per end instead of raising."""
+        out = {}
+        for dev, pre in ((NODE_DEV, []), (GEN_DEV, in_gen([]))):
+            r = _run(pre + ["tc", "-s", "qdisc", "show", "dev", dev], check=False)
+            if r.returncode != 0:
+                out[dev] = dict(error=(r.stderr or r.stdout).strip())
+            else:
+                out[dev] = dict(parse_tc_stats(r.stdout), raw=r.stdout.strip())
+        return out
 
     def info(self):
         return dict(namespace=NS, node=f"{NODE_DEV} {NODE_IP}/24", gen=f"{GEN_DEV} {GEN_IP}/24",

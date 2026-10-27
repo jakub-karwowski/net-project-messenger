@@ -736,14 +736,33 @@ five files under `results/<scenario>/<param>=<value>/<variant>/`:
   node with `--metrics`).
 - `rep<N>.node.log` and `rep<N>.stressgen.txt`: logs and stdout.
 - `rep<N>.meta.json`: parameters, timings, and a status of `ok`, `dirty` (the
-  node didn't say `bye` and exit within `--quit-timeout`, default 30 s) or
-  `failed`. It also records:
-  - `shutdown_s`: time from `/quit` to exit (or to the kill), plus `bye` and
-    `killed`;
+  node didn't say `bye` and exit with status 0 within `--quit-timeout`, default
+  30 s) or `failed`. (`degraded` is not written by the runner: it is a
+  status `analyze.py` derives from `validity`, see below.) It also records:
+  - `shutdown_s`: time from `/quit` to exit (or to the kill), plus `bye` (a bye
+    event was actually parsed; EOF doesn't count), `killed` and `node_rc` (the
+    node's exit status; -9 after a kill). A crash or non-zero exit makes the
+    cell dirty;
+  - `hang_dump`: true when the node had to be killed; `rep<N>.hang.txt` then
+    holds, for every `/proc/<pid>/task/<tid>`, comm, state, wchan, syscall,
+    stat and (if readable, usually only as root) the kernel stack;
+  - `validity`: `{ok, reasons}` from `analyze.validity` (rules in
+    `docs/experiments.md` §5);
+  - `order_index` and `variant_order`: the position of this cell in the seeded
+    shuffle of variants for its (scenario, value, rep). The shuffle is seeded
+    from (`--seed`, default 1, scenario, value, rep), so it's reproducible;
+  - for S6: `netem_stats`, `tc -s qdisc show` of both ends taken after the cell
+    (dropped, overlimits, requeues, sent, backlog; counters start at zero
+    because each cell recreates the qdiscs);
   - `build`: git commit, branch, uncommitted files, a hash of the harness, and
-    the sha256, size and mtime of `app` and `stressgen`, hashed for every cell.
+    the sha256, size, mtime and build type of `app` and `stressgen`, hashed for
+    every cell. Before writing into a non-empty `--out`, `run_matrix.py`
+    compares the stamps already there (commit, dirty, app and stressgen sha256,
+    app build type) with the current ones and refuses on any difference unless
+    `--force-mixed` is given.
 
-  Cells written before these fields existed don't have them.
+  Cells written before these fields existed don't have them; `analyze.py`
+  works on them with the fields it has.
 
 The node runs pinned to CPUs 0–1 and stressgen to 4–7, so they don't compete for
 cores.
@@ -756,17 +775,33 @@ cores.
 | CPU % of one core | metrics.jsonl | Δ(utime + stime) / Δwall, over the measurement window |
 | Voluntary and involuntary ctx switches per second | metrics.jsonl | Δnvcsw/Δt and Δnivcsw/Δt over the same window |
 | Peak RSS, peak threads, peak fds | metrics.jsonl | maximum over all samples |
-| Backpressure drops, evictions | metrics.jsonl | value in the last sample |
+| Backpressure drops, evictions, `sender_q_hwm` | metrics.jsonl | value in the last sample |
+| Duplicates, handshake failures, unread bytes at slow peers | stress.json | taken directly (absent in old results) |
+| Generator CPU % | stress.json `gen_cpu` | (utime + stime) / window length |
+| netem drops | meta.json `netem_stats` | dropped, summed over both ends (S6) |
 
-The **measurement window** for the node-side rates runs from `warmup` seconds
-after `frames_in` first starts growing to the last sample where it grew. Startup
-and shutdown are therefore left out without needing the two processes' clocks to
-match.
+The **measurement window** for the node-side rates uses the bounds stressgen
+reports (`window_start_mono_ns`, `window_end_mono_ns`; `CLOCK_MONOTONIC`, the
+same clock as the node's `t_ns`): the first sample at or after the start to the
+last sample at or before the end. Results without the bounds fall back to a
+heuristic: from `warmup` seconds after `frames_in` first starts growing to the
+last sample where it grew. `summary.csv` has a `window_method` column (`mono`,
+`frames_in` or `mixed`).
+
+**Validity.** `analyze.py` checks every cell (`analyze.validity`; the rules are
+in `docs/experiments.md` §5). A cell that was `ok` or `dirty` but fails is
+`degraded`: listed under Problems with its reasons and left out of the medians
+and IQR. `summary.csv` keeps `reps` and adds `reps_valid`. A `dirty` cell that
+passes stays in and is listed. The report also has a "Build" section (distinct
+build stamps with cell counts) and a red banner if more than one build is
+present.
 
 Repetitions are reduced to the **median and IQR (Q1–Q3)**. The results go to
 `summary.csv` (columns `<metric>_median`, `<metric>_q1`, `<metric>_q3`) and
-`report.html`, which has charts and a "Problems" list for failed, dirty or
-corrupt cells.
+`report.html`, which has charts and a "Problems" list for failed, dirty,
+degraded or corrupt cells. Charts per scenario: S3 adds unread bytes at slow
+peers and queued sends; S6a/S6c add `sender_q_hwm`; S6b adds netem drops;
+duplicates, handshake failures and generator CPU appear when non-zero.
 
 ### Limitations
 
@@ -981,7 +1016,10 @@ Exit codes: 0 ok, 2 unreachable, 3 no peer completed the handshake.
 
 - **Pinning:** the node runs on CPUs 0–1 and stressgen on 4–7.
 - **Resumable:** cells already marked `ok` or `dirty` are skipped on re-run.
-- **Order:** variant order is shuffled each round.
+- **Order:** variant order is shuffled each round, seeded from `--seed`,
+  scenario, value and rep (recorded in `meta.json`).
+- **Guards:** refuses a non-Release build and a `--out` holding cells from a
+  different build (`--force-mixed` overrides the latter).
 - **Flags:** it passes `--duplex` to stressgen for `*-duplex`/`*-split` and
   starts every node with `--backlog=4096`.
 
@@ -993,7 +1031,8 @@ Exit codes: 0 ok, 2 unreachable, 3 no peer completed the handshake.
 | S4 churn | peers that disconnect and redial | 0, 10, 50 |
 | S5 throughput ceiling | message size (bytes) | 32, 4096, 65536 |
 | S7 capped fan-in | the node's `--max-peers` (1024 peers × 100 msg/s) | 64, 128, 256, 1040 (1040 = uncapped, as in S1) |
-| S6a WAN churn | link RTT `rtt_ms` (netem delay RTT/2 per end, no rate) | 0, 4, 20, 50 (quick: 0, 20); 32 peers, 100 msg/s, 256 B, `--churn 16` (16 reconnects/s in total) |
+| S6a WAN churn | link RTT `rtt_ms` (netem delay RTT/2 per end, no rate) | 0, 4, 20, 30, 40, 50 (quick: 0, 20); 32 peers, 100 msg/s, 256 B, `--churn 16` (16 reconnects/s in total) |
+| S6c WAN churn, half rate | link RTT `rtt_ms`, as S6a | 50 (quick: 50); as S6a but `--churn 8` |
 | S6b WAN bottleneck | `rate_mbit` on node→generator only (RTT 4 ms, netem `limit` about 2×BDP, at least 100 packets) | 1000, 200, 50 (quick: 1000, 100); 32 peers, closed loop (`--rate 0 --window 8`), 16 KiB |
 
 `rtt_ms` and `rate_mbit` feed only the network setup, never stressgen. S6a tests
@@ -1019,7 +1058,9 @@ pair, and shapes it per cell:
   applies to `veth-node` egress only, because a symmetric rate would also slow
   the generator→node direction and the node's tx buffers would barely fill.
 - Each S6 `meta.json` records `netem` (the parameters), `qdiscs` (`tc qdisc show`
-  of both ends) and `netlab` (including warnings). Everything disappears when the
+  of both ends), `netlab` (including warnings) and, after the cell, `netem_stats`
+  (`tc -s qdisc show`; the qdiscs are deleted and recreated per cell so counters
+  start at zero). Everything disappears when the
   child exits: no global interface names, no cleanup.
 
 ```

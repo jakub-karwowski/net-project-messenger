@@ -5,6 +5,10 @@ usage: analyze.py [results_dir]        (default: results)
 Cells are grouped by (scenario, param, variant); each metric is reduced to
 median and IQR (Q1..Q3) across reps. Missing/failed/dirty cells are listed in
 the report instead of being silently dropped.
+
+Validity: every cell is checked post hoc (validity()); a cell that was ok/dirty
+but fails the checks is `degraded`: listed under Problems with its reasons and
+excluded from the medians/IQR (summary.csv keeps `reps` and adds `reps_valid`).
 """
 import csv, html, json, math, sys
 from pathlib import Path
@@ -47,15 +51,30 @@ METRICS = [
     ("tx_queued_sends", "Sends that queued bytes", "sends", True),
     ("tx_flushes", "Flushes on writability", "flushes", True),
     ("accepts", "Accepts", "conns", False),
+    ("duplicates", "Duplicate echoes (received > sent)", "msgs", False),
+    ("handshake_failures", "Handshake failures", "conns", False),
+    ("slow_unread_bytes", "Unread bytes at slow peers", "bytes", True),
+    ("gen_cpu_pct", "Generator CPU (utime+stime)", "% of one core", False),
+    ("sender_q_hwm", "Sender queue high-water mark", "items", False),
+    ("netem_drops", "netem drops (both ends)", "pkts", False),
 ]
 CHART_KEYS = ["msgs_per_s", "rtt_p50", "rtt_p99", "rtt_p999", "cpu_pct", "nvcsw_rate",
               "maxrss_kb", "threads", "fds"]
 # Per-scenario chart lists override CHART_KEYS (S6 looks at different things).
 SCENARIO_CHARTS = {
     "S7": ["msgs_per_s", "rtt_p50", "rtt_p99", "peers_ready", "evictions", "cpu_pct", "threads"],
-    "S6a": ["handshake_p50", "handshake_p99", "msgs_per_s", "rtt_p99"],
-    "S6b": ["msgs_per_s", "rtt_p50", "rtt_p99", "rtt_p999", "tx_queued_sends", "cpu_pct", "nvcsw_rate"],
+    "S6a": ["handshake_p50", "handshake_p99", "msgs_per_s", "rtt_p99", "sender_q_hwm"],
+    "S3": CHART_KEYS + ["slow_unread_bytes", "tx_queued_sends"],
+    "S6b": ["msgs_per_s", "rtt_p50", "rtt_p99", "rtt_p999", "tx_queued_sends", "cpu_pct", "nvcsw_rate", "netem_drops"],
 }
+SCENARIO_CHARTS["S6c"] = SCENARIO_CHARTS["S6a"]
+
+# --- Validity thresholds (see validity()) -------------------------------------
+READY_FRAC_CHURN = 0.9     # churn cells: peers_ready >= this * peers_total (peers are mid-redial at the end)
+READY_FRAC_S7 = 0.9        # S7: peers_ready >= this * min(peers, max_peers) (the cap evicts the rest by design)
+SENT_FRAC_OPEN_LOOP = 0.98 # open-loop cells: sent >= this * peers * rate * duration
+STALL_MARGIN_S = 3.0       # node frames_in must still grow within this of the generator window end (same clock)
+STALL_MARGIN_WALL_S = 5.0  # looser margin when the end had to be mapped through wall clock (~1 s error)
 
 
 # --- Stats helpers ----------------------------------------------------------
@@ -90,9 +109,24 @@ def read_jsonl(path):
     return rows
 
 
+def metrics_window_m(rows, warmup, st=None):
+    """-> ((start, end) sample indices or None, method). With stressgen's monotonic
+    window bounds (same clock as the node's t_ns): first sample at/after the start
+    and last sample at/before the end. Otherwise (old results) the frames_in
+    heuristic of metrics_window()."""
+    if st:
+        ws, we = st.get("window_start_mono_ns"), st.get("window_end_mono_ns")
+        if isinstance(ws, int) and isinstance(we, int) and we > ws:
+            idx = [i for i, r in enumerate(rows) if ws <= r.get("t_ns", -1) <= we]
+            if len(idx) >= 2:
+                return (idx[0], idx[-1]), "mono"
+    return metrics_window(rows, warmup), "frames_in"
+
+
 def metrics_window(rows, warmup):
     """(start, end) sample indices of the measurement window: from `warmup`
-    seconds after the first frames_in growth to the last growth."""
+    seconds after the first frames_in growth to the last growth (fallback for
+    results without stressgen's window bounds)."""
     grow = [i for i in range(1, len(rows)) if rows[i].get("frames_in", 0) > rows[i - 1].get("frames_in", 0)]
     if not grow:
         return None
@@ -103,8 +137,72 @@ def metrics_window(rows, warmup):
     return (s, e) if e > s else None
 
 
+def validity(meta, stress, rows):
+    """-> (ok, reasons). Post-hoc validity of one cell; thresholds are the module
+    constants above. A failed cell is `degraded` (excluded from medians).
+    Rules:
+      1. ready: peers_ready == peers_total. Exceptions: churn>0 needs >=
+         READY_FRAC_CHURN*total; S7 (explicit max_peers) needs >= READY_FRAC_S7 *
+         min(peers, max_peers). (Both given: the lower bar.)
+      2. open loop (rate>0, not S7, churn==0): sent >= SENT_FRAC_OPEN_LOOP *
+         peers*rate*duration (a collapsed or partly ramped generator).
+      3. connect_failures == 0 (not for S7: the cap refuses connections by
+         design), bad_frames == 0, send_skipped == 0.
+      4. no stall: the node's frames_in grew within STALL_MARGIN_S of the
+         generator's window end. With window_end_mono_ns the clocks match. Without
+         it (old results) end_unix_ns is mapped onto the metrics clock through
+         meta.t_start (wall) ~= first metrics sample, an error of about 1 s, so
+         STALL_MARGIN_WALL_S is used.
+    Missing fields are skipped, so old results are judged on what they have."""
+    if not stress:
+        return True, []
+    reasons = []
+    p = meta.get("params", {}) or {}
+    s7 = meta.get("scenario") == "S7" or bool(p.get("max_peers"))
+    churn = p.get("churn", 0) or 0
+    total, ready = stress.get("peers_total"), stress.get("peers_ready")
+    if total is not None and ready is not None:
+        need, why = total, "peers_ready"
+        if churn > 0:
+            need, why = READY_FRAC_CHURN * total, f"peers_ready (churn, >= {READY_FRAC_CHURN:g})"
+        if s7:
+            cap = min(total, p.get("max_peers") or total)
+            need, why = READY_FRAC_S7 * cap, f"peers_ready (S7 cap {cap}, >= {READY_FRAC_S7:g})"
+        if ready < need:
+            reasons.append(f"{why} {ready}/{total}")
+    rate, dur, peers = p.get("rate") or 0, p.get("duration"), p.get("peers")
+    if rate > 0 and not s7 and not churn and dur and peers and "sent" in stress:
+        want = peers * rate * dur
+        if stress["sent"] < SENT_FRAC_OPEN_LOOP * want:
+            reasons.append(f"sent {stress['sent']} < {SENT_FRAC_OPEN_LOOP:g} * offered {want:g}")
+    if not s7 and (stress.get("connect_failures") or 0) > 0:
+        reasons.append(f"connect_failures={stress['connect_failures']}")
+    for k in ("bad_frames", "send_skipped"):
+        if (stress.get(k) or 0) > 0:
+            reasons.append(f"{k}={stress[k]}")
+    if rows and len(rows) >= 2:
+        end_ns, margin = stress.get("window_end_mono_ns"), STALL_MARGIN_S
+        if not isinstance(end_ns, int):
+            eu = stress.get("end_unix_ns")
+            if isinstance(eu, int) and eu > 0 and meta.get("t_start") and "t_ns" in rows[0]:
+                end_ns = rows[0]["t_ns"] + (eu / 1e9 - meta["t_start"]) * 1e9
+                margin = STALL_MARGIN_WALL_S
+            else:
+                end_ns = None
+        if end_ns is not None:
+            grow = [rows[i]["t_ns"] for i in range(1, len(rows))
+                    if rows[i].get("frames_in", 0) > rows[i - 1].get("frames_in", 0) and "t_ns" in rows[i]]
+            if not grow:
+                reasons.append("node frames_in never grew")
+            elif (end_ns - grow[-1]) / 1e9 > margin:
+                reasons.append(f"node stalled: frames_in stopped growing {(end_ns - grow[-1]) / 1e9:.1f}s "
+                               f"before the generator window end (margin {margin:g}s)")
+    return not reasons, reasons
+
+
 def cell_metrics(cell_dir, rep, meta):
-    """Derive per-rep scalar metrics. Raises ValueError with a clear message."""
+    """Derive per-rep scalar metrics. Raises ValueError with a clear message.
+    Also sets out["valid"] / out["reasons"] (validity()) and out["window_method"]."""
     sp = cell_dir / f"rep{rep}.stress.json"
     mp = cell_dir / f"rep{rep}.metrics.jsonl"
     if not sp.exists():
@@ -116,13 +214,16 @@ def cell_metrics(cell_dir, rep, meta):
     out.update(handshake_p50=hs["p50"] if hs else None, handshake_p99=hs["p99"] if hs else None,
                connect_failures=st.get("connect_failures"), churn_events=st.get("churn_events"),
                peers_ready=st.get("peers_ready"), disconnects=st.get("disconnects"),
-               send_skipped=st.get("send_skipped"))
+               send_skipped=st.get("send_skipped"), duplicates=st.get("duplicates"),
+               handshake_failures=st.get("handshake_failures"),
+               slow_unread_bytes=st.get("slow_unread_bytes"))
     if not mp.exists():
         raise ValueError("missing metrics.jsonl")
     rows = read_jsonl(mp)
     if len(rows) < 2:
         raise ValueError("metrics.jsonl has <2 samples")
-    w = metrics_window(rows, meta.get("params", {}).get("warmup", 0))
+    w, method = metrics_window_m(rows, meta.get("params", {}).get("warmup", 0), st)
+    out["window_method"] = method
     if w:
         a, b = rows[w[0]], rows[w[1]]
         wall = (b["t_ns"] - a["t_ns"]) / 1e9
@@ -131,6 +232,14 @@ def cell_metrics(cell_dir, rep, meta):
         out["nivcsw_rate"] = (b["nivcsw"] - a["nivcsw"]) / wall
     else:
         out.update(cpu_pct=None, nvcsw_rate=None, nivcsw_rate=None)
+    gc = st.get("gen_cpu")
+    out["gen_cpu_pct"] = None
+    if gc:
+        ws, we = st.get("window_start_mono_ns"), st.get("window_end_mono_ns")
+        secs = (we - ws) / 1e9 if isinstance(ws, int) and isinstance(we, int) and we > ws \
+            else st.get("config", {}).get("duration")
+        if secs:
+            out["gen_cpu_pct"] = 100.0 * (gc.get("utime_us", 0) + gc.get("stime_us", 0)) / 1e6 / secs
     out["maxrss_kb"] = max(r.get("maxrss_kb", 0) for r in rows)
     out["threads"] = max(r.get("threads", 0) for r in rows)
     out["fds"] = max(r.get("fds", 0) for r in rows)
@@ -139,12 +248,35 @@ def cell_metrics(cell_dir, rep, meta):
     out["tx_queued_sends"] = rows[-1].get("tx_queued_sends")   # absent before S6
     out["tx_flushes"] = rows[-1].get("tx_flushes")
     out["accepts"] = rows[-1].get("accepts")
+    out["sender_q_hwm"] = rows[-1].get("sender_q_hwm")
+    ns = meta.get("netem_stats")
+    out["netem_drops"] = sum(v.get("dropped", 0) for v in ns.values() if isinstance(v, dict)) if ns else None
+    out["valid"], out["reasons"] = validity(meta, st, rows)
     return out
 
 
-def load(root):
-    """-> (data, problems). data[(sc, x_name, x, variant)] = list of per-rep dicts."""
-    data, problems, titles = {}, [], {}
+def build_key(build):
+    """The identity of a build stamp: (commit, dirty, app sha256, stressgen sha256,
+    build_type) or None when the cell has no stamp ("unknown")."""
+    if not build:
+        return None
+    app, sg = build.get("app") or {}, build.get("stressgen") or {}
+    return (build.get("commit"), build.get("dirty"), app.get("sha256"), sg.get("sha256"), app.get("build_type"))
+
+
+def fmt_build_key(k):
+    if k is None:
+        return "unknown (no build stamp)"
+    c, dirty, app, sg, bt = k
+    sh = lambda x: (x or "?")[:10]
+    return f"commit {sh(c)}{' (dirty)' if dirty else ''}, app {sh(app)}, stressgen {sh(sg)}, {bt or 'unknown'} build"
+
+
+def load(root, builds=None):
+    """-> (data, problems). data[(sc, x_name, x, variant)] = list of per-rep dicts,
+    each with "valid" (False for degraded cells). `builds`, when a dict, is filled
+    with {build_key: cell count} over every cell that has a meta.json."""
+    data, problems = {}, []
     for mp in sorted(Path(root).glob("*/*/*/rep*.meta.json")):
         d = mp.parent
         try:
@@ -152,6 +284,9 @@ def load(root):
         except ValueError:
             problems.append((str(mp.relative_to(root)), "unreadable meta.json"))
             continue
+        if builds is not None:
+            k = build_key(meta.get("build"))
+            builds[k] = builds.get(k, 0) + 1
         label = f"{meta.get('scenario')} {meta.get('x_name')}={meta.get('x')} {meta.get('variant')} rep{meta.get('rep')}"
         if meta.get("status") not in ("ok", "dirty"):
             problems.append((label, f"status={meta.get('status')}: {meta.get('error')}"))
@@ -161,29 +296,33 @@ def load(root):
         except (ValueError, KeyError, ZeroDivisionError) as e:
             problems.append((label, f"bad data: {e}"))
             continue
-        if meta["status"] == "dirty":
+        if not m["valid"]:
+            problems.append((label, f"degraded (excluded from medians; was {meta['status']}): " + "; ".join(m["reasons"])))
+        elif meta["status"] == "dirty":
             problems.append((label, f"dirty (data kept): {meta.get('error')}"))
         data.setdefault((meta["scenario"], meta["x_name"], meta["x"], meta["variant"]), []).append(m)
     return data, problems
 
 
 def aggregate(data):
+    """Medians/IQR over the valid reps only. n = reps loaded, n_valid = reps used."""
     agg = {}
     for key, reps in data.items():
-        a = {"n": len(reps)}
+        good = [r for r in reps if r.get("valid", True)]
+        a = {"n": len(reps), "n_valid": len(good)}
         for mk, _, _, _ in METRICS:
-            vals = [r.get(mk) for r in reps]
-            if mk in ("maxrss_kb", "threads"):   # peak across reps' peaks: report median of peaks too
-                pass
+            vals = [r.get(mk) for r in good]
             a[mk] = median_iqr(vals)
             a[mk + "_peak"] = max([v for v in vals if v is not None], default=float("nan"))
+        methods = {r.get("window_method") for r in good if r.get("window_method")}
+        a["window_method"] = methods.pop() if len(methods) == 1 else ("mixed" if methods else "")
         agg[key] = a
     return agg
 
 
 # --- CSV --------------------------------------------------------------------
 def write_csv(path, agg):
-    cols = ["scenario", "param", "value", "variant", "reps"]
+    cols = ["scenario", "param", "value", "variant", "reps", "reps_valid", "window_method"]
     for mk, _, _, _ in METRICS:
         cols += [mk + "_median", mk + "_q1", mk + "_q3"]
     with open(path, "w", newline="") as f:
@@ -191,7 +330,7 @@ def write_csv(path, agg):
         w.writerow(cols)
         for (sc, xn, x, v) in sorted(agg, key=lambda k: (k[0], k[2], VARIANTS.index(k[3]) if k[3] in VARIANTS else 9)):
             a = agg[(sc, xn, x, v)]
-            row = [sc, xn, x, v, a["n"]]
+            row = [sc, xn, x, v, a["n"], a["n_valid"], a["window_method"]]
             for mk, _, _, _ in METRICS:
                 row += [f"{t:.6g}" for t in a[mk]]
             w.writerow(row)
@@ -359,7 +498,7 @@ def table(sc, xn, xs, variants, agg):
             if not a:
                 h.append(f"<tr><td>{v}</td><td>{x}</td><td colspan='{len(cols)-2}' class='err'>no data</td></tr>")
                 continue
-            cells = [v, str(x), str(a["n"])]
+            cells = [v, str(x), str(a["n"]) if a["n"] == a["n_valid"] else f"{a['n_valid']}/{a['n']} valid"]
             for mk, _, _, _ in METRICS:
                 m, q1, q3 = a[mk]
                 cells.append("-" if m != m else f"{fmt(m)} <span class='mut'>[{fmt(q1)}-{fmt(q3)}]</span>")
@@ -367,14 +506,29 @@ def table(sc, xn, xs, variants, agg):
     return "".join(h) + "</table>"
 
 
-def write_html(path, agg, problems, root, titles):
+def build_html(builds):
+    o = ["<h2>Build</h2>"]
+    if len(builds) > 1:
+        o.append("<p class=err><b>WARNING: this directory mixes %d different builds.</b> "
+                 "Medians combine cells from different binaries; do not compare variants across them.</p>" % len(builds))
+    o.append("<table><tr><th>build</th><th>cells</th></tr>")
+    for k, n in sorted(builds.items(), key=lambda kv: -kv[1]):
+        o.append(f"<tr><td style='text-align:left'>{html.escape(fmt_build_key(k))}</td><td>{n}</td></tr>")
+    o.append("</table>")
+    return "".join(o)
+
+
+def write_html(path, agg, problems, root, titles, builds=None):
     scs = sorted({k[0] for k in agg})
     o = [f"<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
          f"<title>Stress report</title><style>{css()}</style><body><h1>I/O variant stress report</h1>",
          f"<p class=mut>Source: {html.escape(str(root))}. Points are medians across reps; vertical bars are IQR (Q1-Q3). "
-         "CPU, ctx-switch rates are computed over the measurement window (after warmup) from the node's metrics.jsonl; "
-         "RSS and threads are peaks.</p>",
+         "CPU, ctx-switch rates are computed over the measurement window (after warmup) from the node's metrics.jsonl "
+         "(bounds from stressgen's monotonic window when present, else a frames_in heuristic; see window_method in summary.csv); "
+         "RSS and threads are peaks. Degraded cells (failed validity checks) are listed under Problems and excluded.</p>",
          "<div class=legend>" + "".join(f"<span><i class='sw-{v}' style='width:14px;height:14px;display:inline-block;border-radius:3px'></i>{v}</span>" for v in VARIANTS) + "</div>"]
+    if builds:
+        o.append(build_html(builds))
     if problems:
         o.append(f"<h2>Problems ({len(problems)})</h2><table><tr><th>cell</th><th>issue</th></tr>")
         o += [f"<tr><td class=err>{html.escape(c)}</td><td style='text-align:left'>{html.escape(m)}</td></tr>" for c, m in problems]
@@ -391,7 +545,8 @@ def write_html(path, agg, problems, root, titles):
             _, label, unit, lg = next(m for m in METRICS if m[0] == mk)
             series = {v: [agg[(sc, xn, x, v)][mk] if (sc, xn, x, v) in agg else None for x in xs] for v in variants}
             o.append(f"<div class=card>{chart(label, unit, xn, xs, series, lg)}</div>")
-        for mk in ("lost", "bp_drops", "evictions", "connect_failures", "send_skipped"):   # only interesting when nonzero
+        for mk in ("lost", "bp_drops", "evictions", "connect_failures", "send_skipped",
+                   "duplicates", "handshake_failures", "gen_cpu_pct"):   # only interesting when nonzero
             if any((agg[k][mk][0] or 0) > 0 for k in keys):
                 _, label, unit, lg = next(m for m in METRICS if m[0] == mk)
                 series = {v: [agg[(sc, xn, x, v)][mk] if (sc, xn, x, v) in agg else None for x in xs] for v in variants}
@@ -405,7 +560,8 @@ def main():
     root = Path(sys.argv[1] if len(sys.argv) > 1 else "results")
     if not root.is_dir():
         sys.exit(f"no such results dir: {root}")
-    data, problems = load(root)
+    builds = {}
+    data, problems = load(root, builds)
     if not data:
         print("warning: no usable cells found", file=sys.stderr)
     agg = aggregate(data)
@@ -417,7 +573,15 @@ def main():
     except Exception:
         pass
     write_csv(root / "summary.csv", agg)
-    write_html(root / "report.html", agg, problems, root, titles)
+    write_html(root / "report.html", agg, problems, root, titles, builds)
+    print("builds:")
+    for k, n in sorted(builds.items(), key=lambda kv: -kv[1]):
+        print(f"  {n:5d} cells  {fmt_build_key(k)}")
+    if len(builds) > 1:
+        print("WARNING: mixed builds in one results directory", file=sys.stderr)
+    deg = sum(1 for _, m in problems if m.startswith("degraded"))
+    if deg:
+        print(f"{deg} degraded cells excluded from medians")
     print(f"wrote {root/'summary.csv'} and {root/'report.html'}: {len(agg)} groups, {len(problems)} problem cells")
     return 0
 
