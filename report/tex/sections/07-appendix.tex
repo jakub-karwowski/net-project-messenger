@@ -1,0 +1,82 @@
+\section{Reproduction}
+\label{app:repro}
+
+\paragraph{The measured run.} All results in this report come from the directory
+\code{results-0294f37}, produced by a clean Release build of commit \code{0294f37} on
+the branch \code{io-variants}. The repository contains, for every cell and repetition,
+the metadata (\code{rep*.meta.json}), the generator's result (\code{rep*.stress.json})
+and the node's metrics (\code{rep*.metrics.jsonl}), together with \code{summary.csv}
+and \code{report.html}. The node and generator logs are not committed.
+
+\paragraph{Build and run.}
+\begin{verbatim}
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+scripts/run_matrix.py --app build/app --stressgen build/stressgen \
+    --out results-<commit> --reps 3
+scripts/analyze.py results-<commit>      # summary.csv, report.html
+\end{verbatim}
+
+\paragraph{Notes.}
+\begin{itemize}
+  \item The working tree must be clean, so every cell's build stamp names an exact
+        commit.
+  \item The node runs on CPUs 0--1 and the generator on CPUs 4--7.
+  \item An interrupted run resumes when the same command is run again: cells that
+        completed are kept and failed ones are retried. It refuses to mix builds.
+\end{itemize}
+
+\paragraph{Figures and tables.} Every figure and table in Section~\ref{sec:results}
+is generated from \code{results-0294f37} by the script \code{make\_figures.py} in
+the directory \code{report/visualisation-scripts}. The handshake diagrams
+(Figure~\ref{fig:handshake}) are PlantUML sources in the same directory, rendered by
+\code{make\_handshake.sh}.
+
+\section{Test suite}
+
+\begin{itemize}
+  \item One unit-test executable per component: queue, wire format, sockets and pools,
+        \code{TxPoller}, store, sender, workers, rendering, metrics, \code{stressgen},
+        \code{peer-threads} and others.
+  \item An end-to-end script that runs two headless nodes in every mode.
+  \item Tests for the analysis script.
+  \item A normal \code{ctest -j8} passes 26 of 26 tests.
+\end{itemize}
+
+\paragraph{Parallel load.} Running six to eight copies of the network-heavy tests at
+once still fails about 2\% of runs, because fixed deadlines in the two-node checks
+expire under that artificial load (see also Section~\ref{sec:lessons}).
+
+\section{All results}
+\label{app:full}
+
+Tables~\ref{tab:full-S1}--\ref{tab:full-S7} list every swept value and every mode of
+every scenario. Each value is the median over the valid repetitions; ``valid'' gives
+how many of the three repetitions passed the validity checks, and a cell with no
+valid repetition shows dashes. Columns:
+\begin{itemize}
+  \item \textbf{msg/s}: echoed messages per second; \textbf{lost}: messages sent in
+        the window and never echoed;
+  \item \textbf{p50}, \textbf{p99}, \textbf{p99.9}: round-trip time in ms;
+  \item \textbf{CPU \%}: node CPU usage (Equation~\ref{eq:cpu}); \textbf{vol./s} and
+        \textbf{invol./s}: voluntary and involuntary context switches per second;
+  \item \textbf{thr.} and \textbf{fds}: the node's peak thread and descriptor counts;
+  \item \textbf{ready}: peers that completed the handshake; \textbf{hs p50}: median
+        handshake time in ms;
+  \item \textbf{queued}: sends that had to be queued because the socket's transmit
+        buffer was full; \textbf{evict.}: peers evicted by the cap.
+\end{itemize}
+
+\begin{landscape}
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\setlength{\LTcapwidth}{\linewidth}
+\input{tables/full_S1}
+\input{tables/full_S2}
+\input{tables/full_S3}
+\input{tables/full_S4}
+\input{tables/full_S5}
+\input{tables/full_S6a}
+\input{tables/full_S6c}
+\input{tables/full_S6b}
+\input{tables/full_S7}
+\end{landscape}

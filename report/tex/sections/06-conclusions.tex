@@ -1,0 +1,145 @@
+\section{Conclusions and final summary}
+\label{sec:conclusions}
+
+Every conclusion below rests on the measured run (Section~\ref{sec:method}) and on
+the code it was built from. Each one was checked against the data. Claims that did not survive that
+check are not included.
+
+\subsection{Conclusions supported by the data}
+
+\paragraph{C1. A second, simplex connection per peer is not worth it.}
+\begin{itemize}
+  \item \textbf{No throughput gain.} At 32\,B it is slower than duplex: \mode{poll}
+        158k against 188k msg/s, \mode{epoll} 169k against 189k. At 4 and 64\,KiB the
+        two shapes are within noise.
+  \item \textbf{A longer handshake.} It costs 3\,RTT instead of 2: 62 against 41\,ms at
+        20\,ms RTT, and a p50 of about 280 against 95\,ms at 1,024 peers.
+  \item \textbf{An unreliable handshake under churn.} It collapses from 40\,ms RTT
+        under 16 reconnects/s, and it slows behind a rate limit (78 against 9\,ms).
+  \item \textbf{Twice the file descriptors.}
+\end{itemize}
+The collapse comes from the dial-back being a blocking \code{connect()} on the shared
+sender thread, not from the retry sleep. How abruptly it appears is partly set by the
+benchmark's open-loop churn and its 90\%-ready check (Section~\ref{sec:res-wan}). A non-blocking dial-back would remove the cliff, but not the extra
+round trip or the extra connection.
+
+\paragraph{C2. Separate read and write pollers pay off when the single I/O thread is
+the bottleneck.} The trigger can be a high message rate, large messages or heavy
+fan-in; any one is enough.
+\begin{itemize}
+  \item \textbf{Large messages, few peers:} with only 8 peers at 4\,KiB, the split
+        modes deliver 46\% and 76\% more than duplex.
+  \item \textbf{Fan-in:} at 256 peers, p99 is 8.0--8.4\,ms against about 10.6\,ms, at
+        lower CPU. At 1,024 peers, p50 is 60 against 76\,ms (\mode{poll}) and 147
+        against 159\,ms (\mode{epoll}).
+  \item \textbf{No gain} when the link is the bottleneck (S6b) or the load is mostly
+        idle (S2).
+  \item \textbf{Worse under churn:} more failed sends.
+\end{itemize}
+
+\paragraph{C3. \mode{peer-threads} is reliable and fast, but needs a thread cap, and
+its retry path is a limitation of the current implementation.}
+\begin{itemize}
+  \item \textbf{Reliable:} all 96 of its cells are valid. It stays healthy in S6a at
+        40--50\,ms RTT, where simplex collapses.
+  \item \textbf{Fast:} 203k msg/s at 32\,B and 16.2k at 64\,KiB. It has the best p99
+        at 256 peers (6.8\,ms) and shields other peers from a slow reader.
+  \item \textbf{Needs a cap:} at 1,024 peers on two CPUs it delivers only 20.8k of
+        102k msg/s. Capped at 256, it serves those peers at a p99 of 6.8\,ms and
+        58\% CPU.
+  \item \textbf{Limitation:} its writes are already non-blocking, but retries are a
+        100\,ms sleep on the shared \code{SenderWorker} thread, which stalls every
+        peer. That cost 29--33 failures, and a p99 of 64--103\,ms, at churn 50.
+        \code{open()} also does a blocking \code{connect()} on the same thread.
+\end{itemize}
+The retry and the dial belong on the peer's own owner thread: a deadline in its poll
+loop rather than a sleep, and an asynchronous dial. The shared sender would then
+become a dispatcher into per-peer queues. Two caveats remain: \mode{peer-threads}
+uses two fds per peer, and its backpressure path was never exercised (S3).
+
+\paragraph{Also established.}
+\begin{itemize}
+  \item Thread-per-connection collapses at 1,024 peers on two CPUs, and below that
+        ceiling it is the cheapest mode.
+  \item \code{poll} pays for every idle socket; \code{epoll} does not.
+  \item Only a blocking sender lets one slow reader stall everyone.
+  \item Under churn, tail latency is set by the shared sender's retry sleep, not by
+        the concurrency model or by isolating descriptors.
+\end{itemize}
+
+\paragraph{Which mode to use.}
+\begin{itemize}
+  \item \textbf{Up to a few hundred peers on few cores:} a thread per peer with
+        pooled writes (\mode{peer-threads}, \mode{pool-sender}), with
+        \code{-{}-max-peers} sized to the cores.
+  \item \textbf{Many or mostly idle peers:} \mode{epoll-duplex}, or
+        \mode{epoll-split} for large messages or high rates.
+  \item \textbf{Churn over a WAN:} always duplex.
+\end{itemize}
+
+\subsection{Limitations and open observations}
+
+\begin{itemize}
+  \item The measurements come from one WSL2 host, count CPU for the node only, and
+        give the node two CPUs, which sets where the thread ceiling falls.
+  \item Two observations remain unexplained:
+        \begin{itemize}
+          \item why the poll-based duplex and split modes beat \code{epoll} at 1,024
+                peers;
+          \item why the duplex shapes never queued writes in S3.
+        \end{itemize}
+  \item The peer cap is not uniform across modes (S7).
+  \item Open-loop churn turns sender overload into an abrupt exclusion rather than a
+        gradual slowdown (S6a).
+\end{itemize}
+
+\subsection{Final summary: a hypothesis for a combined design}
+
+The tested results above bracket a design we did not build or measure. We state it as
+a hypothesis.
+
+\paragraph{Proposal.} Keep the ownership model of \mode{peer-threads}, in which one
+thread owns its sockets, reads them and reports their end. But give each owner thread
+a \emph{small pool of peers} instead of one, and add a balancing policy. This is an
+M:N reactor~\cite{reactor} that sits between the two extremes we measured: one peer
+per pool (\mode{peer-threads}) and every peer in one pool (\mode{*-duplex} and
+\mode{*-split}). Candidate balancing policies:
+\begin{itemize}
+  \item uniform: assign each new peer to the least-loaded pool;
+  \item separate pools for peers that send large messages and peers that send small
+        ones;
+  \item separate pools for unreliable or churning peers.
+\end{itemize}
+
+\paragraph{Why the data makes it plausible.}
+\begin{itemize}
+  \item \textbf{No CPU starvation.} A bounded number of threads avoids the collapse
+        at 1,024 peers; the single-poller modes served 1,024 peers at about 140\% CPU.
+  \item \textbf{Uses the cores.} One I/O thread plateaus at about 122--144\% CPU in
+        S5, while the thread modes reach 170--180\%. Roughly one pool per core could
+        reach the same.
+  \item \textbf{\code{poll} is cheap for small pools.} Its cost grows with the number
+        of descriptors (S2), and the poll-based duplex and split modes had the best
+        fan-in latency.
+  \item \textbf{Fewer descriptors.} One eventfd per pool instead of one per peer gives
+        about \emph{peers + pools}.
+\end{itemize}
+
+\paragraph{Preconditions and risks.}
+\begin{itemize}
+  \item \textbf{The sender's policy has to move into the pool loops.} Retries and
+        dials (C3) must become timers there. Otherwise the S4 tail and the S6a cliff
+        remain. A plain sleep inside a pool would stall every peer in that pool.
+  \item \textbf{Place peers once.} A peer should be assigned when it attaches, without
+        migration at first. Moving a live connection means handing over its fd and
+        its \code{FrameChannel}.
+  \item \textbf{Some isolation policies lack evidence.} Isolating large-message peers
+        is motivated by S5 but untested. Isolating slow readers showed no clear need,
+        since pooled writes did not stall in S3.
+\end{itemize}
+Evaluating it would mean sweeping the pool size (1, 8, 32, all) with about one pool
+per core, over S1, S4 and S5, under one capacity rule for every mode.
+
+\paragraph{Other directions.} A completion-based backend
+(\code{io\_uring}~\cite{iouring}) behind the same \code{IoStack}, and QUIC~\cite{quic},
+which is duplex and multiplexed by design.

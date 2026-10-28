@@ -1,0 +1,13 @@
+\toprule
+Variant & p50 (ms) & p99 (ms) & CPU \% & vol.\ ctx/s \\
+\midrule
+\texttt{threads} & 4.1 & 7.2 & 49 & 28{,}529 \\
+\texttt{pool-sender} & 4.0 & 7.1 & 49 & 28{,}615 \\
+\texttt{peer-threads} & 3.9 & 6.8 & 54 & 29{,}814 \\
+\texttt{poll} & 11.5 & 22.5 & 132 & 25{,}314 \\
+\texttt{poll-duplex} & 4.8 & 10.5 & 100 & 37{,}505 \\
+\texttt{poll-split} & 3.7 & 8.4 & 87 & 25{,}834 \\
+\texttt{epoll} & 6.3 & 19.4 & 114 & 32{,}103 \\
+\texttt{epoll-duplex} & 5.4 & 10.7 & 91 & 32{,}043 \\
+\texttt{epoll-split} & 4.1 & 8.0 & 74 & 18{,}500 \\
+\bottomrule

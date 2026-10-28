@@ -1,0 +1,68 @@
+\documentclass[10pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{longtable}
+\usepackage{pdflscape}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit}
+\usepackage[hidelinks]{hyperref}
+
+\setlist{itemsep=1pt,topsep=3pt}
+\setlength{\emergencystretch}{2em}
+\captionsetup{font=small,labelfont=bf}
+\graphicspath{{figures/}}
+
+\newcommand{\mode}[1]{\texttt{#1}}
+\newcommand{\code}[1]{\texttt{#1}}
+% Primitive \@@input expands at the start of a tabular row (LaTeX's \input does not),
+% so generated table files can start with \toprule.
+\makeatletter
+\newcommand{\tablebody}[1]{\@@input #1 }
+\makeatother
+\newcommand{\finding}[1]{\par\smallskip\noindent\textbf{#1}\quad}
+
+\title{Sockets on Linux, Hands On:\\
+Nine I/O Back Ends for a Peer-to-Peer Chat Node}
+\author{Jakub Karwowski}
+\date{October 2026}
+
+\begin{document}
+\maketitle
+
+\input{sections/00-abstract}
+\tableofcontents
+\bigskip
+
+\input{sections/01-introduction}
+\input{sections/02-architecture}
+\input{sections/03-backends}
+\input{sections/04-methodology}
+\input{sections/05-results}
+\input{sections/06-conclusions}
+
+\appendix
+\input{sections/07-appendix}
+
+\begin{thebibliography}{9}
+\bibitem{poll} \emph{poll(2)}, \emph{epoll(7)}, \emph{eventfd(2)}, \emph{getrusage(2)}. Linux man-pages project.
+\bibitem{so-cpu} ``How to calculate the CPU usage of a process by PID in Linux from C?''
+  Stack Overflow, question 1420426.
+  \url{https://stackoverflow.com/questions/1420426}.
+\bibitem{netem} S.~Hemminger. Network emulation with NetEm. In \emph{Proc.\ linux.conf.au}, 2005.
+\bibitem{iouring} J.~Axboe. \emph{Efficient IO with io\_uring}. 2019. See also \emph{io\_uring(7)}.
+\bibitem{quic} J.~Iyengar, M.~Thomson (eds.). \emph{QUIC: A UDP-Based Multiplexed and Secure Transport}. RFC~9000, IETF, 2021.
+\bibitem{reactor} D.~C.~Schmidt. Reactor: an object behavioral pattern for demultiplexing and dispatching handles for synchronous events. In \emph{Pattern Languages of Program Design}, 1995.
+\end{thebibliography}
+
+\end{document}

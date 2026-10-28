@@ -1,0 +1,305 @@
+\section{Results}
+\label{sec:results}
+
+All values are medians over three repetitions; the shaded bands in the figures are
+the inter-quartile range. Figures share one encoding: colour gives the concurrency
+family (blue for threaded, orange for \code{poll}, green for \code{epoll}), and line
+style and marker give the socket topology (solid for simplex, dashed for duplex,
+dotted for split). Values are comparable only within one scenario and one swept value.
+
+%-----------------------------------------------------------------------------
+\subsection{S1: fan-in}
+\label{sec:res-fanin}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{s1_fanin}
+\caption{S1. Each peer offers 100 msg/s. The node has two CPUs (200\%).}
+\label{fig:s1}
+\end{figure}
+
+\finding{Thread-per-connection collapses at 1,024 peers.} Table~\ref{tab:s1-1024}
+shows the result. \mode{threads}, \mode{pool-sender} and \mode{peer-threads} deliver
+10.4--20.8k of the 102.4k msg/s offered. Their median RTT is 16--19\,s, they run about
+1,030 threads, and they use both cores. Every multiplexed mode delivers the whole load
+with no loss. Each runnable reader thread competes for two CPUs, and the scheduler
+cannot keep up.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lrrrrrrr@{}}
+\tablebody{tables/s1_1024.tex}
+\end{tabular}
+\caption{S1 at 1,024 active peers (102.4k msg/s offered).}
+\label{tab:s1-1024}
+\end{table}
+
+\finding{Duplex halves the descriptors.} At 1,024 peers the duplex and split modes
+use about 1,031 fds, against 2,055 for \mode{poll}/\mode{epoll}. \mode{peer-threads}
+also uses two per peer, because each link's pool has an eventfd.
+
+\finding{Below the ceiling, threads are the cheapest mode.} At 256 peers
+(Table~\ref{tab:s1-256}), \mode{threads}, \mode{pool-sender} and \mode{peer-threads}
+use 49--54\% CPU, with a p99 of 6.8--7.2\,ms. \mode{poll} and \mode{epoll} use
+114--132\% for a p99 of about 20\,ms. The duplex and split modes fall in between.
+A blocked reader costs nothing, and the work of the active ones spreads over both
+cores. A single I/O thread makes at least one system call per ready socket, and all
+of them run on one core.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lrrrr@{}}
+\tablebody{tables/s1_256.tex}
+\end{tabular}
+\caption{S1 at 256 active peers (25.6k msg/s offered; every mode delivers it).}
+\label{tab:s1-256}
+\end{table}
+
+\finding{An unexplained ordering at 1,024 peers.} The poll-based duplex and split
+modes have the lowest latency: p50 60--76\,ms and p99 126--168\,ms. Their epoll twins
+are at 147--159\,ms p50 and 654--721\,ms p99. The ordering holds in all three
+repetitions. The data does not explain it. One plausible mechanism is the order in
+which each pool serves ready sockets: \code{poll}'s round-robin cursor against
+\code{epoll}'s ready list. We report this as an observation, not a finding.
+
+%-----------------------------------------------------------------------------
+\subsection{S2: idle connections}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{s2_idle}
+\caption{S2. Eight active peers at 500 msg/s each, plus idle peers.}
+\label{fig:s2}
+\end{figure}
+
+\finding{\code{poll()} pays for idle sockets; \code{epoll} does not.}
+Figure~\ref{fig:s2} shows the cost. From 0 to 1,000 idle peers:
+\begin{itemize}
+  \item \mode{poll}'s p99 rises from 1.05 to 3.28\,ms and its CPU from 19\% to 100\%,
+        because every wake-up rebuilds and scans the whole \code{pollfd} array;
+  \item the poll duplex and split modes have half as many sockets to scan and pay
+        about half (about 65\% CPU);
+  \item every \code{epoll} variant stays flat, at about 1.0\,ms p99 and 10--17\% CPU.
+\end{itemize}
+In the thread modes each idle peer costs a thread (1,016 threads), but latency stays
+flat: a blocked thread uses no CPU.
+
+%-----------------------------------------------------------------------------
+\subsection{S3: slow consumers}
+\label{sec:res-slow}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.55\linewidth]{s3_slow}
+\caption{S3. The p99 of all peers when some stop reading.}
+\label{fig:s3}
+\end{figure}
+
+\finding{Only a blocking sender lets one slow reader stall everyone.} One slow peer
+raises \mode{threads}' p99 for \emph{all} peers from 1.3\,ms to 419\,ms, and four slow
+peers raise it to 2.2\,s (Figure~\ref{fig:s3}). The sender thread waits up to
+500\,ms per blocking write. Every other mode stays at 1.3--1.6\,ms. The pooled simplex
+modes queue about 2,045 writes per slow peer but never reach the 1\,MiB cap within
+20\,s, so nothing is dropped.
+
+\textbf{Caveat.} The duplex, split and \mode{peer-threads} modes record no queued
+writes at all, even with a 4\,KiB receive buffer on the slow peers. For these shapes
+the result shows that no peer stalled, not that a slow reader was isolated under
+backpressure.
+
+%-----------------------------------------------------------------------------
+\subsection{S4: churn}
+\label{sec:res-churn}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{s4_churn}
+\caption{S4. Left: p99 against churn. Right: each valid repetition at churn 10 and 50,
+         plotting the node's send failures against p99.}
+\label{fig:s4}
+\end{figure}
+
+\finding{Churn moves the tail, and the tail follows the sender's failures.} At churn
+of 10 reconnects/s and above, most modes reach a p99 of 44--143\,ms. Only
+\mode{threads} stays at about 4.5\,ms, and \mode{poll-duplex} does too at churn 10.
+Table~\ref{tab:s4} and Figure~\ref{fig:s4} show that p99 follows the number of failed
+sends. A failed send (\code{ConnectionNotFound} for a handle that has just been
+closed) makes the sender sleep 100\,ms before retrying, on the single thread that
+writes for every peer. Every other peer waits with it:
+\begin{itemize}
+  \item cells with zero or one failure keep a p99 of about 5\,ms;
+  \item a handful of failures already raises p99 in some repetitions, and from about
+        ten failures per run p99 sits at or above the 100\,ms sleep;
+  \item the simplex \mode{poll} and \mode{epoll} modes fail most often (125--166 times
+        at churn 50), and they are the only modes whose \emph{median} also rises, to
+        32\,ms and 13\,ms.
+\end{itemize}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lllrrr@{}}
+\tablebody{tables/s4.tex}
+\end{tabular}
+\caption{S4: the node's send failures for each of the three repetitions, against tail latency.}
+\label{tab:s4}
+\end{table}
+
+\finding{Threaded reads do not prevent this.} \mode{pool-sender} and
+\mode{peer-threads} read on their own threads, with isolated descriptors, and still
+reach a p99 of 64--105\,ms. \mode{threads} has no failures at all. The likely
+mechanism, which we have not proven, is that its blocking \code{send()} on a
+just-closed socket still succeeds into the kernel buffer. The echo is then lost
+silently instead of retried, which also gives \mode{threads} the lowest loss. The pool
+modes notice the EOF first, so their next send fails and the sender sleeps. The split
+modes fail more often than the duplex modes (69--103 against 14--25 at churn 50). The
+same 100\,ms signature appears as the handshake p99 at RTT 0 in S4 and S6a.
+
+%-----------------------------------------------------------------------------
+\subsection{S5: throughput ceiling}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{s5_throughput}
+\caption{S5. Closed loop, 8 peers with 16 messages outstanding each. Black whiskers are the IQR.}
+\label{fig:s5}
+\end{figure}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lrrrr@{}}
+\tablebody{tables/s5.tex}
+\end{tabular}
+\caption{S5: throughput in thousands of messages per second.}
+\label{tab:s5}
+\end{table}
+
+\finding{The single I/O thread is the ceiling.} At 4 and 64\,KiB, every mode with one
+I/O thread plateaus at about 122--144\% CPU and 51--56k msg/s (4\,KiB), or
+7.6--8.6k msg/s (64\,KiB). The thread modes reach 170--180\% and the highest
+throughput:
+\begin{itemize}
+  \item 105--113k msg/s at 4\,KiB;
+  \item 17.7k msg/s for \mode{pool-sender} and 16.2k for \mode{peer-threads} at
+        64\,KiB.
+\end{itemize}
+
+\finding{A separate write thread pays off once that thread is the bottleneck.}
+Compared with their duplex twins, the split modes gain:
+\begin{itemize}
+  \item at 4\,KiB, with only 8 peers: 46\% (\mode{poll}) and 76\% (\mode{epoll});
+  \item at 64\,KiB: 21\% and 40\%;
+  \item at 32\,B: 15\% and 9\%.
+\end{itemize}
+
+\finding{Simplex buys no throughput.} At 32\,B, \mode{poll} and \mode{epoll} are
+slower than their duplex versions: 158k against 188k, and 169k against 189k msg/s. At
+4 and 64\,KiB the two shapes are within noise.
+
+%-----------------------------------------------------------------------------
+\subsection{S6: WAN churn and bottleneck}
+\label{sec:res-wan}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{s6a_wan_churn}
+\caption{S6a. Left: handshake p50 against RTT, with 2\,RTT and 3\,RTT guides. Right:
+         delivered rate. Crosses mark the simplex cells that collapsed and were
+         excluded as degraded.}
+\label{fig:s6a}
+\end{figure}
+
+\finding{A handshake costs 3\,RTT in simplex and 2\,RTT in duplex.} At 20\,ms RTT the
+simplex modes take 62\,ms to become ready and the duplex modes 41\,ms. At 50\,ms the
+duplex modes take about 102\,ms (Figure~\ref{fig:s6a}).
+
+\finding{The simplex collapse is a saturation cliff.} In every simplex mode, the
+dial-back is a blocking \code{connect()} on the single sender thread. A churn event
+costs that thread about two connects, so about $2\cdot\mathrm{RTT}$ of service time.
+Its utilisation is $\rho = \mathrm{churn}\times 2\cdot\mathrm{RTT}$:
+\begin{itemize}
+  \item at 20\,ms, $\rho = 0.64$: stable, although the initial burst of 32 serialised
+        connects gives a handshake p99 of 654\,ms;
+  \item at 30\,ms, $\rho = 0.96$: \mode{poll} and \mode{epoll} degrade (2.8k msg/s,
+        p50 about 100\,ms), while \mode{threads} and \mode{pool-sender} still hold;
+  \item at 40 and 50\,ms, $\rho > 1$: all four simplex modes collapse. Only 10--13 of
+        32 peers are ready, and the gates exclude all 24 cells.
+\end{itemize}
+The duplex modes never dial back and stay at about 3.1k msg/s throughout.
+
+S6c repeats RTT 50\,ms with the churn halved to 8/s ($\rho = 0.8$). The simplex modes
+recover to 3.0k msg/s, with a handshake p50 of 155\,ms (3\,RTT) and a p99 of 1.7\,s.
+The collapse is therefore a cliff at $\rho = 1$, not a gradual slope.
+
+\finding{What causes the cliff, and what defines it.} The sender's 100\,ms retry
+sleep, which sets the tail in S4, plays no part here. The collapsed cells record only
+1--4 failed sends per run, which is at most 0.4\,s of sleep in a 25\,s run. The cause
+is the serial, blocking dial-back. The \emph{sharpness} of the cliff, however, also
+comes from how the benchmark defines churn and validity:
+\begin{itemize}
+  \item Churn is open loop and always closes a \emph{ready} peer
+        (Section~\ref{sec:gen}). Once the sender completes handshakes more slowly
+        than churn removes ready peers, the set of ready peers drains and the backlog
+        of dial-backs only grows. In the collapsed cells, only 278--341 of the 400
+        scheduled churn events found a ready peer to close, the handshake p50 grew to
+        2.6--3.2\,s, and the generator received no echoes in the window.
+  \item A cell is excluded once fewer than 90\% of its peers are ready at the end.
+\end{itemize}
+A churn schedule that waits for each redial to finish, or a longer window, would
+likely show the same overload as a gradual slowdown. The limit itself, one blocking
+dial-back per churn event on one shared thread, belongs to the node. Where along that
+curve a cell is called ``collapsed'' belongs to the benchmark.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lrrrrr@{}}
+\tablebody{tables/s6b.tex}
+\end{tabular}
+\caption{S6b: msg/s at three node egress rates (16\,KiB messages, 4\,ms RTT), queued
+         sends at 50\,Mbit/s, and handshake p50 at 1\,Gbit/s.}
+\label{tab:s6b}
+\end{table}
+
+\finding{Behind a bottleneck, the link sets the pace.} In S6b every mode reaches the
+same link-limited rate (Table~\ref{tab:s6b}), about 95\% of line rate. Writes queue as
+designed: 4--5k queued sends at 50\,Mbit/s, and fewer than 60 at 1\,Gbit/s. Split and
+duplex are identical within noise, so a separate write thread gains nothing when the
+link is the limit. Simplex handshakes take about 78\,ms against 9\,ms, because the
+dial-back's Ack queues behind data on the rate-limited node egress.
+
+%-----------------------------------------------------------------------------
+\subsection{S7: capped fan-in}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{s7_capped}
+\caption{S7. 1,024 peers offered against a node cap. 1040 is effectively uncapped.}
+\label{fig:s7}
+\end{figure}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\tablebody{tables/s7_256.tex}
+\end{tabular}
+\caption{S7 at \code{-{}-max-peers 256}.}
+\label{tab:s7}
+\end{table}
+
+\finding{A cap turns collapse into shedding.} With a cap of 256
+(Table~\ref{tab:s7}), \mode{threads} serves its 256 peers with no loss, a p99 of
+7.1\,ms and 50\% CPU. Uncapped, it delivers 15.6k msg/s and loses 1.7\,M messages.
+\mode{peer-threads} reaches a p99 of 6.8\,ms at 58\% CPU. In both, evictions equal
+$1024 - \mathrm{cap}$ exactly. Capped \mode{epoll} uses 115\% CPU, the same as S1
+\mode{epoll} at 256 peers (114\%). That is simply the cost of a single I/O thread
+serving 256 peers (Section~\ref{sec:res-fanin}), not re-dial churn.
+
+\textbf{The cap is not uniform across modes:}
+\begin{itemize}
+  \item the duplex and split pools hold \code{max\_peers}${}+16$ connections, so they
+        serve 80, 144 and 272 peers;
+  \item the dual pools hold $2\times$\code{max\_peers} connections, shared with
+        dial-backs, so they serve the cap or one fewer;
+  \item the thread modes serve exactly the cap.
+\end{itemize}
+Multiplexed prunes are also not counted as evictions. Modes must therefore be compared
+by the number of peers they served, not by the nominal cap.

@@ -1,0 +1,33 @@
+\begin{abstract}
+\noindent
+This report describes a university course project: a hands-on study of the Linux
+socket API, carried out by building one peer-to-peer chat node in C++23 and giving it
+nine interchangeable I/O back ends. Everything above the transport stays fixed: a
+shared \code{ChatController}, a single-threaded \code{StoreWorker}, a
+\code{SenderWorker} that owns the write policy, and a socket-agnostic
+\code{FrameChannel}. The back ends cover blocking thread-per-connection readers,
+pooled non-blocking writes, \code{poll(2)} and \code{epoll(7)} reactors over two
+sockets per peer (simplex) or one (duplex), reactors with separate read and write
+pollers, and one owner thread per peer. A headless test harness and an \code{epoll}
+load generator on separate pinned cores drive all nine through fan-in, idle
+connections, slow consumers, connection churn, throughput, emulated WAN delay and a
+peer cap: 864 runs in total, three repetitions of each point.
+
+The main results:
+\begin{itemize}
+  \item \textbf{Thread-per-connection collapses at 1,024 peers on two CPUs,} delivering
+        10--21\% of the offered load. Below 256 peers it is the cheapest and has the
+        lowest tail latency.
+  \item \textbf{\code{poll} pays for every idle socket and \code{epoll} does not.}
+  \item \textbf{Only a blocking sender lets one slow reader stall every peer.}
+  \item \textbf{The second, simplex connection per peer buys no throughput.} It costs
+        an extra round trip per handshake, and its blocking dial-back collapses under
+        WAN churn.
+  \item \textbf{A separate write thread pays off when the single I/O thread is the
+        bottleneck.}
+  \item \textbf{Under churn, tail latency is set by the shared sender's retry sleep,
+        not by the concurrency model.}
+\end{itemize}
+We close with an untested design hypothesis that combines the measured strengths:
+small per-thread peer pools with a balancing policy.
+\end{abstract}

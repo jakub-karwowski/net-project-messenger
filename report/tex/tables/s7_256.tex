@@ -1,0 +1,13 @@
+\toprule
+Variant & peers served & msg/s & p99 (ms) & CPU \% & threads & evictions \\
+\midrule
+\texttt{threads} & 256 & 25{,}600 & 7.1 & 50 & 264 & 768 \\
+\texttt{pool-sender} & 256 & 25{,}600 & 7.2 & 51 & 265 & 768 \\
+\texttt{peer-threads} & 256 & 25{,}600 & 6.8 & 58 & 264 & 768 \\
+\texttt{poll} & 256 & 25{,}600 & 19.9 & 131 & 8 & 0 \\
+\texttt{poll-duplex} & 272 & 27{,}200 & 11.8 & 115 & 8 & 0 \\
+\texttt{poll-split} & 272 & 27{,}200 & 9.2 & 93 & 9 & 0 \\
+\texttt{epoll} & 256 & 25{,}600 & 22.0 & 115 & 8 & 0 \\
+\texttt{epoll-duplex} & 272 & 27{,}200 & 11.8 & 98 & 8 & 0 \\
+\texttt{epoll-split} & 272 & 27{,}200 & 8.7 & 79 & 9 & 0 \\
+\bottomrule
