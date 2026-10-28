@@ -1,0 +1,248 @@
+\section{C++ wrappers around the socket API}
+\label{sec:wrappers}
+
+Every backend in Section~\ref{sec:backends} is built from a small set of C++ classes
+in \code{TcpSocket/}:
+\begin{itemize}
+  \item \code{TcpListener} and \code{TcpConnection}, which wrap one descriptor each;
+  \item \code{PollSet} and \code{TcpConnectionPool}, built on \code{poll(2)};
+  \item \code{EpollConnectionPool}, built on \code{epoll(7)};
+  \item \code{TxPoller}, a write-only poller with a \code{poll} and an \code{epoll}
+        back end.
+\end{itemize}
+This section describes how these classes call the C functions underneath, and which
+rules of the C API shaped them. Table~\ref{tab:syscalls} lists every call and where
+it is used.
+
+\begin{table}[h]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{4.4cm}>{\raggedright\arraybackslash}X@{}}
+\toprule
+C function & Used in \\
+\midrule
+\code{socket}, \code{bind}, \code{listen}, \code{accept} & \code{TcpListener}; \code{SO\_REUSEADDR} set before \code{bind} \\
+\code{socket}, \code{inet\_pton}, \code{connect} & \code{TcpConnection::connect}, always blocking \\
+\code{setsockopt}, \code{fcntl} & \code{TcpConnection::apply\_options}: \code{SO\_SNDTIMEO}, \code{SO\_RCVTIMEO}, \code{TCP\_NODELAY}, \code{SO\_KEEPALIVE}, \code{O\_NONBLOCK} \\
+\code{send}, \code{recv} & \code{TcpConnection::send}/\code{receive} (blocking, with retries) and \code{send\_once}/\code{receive\_once} (one call, caller's flags) \\
+\code{shutdown}, \code{close} & \code{TcpConnection::shutdown} wakes other threads; only the destructor closes \\
+\code{poll} & \code{PollSet::wait}, for \code{TcpConnectionPool} and the \code{poll} \code{TxPoller} \\
+\code{epoll\_create1}, \code{epoll\_ctl}, \code{epoll\_wait} & \code{EpollConnectionPool} and the \code{epoll} \code{TxPoller} \\
+\code{eventfd}, \code{read}, \code{write} & the wake-up descriptor of every poller \\
+\bottomrule
+\end{tabularx}
+\caption{C functions and the wrappers that use them.}
+\label{tab:syscalls}
+\end{table}
+
+\subsection{Owning a descriptor}
+
+A descriptor is an \code{int} that must be closed exactly once, by exactly one
+owner. \code{TcpConnection} and \code{TcpListener} make that an ownership rule of
+the type:
+\begin{itemize}
+  \item the constructor takes the descriptor, and the destructor calls
+        \code{close()} if it still holds one;
+  \item the classes cannot be copied. A move takes the number with
+        \code{std::exchange(other.fd\_, -1)}, so the moved-from object holds $-1$
+        and its destructor does nothing;
+  \item a connection shared between threads is held in a
+        \code{std::shared\_ptr<TcpConnection>}. The last owner to let go closes the
+        descriptor, so the number cannot be reused while another thread still uses
+        it.
+\end{itemize}
+
+The C functions report errors by returning $-1$ and setting \code{errno}. The
+wrappers translate \code{errno} at once into a small \code{SocketError} enumeration
+(\code{EAGAIN} and \code{EWOULDBLOCK} become \code{WouldBlock}, \code{EINTR}
+becomes \code{Interrupted}, and so on). They return it in a
+\code{std::expected}, so the caller has to look at the error before it can use the
+value. Only the \code{TcpListener} constructor throws, because a listener that
+could not bind is not a usable object.
+
+Addresses are built as a value-initialised \code{sockaddr\_in\{\}}, which also
+zeroes the \code{sin\_zero} padding, and filled with \code{htons} and
+\code{inet\_pton}. A failed \code{inet\_pton} is reported as a bad address before
+any system call is made.
+
+\subsection{Socket options}
+
+\code{TcpConnection} stores its options and applies them in one place,
+\code{apply\_options()}:
+\begin{itemize}
+  \item \code{SO\_SNDTIMEO} and \code{SO\_RCVTIMEO} take a \code{struct timeval}. A
+        zero value means ``no timeout'', so the same code both sets and clears them.
+  \item \code{TCP\_NODELAY} turns off Nagle's algorithm. Without it, a small frame
+        could wait for the acknowledgement of the previous one. Every connection in
+        the node sets it.
+  \item \code{SO\_KEEPALIVE} lets the kernel notice a peer that has vanished without
+        closing.
+  \item \code{O\_NONBLOCK} is a flag on the open file, not a socket option. It is
+        read with \code{fcntl(F\_GETFL)} and written back with \code{F\_SETFL}, so the
+        other flags are kept.
+\end{itemize}
+The \code{with\_*()} setters only record the values, and the next \code{send} or
+\code{receive} applies them. This is convenient for one thread. It is a data race
+when a reader and a writer share the socket, because both would check and set the
+``applied'' flag. Connections handed to a pool or a \code{TxPoller} are therefore
+configured with \code{apply\_options\_now()} first; after that, the I/O calls only
+read the flag.
+
+\subsection{Reading and writing}
+
+There are two pairs of I/O calls:
+\begin{itemize}
+  \item \code{send()} and \code{receive()} serve the blocking modes. They loop over
+        \code{::send} and \code{::recv}, retry on \code{EINTR} and \code{EAGAIN} if
+        retries were configured, and turn a \code{recv} that returns 0 into
+        \code{ConnectionClosed}.
+  \item \code{send\_once()} and \code{receive\_once()} are for the pollers. They make
+        exactly one call with the flags the caller passes (\code{MSG\_DONTWAIT}),
+        report \code{WouldBlock} as it is, and return a 0-byte read as 0, so the pool
+        can treat it as end of stream.
+\end{itemize}
+Every \code{send} adds \code{MSG\_NOSIGNAL}. Without it, writing to a connection the
+peer has closed raises \code{SIGPIPE}, which kills the whole process. With it, the
+call simply fails with \code{EPIPE}.
+
+A \code{send} may write only part of the buffer. The blocking outbound path wraps it
+in \code{send\_all()}, which continues from where the previous call stopped. On a
+blocking socket with \code{SO\_SNDTIMEO}, a send that waits too long fails with
+\code{EAGAIN}, which the sender treats like a full buffer.
+
+In \mode{threads} and \mode{pool-sender}, each reader thread blocks in
+\code{receive()} with a 200\,ms \code{SO\_RCVTIMEO}. When the timeout expires,
+\code{recv} fails with \code{EAGAIN}. The reader treats that as ``nothing yet'',
+updates its heartbeat for the watchdog, and calls \code{recv} again.
+
+\subsection{Ending a connection: \texttt{shutdown} before \texttt{close}}
+
+Closing a descriptor that another thread is blocked on does not reliably wake that
+thread. Worse, the number becomes free at once and can be given to a new connection
+while the old thread still holds it. The wrappers therefore separate the two steps:
+\begin{itemize}
+  \item \code{TcpConnection::shutdown()} calls \code{shutdown(fd, SHUT\_RDWR)}. A
+        thread blocked in \code{recv} on that socket then returns 0, as if the peer
+        had closed. The descriptor stays valid, so no other connection can get its
+        number. \code{ENOTCONN} is not treated as an error, because it only means
+        the peer was already gone.
+  \item \code{close()} is called only by the destructor, once no thread can use the
+        socket any more.
+\end{itemize}
+The watchdog uses this to evict a blocking reader. The split modes use it so that a
+failed write on the write thread shows up on the read thread as end of stream. The
+pools call it whenever they drop a connection.
+
+\code{accept()} on a listening socket cannot be woken this way. To stop a listener
+blocked in \code{accept}, the node sets a stop flag and then connects to its own
+listening port. \code{accept} returns, the loop sees the flag, and it closes the
+wake-up connection.
+
+\code{connect()} is always blocking (Section~\ref{sec:lessons}). The wrapper refuses
+port~0 before calling it, because Linux does not reject a connection to port~0: the
+SYN simply goes unanswered and the call blocks for about 130\,s of retries.
+
+\subsection{The \texttt{poll} wrapper}
+\label{sec:wrap-poll}
+
+\code{poll()} reads an array of \code{struct pollfd} while it blocks, so no other
+thread may change that array during the call. \code{PollSet} solves this with two
+copies of the state:
+\begin{itemize}
+  \item a \emph{desired} table, \code{id}~$\to$~\code{pollfd}, which any thread may
+        change under the pool's mutex (\code{upsert()} and \code{erase()});
+  \item the \emph{kernel} array \code{fds\_}, which only the I/O thread touches. It
+        is rebuilt from the desired table (\code{prepare()}), under the mutex, and
+        only when that table has changed.
+\end{itemize}
+The I/O thread then releases the mutex and calls \code{::poll(fds\_, n, timeout)}.
+The timeout is the time until the next sweep for idle connections. A call that fails
+with \code{EINTR} is repeated.
+
+Slot~0 of the array always holds an \code{eventfd} created with
+\code{EFD\_NONBLOCK | EFD\_CLOEXEC}. When another thread adds a connection, queues a
+write or closes the pool, it writes the 8-byte value 1 to that descriptor. The
+blocked \code{poll} returns, and the I/O thread reads the counter back to zero and
+rebuilds the array if needed.
+
+On return, \code{for\_each\_ready()} walks the \code{revents} of every entry,
+starting after the socket it served last, so a busy socket cannot starve the others:
+\begin{itemize}
+  \item \code{POLLOUT} with queued bytes: flush them with \code{send\_once};
+  \item \code{POLLIN}: one \code{receive\_once} into the caller's buffer;
+  \item \code{POLLERR}, \code{POLLHUP} or \code{POLLNVAL}: drop the connection and
+        report it as closed.
+\end{itemize}
+\code{POLLOUT} is in the desired table only while a connection has queued bytes.
+Otherwise every connection with free buffer space would be reported as writable on
+every call.
+
+\code{receive()} returns as soon as it has one chunk from one socket. The next call
+makes a new \code{poll()}. With many sockets, every message read therefore costs one
+scan of the whole array in the kernel and one walk over the \code{revents} in the
+pool. This is the cost that grows with idle peers in S2.
+
+\subsection{The \texttt{epoll} wrapper}
+
+\code{EpollConnectionPool} uses the three \code{epoll} calls:
+\begin{itemize}
+  \item \code{epoll\_create1(EPOLL\_CLOEXEC)} creates the instance once, in the
+        constructor. Its \code{eventfd} is registered first, with the token 0 in
+        \code{epoll\_event.data.u64}.
+  \item \code{epoll\_ctl} keeps the kernel's interest list up to date:
+        \code{EPOLL\_CTL\_ADD} with \code{EPOLLIN} when a connection arrives,
+        \code{EPOLL\_CTL\_MOD} to add or remove \code{EPOLLOUT} (only when the
+        interest actually changes, which saves a system call), and
+        \code{EPOLL\_CTL\_DEL} when it leaves. These calls are safe while the I/O
+        thread is blocked in \code{epoll\_wait}, so no second copy of the state is
+        needed.
+  \item \code{epoll\_wait} fills a preallocated array of \code{max\_connections + 2}
+        events.
+\end{itemize}
+
+Two details of the C API matter here:
+\begin{itemize}
+  \item \textbf{The event carries the connection id, not the fd.} Ids start at 1 and
+        are never reused, so the token 0 can mean the \code{eventfd}, and an event
+        for a connection removed in the meantime cannot reach a new connection with
+        the same descriptor number.
+  \item \textbf{\code{EPOLL\_CTL\_DEL} comes before \code{shutdown} and the release.}
+        The kernel removes a descriptor from an epoll set by itself only when every
+        reference to the underlying open file is closed. A connection shared with a
+        \code{TxPoller} may outlive the pool's reference, so the pool removes it
+        explicitly.
+\end{itemize}
+
+The pool is level-triggered: it does not set \code{EPOLLET}. A socket that still has
+unread data is reported again by the next \code{epoll\_wait}, so the pool may read
+one chunk and return. With edge triggering it would have to read until
+\code{EAGAIN}, or it could miss data. Like the \code{poll} pool, \code{receive()}
+serves one ready socket per call. Its fairness cursor indexes the events array of
+the \emph{previous} call, whose contents are different each time, so it is not the
+strict round robin of \code{PollSet}. This may contribute to \code{epoll}'s worse
+tail at 1,024 busy peers (Section~\ref{sec:res-fanin}); we have not tested it.
+
+\subsection{Writes through a pool, and the \texttt{TxPoller}}
+
+All three pollers (\code{TcpConnectionPool}, \code{EpollConnectionPool} and
+\code{TxPoller}) write in the same way:
+\begin{enumerate}
+  \item If nothing is queued for the connection, \code{send\_once(MSG\_DONTWAIT)}
+        writes as much as the kernel accepts at once.
+  \item Whatever the kernel did not accept is appended to the connection's
+        \code{tx\_buffer}, and writability is armed: \code{POLLOUT} in the desired
+        table, or \code{EPOLLOUT} through \code{epoll\_ctl}.
+  \item When the socket becomes writable, the buffer is flushed until it is empty
+        or the kernel says \code{EAGAIN} again. Once it is empty, writability is
+        disarmed.
+  \item A message that would push the buffer past 1\,MiB is refused with
+        \code{WouldBlock}, and nothing of it is queued. This is the backpressure drop
+        of Section~\ref{sec:arch}.
+\end{enumerate}
+The buffer keeps an offset of its first unsent byte, and it is compacted only once
+that offset passes half the buffer, so appending stays cheap.
+
+The \code{TxPoller} of the split modes runs the same algorithm on its own thread. It
+never reads, and it watches a socket only while that socket has queued bytes, so its
+set is usually empty. Unlike the read pools, it handles every ready descriptor
+returned by one \code{poll} or \code{epoll\_wait} (up to 64 for \code{epoll}) before
+it waits again.

@@ -42,7 +42,7 @@ also uses two per peer, because each link's pool has an eventfd.
 (Table~\ref{tab:s1-256}), \mode{threads}, \mode{pool-sender} and \mode{peer-threads}
 use 49--54\% CPU, with a p99 of 6.8--7.2\,ms. \mode{poll} and \mode{epoll} use
 114--132\% for a p99 of about 20\,ms. The duplex and split modes fall in between.
-A blocked reader costs nothing, and the work of the active ones spreads over both
+A blocked reader costs almost nothing, and the work of the active ones spreads over both
 cores. A single I/O thread makes at least one system call per ready socket, and all
 of them run on one core.
 
@@ -76,13 +76,14 @@ which each pool serves ready sockets: \code{poll}'s round-robin cursor against
 Figure~\ref{fig:s2} shows the cost. From 0 to 1,000 idle peers:
 \begin{itemize}
   \item \mode{poll}'s p99 rises from 1.05 to 3.28\,ms and its CPU from 19\% to 100\%,
-        because every wake-up rebuilds and scans the whole \code{pollfd} array;
+        because every \code{poll()} call scans the whole \code{pollfd} array, and the
+        pool makes one call per chunk it reads (Section~\ref{sec:wrap-poll});
   \item the poll duplex and split modes have half as many sockets to scan and pay
         about half (about 65\% CPU);
   \item every \code{epoll} variant stays flat, at about 1.0\,ms p99 and 10--17\% CPU.
 \end{itemize}
 In the thread modes each idle peer costs a thread (1,016 threads), but latency stays
-flat: a blocked thread uses no CPU.
+flat: a blocked thread uses no CPU between its 200\,ms heartbeat wake-ups.
 
 %-----------------------------------------------------------------------------
 \subsection{S3: slow consumers}

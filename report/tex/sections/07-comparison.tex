@@ -1,0 +1,182 @@
+\section{Blocking calls, \texttt{poll} and \texttt{epoll} compared}
+\label{sec:compare}
+
+Section~\ref{sec:results} goes through the measurements one scenario at a time. This
+section reads them the other way round. It takes the three ways a program can wait
+for a socket and compares them across all scenarios: a blocking call on a thread of
+its own, \code{poll(2)}, and \code{epoll(7)}.
+
+\subsection{How each one waits}
+
+\begin{description}
+  \item[Blocking calls.] Each socket gets a thread that sits in \code{recv()} (or
+        \code{send()}) until the call can complete. When data arrives, the kernel
+        wakes exactly the thread that waits on that socket. No user-space code has to
+        find out \emph{which} socket is ready, and the threads run on all cores at
+        once. The price is a thread per socket: a stack, a scheduler entry, and one
+        context switch per wake-up. A blocking call also waits as long as the peer
+        lets it, which is why \mode{threads} sets a 500\,ms \code{SO\_SNDTIMEO} on
+        sends and a 200\,ms timeout on reads.
+  \item[\code{poll}.] One thread passes an array with every socket it watches to
+        each call. The kernel checks every entry and the call returns the whole
+        array, so a wait costs time proportional to the number of sockets, whether
+        or not they are active. In this node, \code{receive()} returns one chunk
+        per call, so every message read pays for one such scan
+        (Section~\ref{sec:wrap-poll}).
+  \item[\code{epoll}.] The interest list lives in the kernel. A socket is registered
+        once with \code{epoll\_ctl}, the kernel puts it on a ready list when it
+        becomes readable or writable, and \code{epoll\_wait} returns only the ready
+        ones. A wait therefore costs time proportional to the number of
+        \emph{ready} sockets. Other threads can change the interest list while the
+        I/O thread is blocked in \code{epoll\_wait}, so no hand-off is needed. Both
+        pools here are level-triggered.
+\end{description}
+
+\code{poll} and \code{epoll} need non-blocking sockets, and the program has to keep
+its own buffer for a write that did not fit. It arms writability (\code{POLLOUT} or
+\code{EPOLLOUT}) only while that buffer holds data. With blocking calls, the kernel
+keeps the unsent bytes and the thread simply waits.
+
+\subsection{\texttt{poll} against \texttt{epoll}}
+
+Three pairs of modes differ only in the readiness API: \mode{poll}/\mode{epoll},
+\mode{poll-duplex}/\mode{epoll-duplex} and \mode{poll-split}/\mode{epoll-split}.
+Table~\ref{tab:cmp-poll-epoll} puts each pair side by side.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lcccccc@{}}
+\tablebody{tables/cmp_poll_epoll.tex}
+\end{tabular}
+\caption{\code{poll} against \code{epoll} in each socket topology. Each cell gives
+         the \code{poll} value, then the \code{epoll} value.}
+\label{tab:cmp-poll-epoll}
+\end{table}
+
+\finding{With many sockets but few active ones, \code{epoll} is much cheaper.}
+\begin{itemize}
+  \item With 1,000 idle peers (S2), \code{poll} uses 65--100\% CPU and \code{epoll}
+        10--17\%. The \code{epoll} variants cost about the same as with no idle peers
+        at all.
+  \item The \code{poll} p99 rises to 2.2--3.3\,ms, against about 1.0\,ms for
+        \code{epoll}.
+  \item The duplex and split modes have half as many sockets as simplex, and their
+        \code{poll} cost is lower in proportion: 65--68\% against 100\%.
+\end{itemize}
+This is the per-call scan of the whole array, described above.
+
+\finding{When most sockets are active, the difference shrinks.} At 256 active peers
+(S1), \code{epoll} still uses less CPU in every topology (74--114\% against
+87--132\%), but by 9--15\%, not by a factor of five. Most sockets are ready at every
+wake-up, so \code{epoll} returns nearly as many entries as \code{poll} scans. With a
+few sockets (S1 at 8 peers, S3, S5) the two are equal within a few percent of CPU,
+and so is the latency.
+
+\finding{Throughput does not depend on the readiness API.} In S5 and S6b the pairs
+deliver the same rate within noise, with no consistent winner. Once the I/O thread is
+busy reading and writing, the cost of finding the ready sockets is a small part of
+its work. Behind a bottleneck link (S6b), \code{epoll} uses 8--14 percentage points less CPU for the
+same rate.
+
+\finding{At 1,024 busy peers, \code{poll} has the better tail.} This is the only
+point where \code{poll} wins. Its p99 is 126--445\,ms, against 654--772\,ms for
+\code{epoll}, at similar CPU. Section~\ref{sec:res-fanin} reports this as an
+unexplained observation; the order in which each pool serves ready sockets is the
+most likely cause.
+
+\finding{Under churn, neither API decides the result.} In S4 both reach a p99 near or
+above 100\,ms, set by the sender's retry sleep (Section~\ref{sec:res-churn}).
+
+\subsection{Blocking calls against readiness multiplexing}
+
+Table~\ref{tab:cmp-blocking} compares three modes at the same points:
+\begin{itemize}
+  \item \mode{threads}: blocking reads and blocking writes;
+  \item \mode{pool-sender}: blocking reads, with writes made non-blocking through a
+        pool;
+  \item \mode{epoll-duplex}: one \code{epoll} thread for everything, the cheapest
+        single-thread mode.
+\end{itemize}
+
+\begin{table}[h]
+\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lrrrrrrrrr@{}}
+\tablebody{tables/cmp_blocking.tex}
+\end{tabular}
+\caption{Blocking calls against one \code{epoll} thread.}
+\label{tab:cmp-blocking}
+\end{table}
+
+\finding{Blocking reads win up to a few hundred peers.} At 256 peers, the blocking
+modes use 49\% CPU with a p99 of 7.1--7.2\,ms. \mode{epoll-duplex} needs 91\% for a
+p99 of 10.7\,ms. With 4\,KiB messages (S5), the blocking modes deliver 109--113k
+msg/s and \mode{epoll-duplex} 51k. There are two reasons:
+\begin{itemize}
+  \item the kernel wakes exactly the reader whose socket has data, so no time is
+        spent finding it;
+  \item the readers run on both cores, while one I/O thread can use only one.
+\end{itemize}
+
+\finding{Idle sockets cost blocking threads little CPU, but they cost memory.} With
+1,000 idle peers, \mode{threads} matches \mode{epoll-duplex}: about 1.0\,ms p99 at
+13--17\% CPU. Both do far better than \code{poll}. A thread blocked in \code{recv()}
+uses no CPU. Here each idle reader still wakes every 200\,ms, when its
+\code{SO\_RCVTIMEO} expires, to update its heartbeat for the watchdog. That shows as
+11.1 thousand voluntary context switches per second, against 5.9 thousand with no
+idle peers, but CPU only rises from 12\% to 17\%. But the node runs 1,016 threads instead of 8, and at 1,024 peers its
+resident memory grows from 21\,MB to 280--291\,MB.
+
+\finding{Too many active threads collapse.} At 1,024 active peers on two CPUs, the
+blocking modes deliver 10--15k of the 102.4k msg/s offered, with RTTs of 18--20\,s.
+They make 89--91 thousand voluntary context switches per second, against about 10
+thousand for \mode{epoll-duplex}. \mode{epoll-duplex} delivers the whole load at
+139\% CPU. A cap on peers (S7) prevents the collapse, but it also refuses peers.
+
+\finding{Blocking writes on a shared thread are the real danger.} Blocking
+\emph{reads} only ever stall their own thread. A blocking \emph{write} on the one
+sender thread stalls every peer behind it: with four slow peers, \mode{threads}
+reaches a p99 of 2.2\,s. \mode{pool-sender} keeps the same blocking reads but makes
+writes non-blocking, and stays at 1.4\,ms. Blocking reads with non-blocking writes is
+therefore the combination that worked best in this project, up to the thread limit.
+
+\finding{Under churn, the blocking write behaves best.} \mode{threads} keeps a p99 of
+4.6\,ms at 50 reconnects/s, while the non-blocking modes reach about 100\,ms. As
+Section~\ref{sec:res-churn} explains, this comes from the sender's retry policy rather
+than from blocking itself. A blocking \code{send()} to a socket that has just closed
+still succeeds into the kernel buffer, so no retry sleep is triggered.
+
+\finding{A blocking \code{connect()} remains in every mode.} Even the \code{poll}
+and \code{epoll} modes dial with a blocking \code{connect()} on the sender thread.
+That one blocking call causes the simplex collapse over a WAN (S6a). A fully
+non-blocking design would also have to make \code{connect()} non-blocking and wait
+for writability to learn when the connection is up.
+
+\subsection{Summary}
+
+\begin{table}[h]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{3.3cm}
+    >{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X
+    >{\raggedright\arraybackslash}X@{}}
+\toprule
+ & Blocking calls (thread per socket) & \code{poll} (one thread) & \code{epoll} (one thread) \\
+\midrule
+Cost of one wait & one context switch per wake-up & proportional to all sockets & proportional to ready sockets \\
+Idle sockets & free in CPU, one thread each & every socket scanned on every call & free \\
+Uses several cores & yes & no (one I/O thread) & no (one I/O thread) \\
+Few active peers & cheapest, lowest latency & close to \code{epoll} & close to \code{poll} \\
+1,024 active peers (2 CPUs) & collapses & full load & full load \\
+Slow peer & stalls everyone if writes block & isolated & isolated \\
+Code needed & simplest: the kernel buffers & non-blocking sockets, own write buffers & as \code{poll}, plus an epoll fd \\
+\bottomrule
+\end{tabularx}
+\caption{Blocking calls, \code{poll} and \code{epoll} as measured in this project.}
+\label{tab:cmp-summary}
+\end{table}
+
+Table~\ref{tab:cmp-summary} sums up. On a small node, blocking reads with non-blocking
+writes were the simplest and the fastest, as long as the number of peers was capped
+to what the cores could serve. Past that point, a readiness API is needed. Between
+the two, \code{epoll} is never meaningfully worse than \code{poll} except in the
+unexplained tail at 1,024 busy peers, and it is far better once many sockets are idle.

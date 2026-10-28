@@ -246,9 +246,10 @@ def fmt(x, digits=0):
     return f"{x:,.{digits}f}".replace(",", "{,}")
 
 
-def write_table(out, name, header, rows):
+def write_table(out, name, header, rows, groups=()):
     # The rules live in the file: \input inside a tabular cannot be followed by \bottomrule.
-    lines_ = [r"\toprule", " & ".join(header) + r" \\", r"\midrule"]
+    # `groups` are extra header lines (e.g. \multicolumn and \cmidrule) above `header`.
+    lines_ = [r"\toprule", *groups, " & ".join(header) + r" \\", r"\midrule"]
     lines_ += [" & ".join(r) + r" \\" for r in rows]
     lines_.append(r"\bottomrule")
     (out / "tables" / f"{name}.tex").write_text("\n".join(lines_) + "\n")
@@ -292,6 +293,44 @@ def tables(d, out):
                   " ".join(map(str, sorted(fails.get((v, 50), [])))),
                   fmt(g("S4", 10, v, "rtt_p99") / 1e3, 1), fmt(g("S4", 50, v, "rtt_p99") / 1e3, 1),
                   fmt(g("S4", 50, v, "lost"))] for v in VARIANTS])
+
+
+# Section "blocking, poll and epoll": the same points seen through two comparisons.
+CMP_POINTS = [   # (scenario, value, label)
+    ("S1", 8, "S1, 8 peers"), ("S1", 256, "S1, 256 peers"), ("S1", 1024, "S1, 1,024 peers"),
+    ("S2", 1000, "S2, 1,000 idle"), ("S3", 4, "S3, 4 slow"), ("S4", 50, "S4, churn 50"),
+    ("S5", 32, "S5, 32 B"), ("S5", 4096, "S5, 4 KiB"), ("S6b", 1000, "S6b, 1 Gbit/s"),
+]
+
+
+def comparison_tables(d, out):
+    g = d.get
+    rows = []
+    for sc, x, label in CMP_POINTS:
+        row = [label]
+        for shape in ("", "-duplex", "-split"):
+            row += [fmt(g(sc, x, "poll" + shape, "cpu_pct")) + " / " + fmt(g(sc, x, "epoll" + shape, "cpu_pct"))]
+        for shape in ("", "-duplex", "-split"):
+            row += [fmt(g(sc, x, "poll" + shape, "rtt_p99") / 1e3, 1) + " / "
+                    + fmt(g(sc, x, "epoll" + shape, "rtt_p99") / 1e3, 1)]
+        rows.append(row)
+    write_table(out, "cmp_poll_epoll",
+                ["Point", "simplex", "duplex", "split", "simplex", "duplex", "split"], rows,
+                groups=[r" & \multicolumn{3}{c}{CPU \% (\texttt{poll} / \texttt{epoll})}"
+                        r" & \multicolumn{3}{c}{p99 in ms (\texttt{poll} / \texttt{epoll})} \\",
+                        r"\cmidrule(lr){2-4}\cmidrule(l){5-7}"])
+    rows = []
+    for sc, x, label in CMP_POINTS:
+        row = [label]
+        for v in ("threads", "pool-sender", "epoll-duplex"):
+            row += [fmt(g(sc, x, v, "msgs_per_s") / 1e3, 1), fmt(g(sc, x, v, "rtt_p99") / 1e3, 1),
+                    fmt(g(sc, x, v, "cpu_pct"))]
+        rows.append(row)
+    write_table(out, "cmp_blocking",
+                ["Point"] + ["k msg/s", "p99 (ms)", "CPU \\%"] * 3, rows,
+                groups=[r" & \multicolumn{3}{c}{\texttt{threads}} & \multicolumn{3}{c}{\texttt{pool-sender}}"
+                        r" & \multicolumn{3}{c}{\texttt{epoll-duplex}} \\",
+                        r"\cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(l){8-10}"])
 
 
 # Appendix: every swept value x variant of every scenario, as a longtable per scenario.
@@ -346,7 +385,7 @@ def main():
     (args.out / "tables").mkdir(parents=True, exist_ok=True)
     style.setup()
     d = Data(args.results)
-    for build in (fig_s1, fig_s2, fig_s3, fig_s4, fig_s5, fig_s6a, fig_s7, tables, full_tables):
+    for build in (fig_s1, fig_s2, fig_s3, fig_s4, fig_s5, fig_s6a, fig_s7, tables, comparison_tables, full_tables):
         build(d, args.out)
 
 

@@ -9,7 +9,7 @@ the Linux socket API; the report does not position itself against published work
 **Data:** one measured run of the full matrix, 864 cells (32 swept values × 9
 variants × 3 repetitions) from one clean Release build. Every cell is `ok` and every
 node exits with code 0. 840 cells pass the validity checks. The 24 that fail are all
-simplex S6a cells at RTT 40 and 50 ms; they are reported as collapsed (§5.6). Figures
+simplex S6a cells at RTT 40 and 50 ms; they are reported as collapsed (§6.6). Figures
 come from the run's `summary.csv` (median and IQR over 3 repetitions). Run and
 commit names appear only in the Appendix; the body never names them.
 
@@ -144,7 +144,49 @@ Headline findings:
 - **Figure:** the handshake in both shapes as two PlantUML sequence diagrams
   (`visualisation-scripts/handshake.puml`).
 
-### 3. The nine I/O backends
+### 3. C++ wrappers around the socket API
+
+How the classes in `TcpSocket/` call the C functions. Table: each C call → wrapper.
+
+- **Owning a descriptor:** `TcpConnection`/`TcpListener` close in the destructor,
+  are move-only (`std::exchange(fd, -1)`), and are shared via
+  `shared_ptr<TcpConnection>` so the last owner closes. `errno` is mapped at once to
+  `SocketError` and returned in `std::expected`; only the listener constructor
+  throws. `sockaddr_in{}` value-initialised (zeroes `sin_zero`), `htons`,
+  `inet_pton`.
+- **Options:** `apply_options()` sets `SO_SNDTIMEO`/`SO_RCVTIMEO` (`timeval`, 0 =
+  none), `TCP_NODELAY`, `SO_KEEPALIVE`, and `O_NONBLOCK` via `fcntl(F_GETFL/F_SETFL)`.
+  Lazy application is a data race once two threads share a socket, hence
+  `apply_options_now()`.
+- **I/O:** blocking `send()`/`receive()` (loop, retry on `EINTR`/`EAGAIN`, 0 →
+  closed) against `send_once()`/`receive_once()` (one call, `MSG_DONTWAIT`).
+  `MSG_NOSIGNAL` on every send (no `SIGPIPE`); `send_all()` for partial writes; an
+  `SO_RCVTIMEO` expiry (`EAGAIN`) is the blocking reader's 200 ms heartbeat tick.
+- **`shutdown` before `close`:** `shutdown(SHUT_RDWR)` wakes a thread blocked in
+  `recv` without freeing the fd number; `close` only in the destructor. Used by the
+  watchdog, the split write path and pool drops. `accept()` is woken by dialling the
+  node's own listener. `connect()` to port 0 is refused before the call (≈130 s SYN
+  retries).
+- **`poll` wrapper (`PollSet`):** a desired table changed under the mutex, and a
+  kernel array rebuilt only when it changed; `poll()` runs without the lock; an
+  `eventfd` in slot 0 wakes it; a round-robin walk over `revents` (POLLOUT flush,
+  POLLIN read, POLLERR/HUP/NVAL drop); POLLOUT armed only while bytes are queued.
+  `receive()` returns one chunk per call, so every read pays a full `poll()` scan,
+  which is the S2 cost.
+- **`epoll` wrapper:** `epoll_create1(EPOLL_CLOEXEC)`, the `eventfd` registered with
+  token 0, ADD/MOD/DEL (MOD only when the interest changes), safe while
+  `epoll_wait` blocks. The event carries the connection id, not the fd. DEL is done
+  before shutdown, because a shared open file keeps a descriptor in the set.
+  Level-triggered, so one chunk per call is enough. The fairness cursor indexes the
+  previous call's array, which is not a strict round robin; this is a possible but
+  untested contributor to the 1,024-peer tail.
+- **Writes through a pool:** immediate `send_once` while nothing is queued; the
+  remainder goes to `tx_buffer`, writability is armed, then flushed and disarmed;
+  above 1 MiB → `WouldBlock`, nothing queued; offset with lazy compaction. The
+  `TxPoller` serves every ready fd per wait (up to 64 for epoll) and watches only
+  sockets with queued bytes.
+
+### 4. The nine I/O backends
 
 - **3.1 `threads` and `pool-sender`:**
   - `ListenerWorker` and one `ReaderWorker` per connection;
@@ -160,7 +202,7 @@ Headline findings:
     blocks, `kWakeToken`, and a fairness cursor over the ready events;
   - registry-mutex ordering, so bytes never arrive for an unknown id;
   - capacity: `2 × max_peers` for dual, `max_peers + 16` for duplex. This matters
-    for S7 (§5.7). Duplex halves the fds and avoids the dial-back.
+    for S7 (§6.7). Duplex halves the fds and avoids the dial-back.
 - **3.3 `poll-split` and `epoll-split`:**
   - each `shared_ptr<TcpConnection>` is shared by the rx pool, the `TxPoller` and
     the registry;
@@ -182,7 +224,7 @@ Headline findings:
 - **Summary table:** per mode, the connections per peer, threads (constant or
   per peer), fds per peer, write path, and backpressure behaviour.
 
-### 4. Instrumentation and benchmark methodology
+### 5. Instrumentation and benchmark methodology
 
 - **Node metrics:**
   - relaxed atomic counters;
@@ -257,13 +299,13 @@ Headline findings:
   - the thread ceiling depends on the 2-CPU node allocation;
   - handshake statistics carry survivorship bias.
 
-### 5. Results
+### 6. Results
 
 One subsection per scenario. Each has a load table, the hypothesis from
 experiments.md, the verdict, key numbers and a root cause where one is known. RTT
 values are medians over 3 reps.
 
-#### 5.1 S1 fan-in (1 → 1,024 active peers, 100 msg/s each, 64 B)
+#### 6.1 S1 fan-in (1 → 1,024 active peers, 100 msg/s each, 64 B)
 
 - **Confirmed: thread-per-connection collapses at 1,024 peers.**
 
@@ -301,7 +343,7 @@ values are medians over 3 reps.
 - **Figures:** throughput and p99 against peers (log x), CPU % against peers, and
   threads and fds against peers.
 
-#### 5.2 S2 idle-heavy (8 active peers × 500 msg/s; 0 → 1,000 idle peers)
+#### 6.2 S2 idle-heavy (8 active peers × 500 msg/s; 0 → 1,000 idle peers)
 
 - **Confirmed: `poll` pays for idle sockets.** From 0 to 1,000 idle peers:
 
@@ -317,7 +359,7 @@ values are medians over 3 reps.
   CPU.
 - **Figures:** p50 and p99 against idle peers, and CPU % against idle peers.
 
-#### 5.3 S3 slow consumers (16 peers × 200 msg/s; 0, 1, 4 peers stop reading)
+#### 6.3 S3 slow consumers (16 peers × 200 msg/s; 0, 1, 4 peers stop reading)
 
 - **Confirmed: a blocking sender stalls everyone.** `threads` p99 goes from
   1.3 ms to 419 ms with one slow peer, and to 2.2 s with four. Every other mode
@@ -331,7 +373,7 @@ values are medians over 3 reps.
   the simplex pool modes. For the duplex shapes the result is "no stall observed",
   not "isolation under backpressure". Explain this or flag it.
 
-#### 5.4 S4 churn (64 peers × 50 msg/s; 0, 10, 50 reconnects/s)
+#### 6.4 S4 churn (64 peers × 50 msg/s; 0, 10, 50 reconnects/s)
 
 - **Churn mostly moves the tail, not the median.** At churn ≥ 10, p99 jumps to
   about 45–130 ms for most modes. `threads` stays at about 4.5 ms. `poll-duplex`
@@ -367,7 +409,7 @@ values are medians over 3 reps.
 - **Figures:** p99 against churn; p99 against `send_failures` per cell; and
   handshake p50/p99 against churn.
 
-#### 5.5 S5 throughput ceiling (8 peers, closed loop, window 16)
+#### 6.5 S5 throughput ceiling (8 peers, closed loop, window 16)
 
 Throughput by message size:
 
@@ -384,7 +426,7 @@ Throughput by message size:
   thread is the bottleneck. The thread modes reach 170–180%.
 - **Figures:** throughput against size (log y), and CPU % against size.
 
-#### 5.6 S6 WAN (netem lab)
+#### 6.6 S6 WAN (netem lab)
 
 - **S6a, handshake cost confirmed.**
   - Simplex takes about 3 RTT: 62 ms at RTT 20.
@@ -426,7 +468,7 @@ Throughput by message size:
 - **Figures:** handshake p50 against RTT with 2·RTT and 3·RTT guide lines, and
   msg/s against RTT, marking the collapsed cells.
 
-#### 5.7 S7 capped fan-in (1,024 peers offered; `--max-peers` 64, 128, 256, 1040)
+#### 6.7 S7 capped fan-in (1,024 peers offered; `--max-peers` 64, 128, 256, 1040)
 
 - **Confirmed: a cap turns collapse into graceful shedding** for the
   thread-per-connection modes. `threads` at cap 256 serves 256 peers with no loss,
@@ -447,13 +489,55 @@ Throughput by message size:
   Multiplexed prunes don't count as `evictions`. Compare modes by peers served,
   not by the nominal cap.
 
-### 6. Conclusions and final summary
+### 7. Blocking calls, `poll` and `epoll` compared
+
+A cross-scenario reading of §6, organised by how the program waits for a socket.
+
+- **How each waits:**
+  - blocking: a thread per socket sleeps in `recv`/`send`; the kernel wakes exactly
+    that thread; it costs a thread and a context switch per wake-up; it needs
+    `SO_SNDTIMEO` (500 ms) and a read timeout (200 ms);
+  - `poll`: the whole array is passed and scanned on every call (O(all sockets)),
+    and the pool makes one `poll()` per chunk read (§3);
+  - `epoll`: the interest list lives in the kernel and `epoll_wait` returns only
+    ready sockets (O(ready)); `epoll_ctl` works while the loop is blocked; both
+    pools are level-triggered;
+  - both multiplexed APIs need non-blocking sockets and the program's own write
+    buffers, with POLLOUT/EPOLLOUT armed only while bytes are pending.
+- **`poll` vs `epoll`** (table: CPU and p99 for each topology at S1 8/256/1,024,
+  S2 1,000 idle, S3 4 slow, S4 churn 50, S5 32 B/4 KiB, S6b 1 Gbit/s):
+  - with many idle sockets, `epoll` is far cheaper: 10–17% CPU against 65–100%,
+    and p99 ≈1.0 ms against 2.2–3.3 ms;
+  - with mostly active sockets the gap shrinks to 9–15% (S1, 256 peers); with few
+    sockets they are equal;
+  - throughput is the same (S5, S6b);
+  - `poll` has the better tail at 1,024 busy peers (unexplained);
+  - under churn the retry sleep decides, not the API.
+- **Blocking vs multiplexing** (table: `threads`, `pool-sender`, `epoll-duplex` at
+  the same points):
+  - blocking reads win up to a few hundred peers: 49% against 91% CPU at 256
+    peers, and 109–113k against 51k msg/s at 4 KiB, because the right thread is
+    woken directly and the threads use both cores;
+  - idle sockets cost blocking threads little CPU (a 200 ms `SO_RCVTIMEO` heartbeat
+    wake-up each: 11.1k against 5.9k voluntary switches/s, CPU 12% → 17%) but a
+    thread each; RSS goes from
+    21 MB to 280–291 MB at 1,024 peers;
+  - 1,024 active threads collapse (89–91k voluntary switches/s against ≈10k);
+  - blocking *writes* on a shared thread are the real danger (S3: 2.2 s p99);
+    blocking reads with non-blocking writes (`pool-sender`) worked best up to the
+    thread limit;
+  - under churn the blocking write looks best, but because of the retry policy;
+  - a blocking `connect()` remains in every mode and causes the S6a cliff.
+- **Summary table:** cost per wait, idle sockets, multi-core use, few or 1,024
+  active peers, slow peer, code needed.
+
+### 8. Conclusions and final summary
 
 No further experiments will be run. Every conclusion below rests on the measured
 run and on the code it was built from. Only conclusions that
 survived review against the data are included.
 
-#### 6.1 Conclusions supported by the data
+#### 8.1 Conclusions supported by the data
 
 - **C1. A second, simplex channel per peer isn't worth it.**
   - **No throughput gain.** At 32 B simplex is slower (`poll` 158k against
@@ -467,7 +551,7 @@ survived review against the data are included.
   - **It doubles the fds.**
   - **Attribution:** the collapse comes from the dial-back being a blocking
     `connect()` on the shared sender thread, not from the retry sleep. How abruptly
-    it appears is partly set by the open-loop churn and the 90%-ready check (§5.6).
+    it appears is partly set by the open-loop churn and the 90%-ready check (§6.6).
     A non-blocking dial-back would remove the cliff, but not the extra RTT or the
     extra connection.
 - **C2. Split read/write pollers pay off when the single I/O thread is the
@@ -504,7 +588,7 @@ survived review against the data are included.
     - It uses 2 fds per peer (the socket plus the pool's eventfd).
     - Its backpressure path was never exercised: S3 shows `tx_queued_sends = 0`
       for every duplex shape.
-- **Also established by the data** (from §5):
+- **Also established by the data** (from §6):
   - **The fan-in collapse.** Thread-per-connection collapses at 1,024 peers on 2
     CPUs, and below that ceiling it is the cheapest mode.
   - **`poll` and idle sockets.** `poll` pays per idle socket; `epoll` stays flat.
@@ -518,7 +602,7 @@ survived review against the data are included.
     high rates.
   - **WAN churn:** always duplex.
 
-#### 6.2 Limitations and open observations
+#### 8.2 Limitations and open observations
 
 - **Measurement limits:**
   - one WSL2 host;
@@ -531,7 +615,7 @@ survived review against the data are included.
 - **"Cap" isn't uniform across modes:** `max_peers + 16` for duplex pools,
   `2 × max_peers` for dual pools, an exact cap for the thread modes.
 
-#### 6.3 Final summary: a hypothesis for a combined design (untested)
+#### 8.3 Final summary: a hypothesis for a combined design (untested)
 
 This comes last, after all the tested findings. It is presented explicitly as a
 design hypothesis that the existing data motivates but does not test.

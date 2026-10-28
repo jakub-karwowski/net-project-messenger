@@ -62,7 +62,8 @@ the I/O thread can never receive bytes for an id it cannot find.
 The two pools differ in how they track sockets:
 \begin{itemize}
   \item \code{TcpConnectionPool} keeps a desired-state table and rebuilds its
-        \code{pollfd} array before every \code{poll()}. Other threads wake it through
+        \code{pollfd} array before a \code{poll()} whenever that table has
+        changed. Other threads wake it through
         an \code{eventfd(2)}. A round-robin cursor decides which ready socket is
         served first.
   \item \code{EpollConnectionPool} calls \code{epoll\_ctl} directly, even while

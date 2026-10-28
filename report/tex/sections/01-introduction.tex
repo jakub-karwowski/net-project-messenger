@@ -77,10 +77,14 @@ Pair & Factor isolated \\
 \begin{itemize}
   \item Section~\ref{sec:arch} describes the part of the node that is the same in
         every mode, and the problems met while building it.
-  \item Section~\ref{sec:backends} describes the nine transports.
+  \item Section~\ref{sec:wrappers} describes the C++ classes that wrap the socket,
+        \code{poll} and \code{epoll} calls, and how they use the C functions.
+  \item Section~\ref{sec:backends} describes the nine transports built from them.
   \item Section~\ref{sec:method} describes how the node was measured: its counters,
         the load generator, the test harness and the scenarios.
-  \item Section~\ref{sec:results} presents the measurements, and
-        Section~\ref{sec:conclusions} draws conclusions and ends with an untested
+  \item Section~\ref{sec:results} presents the measurements scenario by scenario.
+  \item Section~\ref{sec:compare} compares blocking calls, \code{poll} and
+        \code{epoll} across all scenarios.
+  \item Section~\ref{sec:conclusions} draws conclusions and ends with an untested
         design idea.
 \end{itemize}
