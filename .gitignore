@@ -5,3 +5,4 @@ build-*/
 results*/
 .claude/worktrees/
 __pycache__/
+logs/
