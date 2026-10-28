@@ -257,6 +257,9 @@ same as the duplex modes. The difference is how the single socket is driven.
 
 ### `peer-threads`: one owner thread per peer, one connection
 
+The full walkthrough (link lookup, link lifecycle, cap eviction and re-dial) is in
+[peer_threads.md](peer_threads.md).
+
 `PeerThreadIo` ([PeerThreadIo.hpp](../PeerThreadIo.hpp)) is an
 `InboundTransport` and an `OutboundTransport` (`duplex()` and
 `backpressure_is_drop()` are true), like `MultiplexedIo` in the `Duplex` model.
