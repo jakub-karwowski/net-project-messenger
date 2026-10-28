@@ -1,0 +1,63 @@
+{
+ "scenario": "S2",
+ "x_name": "idle_peers",
+ "x": 300,
+ "variant": "epoll",
+ "rep": 3,
+ "port": 21208,
+ "params": {
+  "peers": 8,
+  "rate": 500,
+  "size": 64,
+  "duration": 20,
+  "warmup": 5,
+  "idle_peers": 300,
+  "slow_peers": 0,
+  "churn": 0
+ },
+ "status": "ok",
+ "error": null,
+ "t_start": 1793113987.7004442,
+ "build": {
+  "commit": "0294f37c0ca1d7707130a78efc13912b2cd1060c",
+  "branch": "io-variants",
+  "dirty": false,
+  "dirty_files": [],
+  "harness_sha256": "0cfc8667591a54a97071011d164653ab80434ca3d6c979956cd3e5f9d2986728",
+  "app": {
+   "path": "/home/jakub/net-project/build/app",
+   "sha256": "4504dcf2373c9e381c90f8a9cb17a9e736b4a80d8f9a6ca140a357750db3a5a0",
+   "size": 966136,
+   "mtime": "2026-10-27T19:10:36+0800",
+   "build_type": "Release"
+  },
+  "stressgen": {
+   "path": "/home/jakub/net-project/build/stressgen",
+   "sha256": "6905db06ef41e2a2bae71dbb1d04bef3f4b27252bd189e8b6c558c217b3e7123",
+   "size": 93856,
+   "mtime": "2026-10-27T19:10:28+0800",
+   "build_type": "Release"
+  }
+ },
+ "order_index": 0,
+ "variant_order": [
+  "epoll",
+  "pool-sender",
+  "poll",
+  "poll-split",
+  "epoll-duplex",
+  "epoll-split",
+  "peer-threads",
+  "threads",
+  "poll-duplex"
+ ],
+ "shutdown_s": 0.055,
+ "bye": true,
+ "killed": false,
+ "node_rc": 0,
+ "t_end": 1793114012.996594,
+ "validity": {
+  "ok": true,
+  "reasons": []
+ }
+}

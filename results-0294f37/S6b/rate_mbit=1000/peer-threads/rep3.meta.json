@@ -1,0 +1,106 @@
+{
+ "scenario": "S6b",
+ "x_name": "rate_mbit",
+ "x": 1000,
+ "variant": "peer-threads",
+ "rep": 3,
+ "port": 21213,
+ "params": {
+  "peers": 32,
+  "rate": 0,
+  "window": 8,
+  "size": 16384,
+  "duration": 20,
+  "warmup": 5,
+  "rate_mbit": 1000,
+  "idle_peers": 0,
+  "slow_peers": 0,
+  "churn": 0
+ },
+ "status": "ok",
+ "error": null,
+ "t_start": 1793129645.4649367,
+ "build": {
+  "commit": "0294f37c0ca1d7707130a78efc13912b2cd1060c",
+  "branch": "io-variants",
+  "dirty": false,
+  "dirty_files": [],
+  "harness_sha256": "0cfc8667591a54a97071011d164653ab80434ca3d6c979956cd3e5f9d2986728",
+  "app": {
+   "path": "/home/jakub/net-project/build/app",
+   "sha256": "4504dcf2373c9e381c90f8a9cb17a9e736b4a80d8f9a6ca140a357750db3a5a0",
+   "size": 966136,
+   "mtime": "2026-10-27T19:10:36+0800",
+   "build_type": "Release"
+  },
+  "stressgen": {
+   "path": "/home/jakub/net-project/build/stressgen",
+   "sha256": "6905db06ef41e2a2bae71dbb1d04bef3f4b27252bd189e8b6c558c217b3e7123",
+   "size": 93856,
+   "mtime": "2026-10-27T19:10:28+0800",
+   "build_type": "Release"
+  }
+ },
+ "order_index": 5,
+ "variant_order": [
+  "epoll",
+  "poll",
+  "pool-sender",
+  "epoll-duplex",
+  "epoll-split",
+  "peer-threads",
+  "poll-duplex",
+  "threads",
+  "poll-split"
+ ],
+ "netem": {
+  "node_delay_ms": 2,
+  "gen_delay_ms": 2,
+  "node_rate_mbit": 1000,
+  "limit_pkts": 667
+ },
+ "qdiscs": {
+  "veth-node": "qdisc netem 81dc: root refcnt 23 limit 667 delay 2ms rate 1Gbit",
+  "veth-gen": "qdisc netem 81dd: root refcnt 23 limit 667 delay 2ms"
+ },
+ "netlab": {
+  "namespace": "ns_p2p_gen",
+  "node": "veth-node 10.200.1.1/24",
+  "gen": "veth-gen 10.200.1.2/24",
+  "mtu": 1500,
+  "warnings": []
+ },
+ "shutdown_s": 0.165,
+ "bye": true,
+ "killed": false,
+ "node_rc": 0,
+ "netem_stats": {
+  "veth-node": {
+   "kind": "netem",
+   "sent_bytes": 3127817150,
+   "sent_pkts": 2263709,
+   "dropped": 3217,
+   "overlimits": 0,
+   "requeues": 0,
+   "backlog_bytes": 0,
+   "backlog_pkts": 0,
+   "raw": "qdisc netem 81dc: root refcnt 23 limit 667 delay 2ms rate 1Gbit\n Sent 3127817150 bytes 2263709 pkt (dropped 3217, overlimits 0 requeues 0) \n backlog 0b 0p requeues 0"
+  },
+  "veth-gen": {
+   "kind": "netem",
+   "sent_bytes": 3160814212,
+   "sent_pkts": 2761204,
+   "dropped": 0,
+   "overlimits": 0,
+   "requeues": 0,
+   "backlog_bytes": 0,
+   "backlog_pkts": 0,
+   "raw": "qdisc netem 81dd: root refcnt 23 limit 667 delay 2ms\n Sent 3160814212 bytes 2761204 pkt (dropped 0, overlimits 0 requeues 0) \n backlog 0b 0p requeues 0"
+  }
+ },
+ "t_end": 1793129670.8939624,
+ "validity": {
+  "ok": true,
+  "reasons": []
+ }
+}

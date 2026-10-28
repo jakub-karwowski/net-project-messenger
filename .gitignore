@@ -6,3 +6,7 @@ results*/
 .claude/worktrees/
 __pycache__/
 logs/
+# the measured run behind report/: data files only, no node/generator logs
+!results-0294f37/
+results-0294f37/**/*.log
+results-0294f37/**/*.stressgen.txt
