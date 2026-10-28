@@ -48,9 +48,6 @@ target_link_libraries(test_pool PRIVATE Threads::Threads TcpSocket)
 add_executable(test_tx_poller test_tx_poller.cpp)
 target_link_libraries(test_tx_poller PRIVATE Threads::Threads TcpSocket)
 
-add_executable(test_terminal test_terminal.cpp)
-target_link_libraries(test_terminal PRIVATE TerminalUI)
-
 add_executable(test_chat test_chat.cpp)
 target_link_libraries(test_chat PRIVATE TerminalUI Threads::Threads)
 
