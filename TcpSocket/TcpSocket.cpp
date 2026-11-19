@@ -3,15 +3,21 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <asm-generic/socket.h>
+#include <cerrno>
 #include <chrono>
+#include <climits>
+#include <cstdint>
 #include <expected>
 #include <fcntl.h>
+#include <memory>
+#include <mutex>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <optional>
 #include <poll.h>
 #include <span>
 #include <stdexcept>
+#include <system_error>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -50,6 +56,10 @@ namespace {
             case SocketError::InvalidAddress:    return "Invalid address";
             case SocketError::ConnectionClosed:  return "Connection closed by peer";
             case SocketError::ConnectionNotFound: return "Connection not found in pool";
+            case SocketError::BufferFull:        return "Transmit buffer full";
+            case SocketError::ReadTimedOut:      return "Nothing received within the read timeout";
+            case SocketError::WriteTimedOut:     return "Transmit buffer not flushed within the write timeout";
+            case SocketError::Stopped:           return "Connection pool stopped";
             default:                             return "Unknown socket error";
         }
     }
@@ -344,4 +354,411 @@ std::expected<size_t, SocketError> TcpConnection::receive_once(std::span<std::by
     const ssize_t ret = ::recv(fd_, destination.data(), destination.size_bytes(), flags);
     if (ret >= 0) { return static_cast<size_t>(ret); }
     return std::unexpected(get_last_socket_error());
+}
+
+std::expected<size_t, SocketError> TcpConnection::send_no_block(std::span<const std::byte> source) noexcept {
+    size_t sent = 0;
+    while (sent < source.size()) {
+        const auto written = send_once(source.subspan(sent), MSG_DONTWAIT);
+        if (written) { sent += *written; continue; }
+        if (written.error() == SocketError::Interrupted) { continue; }
+        if (written.error() == SocketError::WouldBlock)  { break; }
+        // A dead socket: the bytes already written no longer matter.
+        return std::unexpected(written.error());
+    }
+    return sent;
+}
+
+// ---------------------------------------------------------------------------
+// EpollConnectionPool
+// ---------------------------------------------------------------------------
+
+EpollConnectionPool::EpollConnectionPool()
+    : EpollConnectionPool(Timeouts{.read = std::chrono::milliseconds{0}, .write = std::chrono::seconds{5}}) {}
+
+EpollConnectionPool::EpollConnectionPool(Timeouts default_timeouts, size_t max_tx_buffer)
+    : default_timeouts_(default_timeouts), max_tx_buffer_(max_tx_buffer) {
+    epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd_ < 0) {
+        throw std::system_error(errno, std::system_category(), "epoll_create1");
+    }
+
+    wakeup_event_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (wakeup_event_fd_ < 0) {
+        const int err = errno;
+        ::close(epoll_fd_);
+        throw std::system_error(err, std::system_category(), "eventfd");
+    }
+
+    epoll_event wake_event{};
+    wake_event.events = EPOLLIN;
+    wake_event.data.u64 = wakeToken_;
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wakeup_event_fd_, &wake_event) < 0) {
+        const int err = errno;
+        ::close(wakeup_event_fd_);
+        ::close(epoll_fd_);
+        throw std::system_error(err, std::system_category(), "epoll_ctl(eventfd)");
+    }
+}
+
+EpollConnectionPool::~EpollConnectionPool() {
+    // Entries close their sockets as connections_ is destroyed; closing a
+    // descriptor removes it from the epoll set on its own.
+    ::close(wakeup_event_fd_);
+    ::close(epoll_fd_);
+}
+
+EpollConnectionPool::Entry::Entry(TcpConnection&& connection, Timeouts timeouts, Clock::time_point now) noexcept
+    : connection(std::move(connection)), timeouts(timeouts), last_rx(now) {}
+
+std::span<const std::byte> EpollConnectionPool::Entry::pending_tx() const noexcept {
+    return std::span<const std::byte>(tx_).subspan(tx_head_);
+}
+
+bool EpollConnectionPool::Entry::append_tx(std::span<const std::byte> bytes) noexcept {
+    try {
+        // Reclaim the consumed prefix before growing, once it is at least half the vector.
+        if (tx_head_ > 0 && tx_head_ >= tx_.size() / 2) {
+            tx_.erase(tx_.begin(), tx_.begin() + static_cast<std::ptrdiff_t>(tx_head_));
+            tx_head_ = 0;
+        }
+        tx_.insert(tx_.end(), bytes.begin(), bytes.end());   // strong guarantee: unchanged on throw
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void EpollConnectionPool::Entry::consume_tx(size_t count) noexcept {
+    tx_head_ += count;
+    if (tx_head_ >= tx_.size()) {
+        tx_.clear();
+        tx_head_ = 0;
+    }
+}
+
+bool EpollConnectionPool::TimerNode::operator>(const TimerNode& other) const noexcept {
+    return deadline > other.deadline;
+}
+
+void EpollConnectionPool::wake() const noexcept {
+    const uint64_t one = 1;
+    // EAGAIN means the counter is already non-zero: a wakeup is pending anyway.
+    std::ignore = ::write(wakeup_event_fd_, &one, sizeof(one));
+}
+
+bool EpollConnectionPool::push_timer_locked(const TimerNode& node, bool wake_if_earliest) noexcept {
+    const bool earliest = timers_.empty() || node.deadline < timers_.top().deadline;
+    try {
+        timers_.push(node);
+    } catch (...) {
+        return false;
+    }
+    if (wake_if_earliest && earliest) { wake(); }
+    return true;
+}
+
+void EpollConnectionPool::stop() noexcept {
+    stopping_.store(true, std::memory_order_release);
+    wake();
+}
+
+std::expected<uint64_t, EpollError> EpollConnectionPool::connection_add(TcpConnection connection) noexcept {
+    return connection_add(std::move(connection), default_timeouts_);
+}
+
+std::expected<uint64_t, EpollError> EpollConnectionPool::connection_add(TcpConnection connection,
+                                                                        Timeouts timeouts) noexcept {
+    if (connection.native_handle() < 0) { return std::unexpected(EpollError::InvalidConnection); }
+    // Applied once, up front, so the pool's send_once()/receive_once() calls
+    // never write the options state.
+    if (!connection.apply_options_now()) { return std::unexpected(EpollError::OptionsFailed); }
+
+    std::lock_guard<std::mutex> lock(connections_mutex_);
+    const uint64_t id = connection_next_id_;
+    const int fd = connection.native_handle();
+
+    epoll_event event{};
+    event.events = EPOLLIN;
+    event.data.u64 = id;
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &event) < 0) {
+        return std::unexpected(EpollError::RegisterFailed);
+    }
+
+    const auto now = Clock::now();
+    EntryIt it;
+    try {
+        it = connections_.try_emplace(id, std::move(connection), timeouts, now).first;
+    } catch (...) {   // map node allocation failed; the connection was not moved from
+        std::ignore = ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+        return std::unexpected(EpollError::RegisterFailed);
+    }
+    ++connection_next_id_;
+
+    // An epoll_wait() in progress already watches the new descriptor; only a
+    // read timer can make receive() need to wake up sooner.
+    if (timeouts.read.count() > 0
+        && !push_timer_locked({now + timeouts.read, id, TimerNode::Kind::Read, 0}, true)) {
+        drop_locked(it);   // a connection that can never time out is not kept
+        return std::unexpected(EpollError::RegisterFailed);
+    }
+    return id;
+}
+
+void EpollConnectionPool::connection_remove(uint64_t connection_id) noexcept {
+    std::lock_guard<std::mutex> lock(connections_mutex_);
+
+    const auto it = connections_.find(connection_id);
+    if (it == connections_.end()) { return; }
+
+    if (!it->second.pending_tx().empty()) {
+        // Keep flushing; the flush timer armed by send() still bounds how long.
+        // EPOLLIN is dropped: nobody reads it any more, and level-triggered
+        // EPOLLIN on unread data would spin the loop.
+        it->second.status = Entry::Status::Closing;
+        if (set_interest_locked(it->second, connection_id, EPOLLOUT)) { return; }
+    }
+    drop_locked(it);
+}
+
+void EpollConnectionPool::connection_drop(uint64_t connection_id) noexcept {
+    std::lock_guard<std::mutex> lock(connections_mutex_);
+
+    const auto it = connections_.find(connection_id);
+    if (it != connections_.end()) { drop_locked(it); }
+}
+
+std::expected<void, SocketError> EpollConnectionPool::send(uint64_t connection_id,
+                                                           std::span<const std::byte> tx_buffer) noexcept {
+    std::lock_guard<std::mutex> lock(connections_mutex_);
+
+    const auto it = connections_.find(connection_id);
+    if (it == connections_.end()) { return std::unexpected(SocketError::ConnectionNotFound); }
+    Entry& entry = it->second;
+    if (entry.status != Entry::Status::Open) { return std::unexpected(SocketError::ConnectionClosed); }
+    if (tx_buffer.empty()) { return {}; }
+
+    // Checked before the fast path: in the worst case nothing reaches the
+    // kernel, so the whole message must fit. That keeps send() all-or-nothing.
+    const size_t queued = entry.pending_tx().size();
+    if (tx_buffer.size() > max_tx_buffer_ - queued) { return std::unexpected(SocketError::BufferFull); }
+
+    if (queued != 0) {
+        // EPOLLOUT is armed and the write timer has been running since the buffer
+        // became non-empty; the bytes only go behind the queued ones. The buffer
+        // is unchanged on failure, so the connection stays usable.
+        if (!entry.append_tx(tx_buffer)) { return std::unexpected(SocketError::BufferFull); }
+        return {};
+    }
+
+    // Empty buffer: try the socket directly first.
+    const auto written = entry.connection.send_no_block(tx_buffer);
+    if (!written) {
+        const SocketError err = written.error();
+        fail_locked(it, err);
+        return std::unexpected(err);
+    }
+    if (*written == tx_buffer.size()) { return {}; }
+
+    // The kernel took only part of it. From here a failure drops the connection:
+    // some bytes are already on the wire, so refusing the rest would corrupt the stream.
+    if (!entry.append_tx(tx_buffer.subspan(*written))
+        || !set_interest_locked(entry, connection_id, EPOLLIN | EPOLLOUT)) {
+        fail_locked(it, SocketError::Unknown);
+        return std::unexpected(SocketError::Unknown);
+    }
+    ++entry.tx_generation;
+    if (entry.timeouts.write.count() > 0
+        && !push_timer_locked({Clock::now() + entry.timeouts.write, connection_id, TimerNode::Kind::Write,
+                               entry.tx_generation}, true)) {
+        fail_locked(it, SocketError::Unknown);
+        return std::unexpected(SocketError::Unknown);
+    }
+    return {};
+}
+
+EpollConnectionPool::ReceiveOutcome EpollConnectionPool::receive(std::span<std::byte> rx_buffer) noexcept {
+    // A 0-byte recv() would be indistinguishable from the peer closing.
+    if (rx_buffer.empty()) { return std::unexpected(ReceiveError{0, SocketError::Unknown}); }
+
+    std::array<epoll_event, 64> events;
+    for (;;) {
+        int timeout = -1;
+        {
+            std::lock_guard<std::mutex> lock(connections_mutex_);
+            if (stopping_.load(std::memory_order_acquire)) {
+                return std::unexpected(ReceiveError{0, SocketError::Stopped});
+            }
+
+            const auto now = Clock::now();
+            expire_timers_locked(now);
+
+            // Removals the pool already decided on come first: they need no I/O.
+            if (!notices_.empty()) {
+                const ReceiveError notice = notices_.front();
+                notices_.pop_front();
+                return std::unexpected(notice);
+            }
+            while (!ready_.empty()) {
+                const uint64_t id = ready_.front();
+                ready_.pop_front();
+                if (auto outcome = read_ready_locked(id, rx_buffer)) { return *outcome; }
+            }
+
+            timeout = epoll_timeout_locked(now);
+        }
+
+        // Never hold the lock while waiting: senders must be able to get in.
+        const int count = ::epoll_wait(epoll_fd_, events.data(), static_cast<int>(events.size()), timeout);
+        if (count < 0) {
+            if (errno == EINTR) { continue; }
+            return std::unexpected(ReceiveError{0, get_last_socket_error()});
+        }
+
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        for (const epoll_event& event : std::span(events).first(static_cast<size_t>(count))) {
+            handle_event_locked(event.data.u64, event.events);
+        }
+    }
+}
+
+void EpollConnectionPool::handle_event_locked(uint64_t token, uint32_t events) noexcept {
+    if (token == wakeToken_) {
+        uint64_t counter = 0;
+        std::ignore = ::read(wakeup_event_fd_, &counter, sizeof(counter));
+        return;
+    }
+
+    const auto it = connections_.find(token);
+    if (it == connections_.end()) { return; }   // removed while we were waiting
+
+    if (it->second.status == Entry::Status::Closing) {
+        // Only the flush matters now. A hang-up or error means it will never finish.
+        if (events & (EPOLLERR | EPOLLHUP)) { drop_locked(it); return; }
+        if (events & EPOLLOUT) { std::ignore = flush_locked(it); }
+        return;
+    }
+
+    if ((events & EPOLLOUT) && !flush_locked(it)) { return; }
+
+    // recv() reports what EPOLLHUP/EPOLLERR mean (0 bytes or the error), so
+    // they go through the ready queue like data.
+    if (events & (EPOLLIN | EPOLLHUP | EPOLLERR)) {
+        try {
+            ready_.push_back(token);
+        } catch (...) {
+            // Out of memory: skip it. Level-triggered epoll reports it again.
+        }
+    }
+}
+
+bool EpollConnectionPool::flush_locked(EntryIt it) noexcept {
+    Entry& entry = it->second;
+    const auto written = entry.connection.send_no_block(entry.pending_tx());
+    if (!written) {
+        fail_locked(it, written.error());
+        return false;
+    }
+
+    entry.consume_tx(*written);
+    if (!entry.pending_tx().empty()) { return true; }
+
+    // Drained before the deadline: the generation bump makes the write timer stale.
+    ++entry.tx_generation;
+    if (entry.status == Entry::Status::Closing) {   // graceful close done
+        drop_locked(it);
+        return false;
+    }
+    if (!set_interest_locked(entry, it->first, EPOLLIN)) {
+        fail_locked(it, SocketError::Unknown);
+        return false;
+    }
+    return true;
+}
+
+void EpollConnectionPool::expire_timers_locked(Clock::time_point now) noexcept {
+    while (!timers_.empty() && timers_.top().deadline <= now) {
+        const TimerNode node = timers_.top();
+        timers_.pop();
+
+        const auto it = connections_.find(node.entry_id);
+        if (it == connections_.end()) { continue; }   // already gone
+        Entry& entry = it->second;
+
+        if (node.kind == TimerNode::Kind::Write) {
+            if (entry.tx_generation != node.generation) { continue; }   // drained since: stale
+            // Still not flushed: drop it even though data is queued.
+            fail_locked(it, SocketError::WriteTimedOut);
+            continue;
+        }
+
+        // Read timer. A closing connection is no longer read, so it no longer
+        // needs one (the write timer still bounds the flush).
+        if (entry.status != Entry::Status::Open) { continue; }
+        const auto due = entry.last_rx + entry.timeouts.read;
+        if (due <= now) {
+            fail_locked(it, SocketError::ReadTimedOut);
+        } else if (!push_timer_locked({due, node.entry_id, TimerNode::Kind::Read, 0}, false)) {
+            // Data arrived since this node was pushed, so it is due again later. No
+            // wake: this is receive()'s thread, it recomputes its timeout next.
+            fail_locked(it, SocketError::Unknown);
+        }
+    }
+}
+
+int EpollConnectionPool::epoll_timeout_locked(Clock::time_point now) const noexcept {
+    if (timers_.empty()) { return -1; }
+    // Rounded up: rounding down would wake just before the deadline and spin.
+    const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(timers_.top().deadline - now);
+    return static_cast<int>(std::clamp<std::chrono::milliseconds::rep>(remaining.count(), 0, INT_MAX));
+}
+
+std::optional<EpollConnectionPool::ReceiveOutcome>
+EpollConnectionPool::read_ready_locked(uint64_t id, std::span<std::byte> rx_buffer) noexcept {
+    const auto it = connections_.find(id);
+    if (it == connections_.end() || it->second.status != Entry::Status::Open) { return std::nullopt; }
+
+    // MSG_DONTWAIT: readiness can be spurious, and a blocking fd would stall the loop.
+    const auto read = it->second.connection.receive_once(rx_buffer, MSG_DONTWAIT);
+
+    if (read && *read > 0) {   // data
+        it->second.last_rx = Clock::now();
+        return ReceiveResult{id, *read};
+    }
+    if (read) {                // 0 bytes: orderly shutdown, reported like TcpConnection::receive()
+        drop_locked(it);
+        return std::unexpected(ReceiveError{id, SocketError::ConnectionClosed});
+    }
+    if (is_retryable(read.error())) {   // spurious: level-triggered epoll reports it again
+        return std::nullopt;
+    }
+    const SocketError err = read.error();   // dead socket
+    drop_locked(it);
+    return std::unexpected(ReceiveError{id, err});
+}
+
+bool EpollConnectionPool::set_interest_locked(const Entry& entry, uint64_t id, uint32_t events) noexcept {
+    epoll_event event{};
+    event.events = events;
+    event.data.u64 = id;
+    return ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, entry.connection.native_handle(), &event) == 0;
+}
+
+void EpollConnectionPool::drop_locked(EntryIt it) noexcept {
+    std::ignore = ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, it->second.connection.native_handle(), nullptr);
+    it->second.connection.shutdown_quietly();
+    connections_.erase(it);   // ~TcpConnection closes the descriptor; queued timers go stale
+}
+
+void EpollConnectionPool::fail_locked(EntryIt it, SocketError error) noexcept {
+    // A connection the user is already removing gets no further results.
+    if (it->second.status == Entry::Status::Open) {
+        try {
+            notices_.push_back(ReceiveError{it->first, error});
+            wake();   // send() runs on other threads: receive() may be parked in epoll_wait()
+        } catch (...) {
+            // Out of memory: the connection is still dropped, only its report is lost.
+        }
+    }
+    drop_locked(it);
 }
