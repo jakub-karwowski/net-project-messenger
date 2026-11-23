@@ -10,3 +10,7 @@ add_executable(test_queue test_queue.cpp)
 target_include_directories(test_queue PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(test_queue PRIVATE Threads::Threads)
 add_test(NAME test_queue COMMAND test_queue)
+
+add_executable(test_terminal_ui test_terminal_ui.cpp)
+target_link_libraries(test_terminal_ui PRIVATE TerminalUI)
+add_test(NAME test_terminal_ui COMMAND test_terminal_ui)
