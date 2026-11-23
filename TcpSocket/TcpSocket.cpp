@@ -38,6 +38,8 @@ namespace {
             case EINTR:        return SocketError::Interrupted;
             case EHOSTUNREACH:
             case ENETUNREACH:  return SocketError::HostUnreachable;
+            case EMFILE:
+            case ENFILE:       return SocketError::TooManyOpenFiles;
             case EAGAIN:
 #if EAGAIN != EWOULDBLOCK
             case EWOULDBLOCK:
@@ -64,7 +66,8 @@ namespace {
             case SocketError::ConnectTimedOut:   return "Connection not established within the connect timeout";
             case SocketError::HostUnreachable:   return "Host or network unreachable";
             case SocketError::NotConnected:      return "Connection is still being established";
-            case SocketError::Stopped:           return "Connection pool stopped";
+            case SocketError::TooManyOpenFiles:  return "Too many open files";
+            case SocketError::Stopped:           return "Stopped";
             default:                             return "Unknown socket error";
         }
     }
@@ -92,6 +95,20 @@ namespace {
         return destination;
     }
 
+    // Formats an IPv4 socket address. Every caller passes an AF_INET address, for
+    // which inet_ntop() cannot fail with a buffer of INET_ADDRSTRLEN.
+    TcpEndpoint to_endpoint(const sockaddr_in& address) noexcept {
+        char text[INET_ADDRSTRLEN] = {};
+        std::ignore = ::inet_ntop(AF_INET, &address.sin_addr, text, sizeof(text));
+        try {
+            // At most 15 characters: fits std::string's inline buffer, so this
+            // does not allocate in practice.
+            return TcpEndpoint{text, ntohs(address.sin_port)};
+        } catch (...) {
+            return TcpEndpoint{};
+        }
+    }
+
     constexpr timeval to_timeval(std::chrono::milliseconds timeout) noexcept {
         return timeval{
             .tv_sec  = static_cast<time_t>(timeout.count() / 1000),
@@ -103,8 +120,51 @@ namespace {
 SocketException::SocketException(SocketError code) : std::runtime_error(to_string(code)), code_(code) {}
 SocketError SocketException::code() const noexcept { return code_; }
 
+// ---------------------------------------------------------------------------
+// WakeupEvent
+// ---------------------------------------------------------------------------
+
+WakeupEvent::WakeupEvent() : fd_(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) {
+    if (fd_ < 0) { throw std::system_error(errno, std::system_category(), "eventfd"); }
+}
+
+WakeupEvent::~WakeupEvent() {
+    if (fd_ >= 0) { ::close(fd_); }
+}
+
+WakeupEvent::WakeupEvent(WakeupEvent&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+
+WakeupEvent& WakeupEvent::operator=(WakeupEvent&& other) noexcept {
+    if (this == &other) { return *this; }
+    if (fd_ >= 0) { ::close(fd_); }
+    fd_ = std::exchange(other.fd_, -1);
+    return *this;
+}
+
+void WakeupEvent::signal() const noexcept {
+    const uint64_t one = 1;
+    // EAGAIN means the counter is already non-zero: a wake-up is pending anyway.
+    std::ignore = ::write(fd_, &one, sizeof(one));
+}
+
+void WakeupEvent::clear() const noexcept {
+    uint64_t counter = 0;
+    // EAGAIN means there was nothing to clear.
+    std::ignore = ::read(fd_, &counter, sizeof(counter));
+}
+
+int WakeupEvent::fd() const noexcept {
+    return fd_;
+}
+
+// ---------------------------------------------------------------------------
+// TcpListener
+// ---------------------------------------------------------------------------
+
 TcpListener::TcpListener(std::string_view local_address, unsigned port, int backlog) {
-    listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    // Non-blocking: accept_client() waits in poll(), and a client that gives up
+    // between poll() and accept() must not leave accept() blocked.
+    listen_fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (listen_fd_ < 0) { throw SocketException(get_last_socket_error()); }
 
     int opt = 1;
@@ -134,12 +194,17 @@ TcpListener::TcpListener(std::string_view local_address, unsigned port, int back
     }
 }
 
-TcpListener::TcpListener(TcpListener&& other) noexcept : listen_fd_(std::exchange(other.listen_fd_, -1 )) {}
+TcpListener::TcpListener(TcpListener&& other) noexcept
+    : listen_fd_(std::exchange(other.listen_fd_, -1)),
+      stop_event_(std::move(other.stop_event_)),
+      stopping_(other.stopping_.load()) {}
 
 TcpListener& TcpListener::operator=(TcpListener&& other) noexcept {
     if (this == &other) { return *this; }
     if (listen_fd_ >= 0) { close(listen_fd_); }
-    this->listen_fd_ = std::exchange(other.listen_fd_, -1);
+    listen_fd_ = std::exchange(other.listen_fd_, -1);
+    stop_event_ = std::move(other.stop_event_);
+    stopping_.store(other.stopping_.load());
     return *this;
 }
 
@@ -148,19 +213,79 @@ TcpListener::~TcpListener() {
 }
 
 std::expected<TcpConnection, SocketError> TcpListener::accept_client() noexcept {
-    struct sockaddr_in client_addr{};
-    socklen_t client_len{sizeof(client_addr)};
-    int client_fd = accept(listen_fd_, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
-    if (client_fd < 0) { return std::unexpected(get_last_socket_error()); }
-    return TcpConnection(client_fd);
+    for (;;) {
+        if (stopping_.load(std::memory_order_acquire)) { return std::unexpected(SocketError::Stopped); }
+        if (auto waited = wait_for_client(); !waited) { return std::unexpected(waited.error()); }
+        // Checked again after the wait: stop() wins over a client that is queued.
+        if (stopping_.load(std::memory_order_acquire)) { return std::unexpected(SocketError::Stopped); }
+
+        auto accepted = try_accept();
+        if (accepted || !is_retryable(accepted.error())) { return accepted; }
+        // WouldBlock / Interrupted: the client went away, or the wake-up was not
+        // for us. Wait again.
+    }
 }
 
-TcpConnection::TcpConnection(int connected_fd) noexcept : fd_(connected_fd) {}
+void TcpListener::stop() noexcept {
+    // The flag is the request; the event only wakes a thread parked in poll().
+    // It is never cleared, so every later wait returns at once as well.
+    stopping_.store(true, std::memory_order_release);
+    stop_event_.signal();
+}
 
+std::expected<uint16_t, SocketError> TcpListener::local_port() const noexcept {
+    sockaddr_in address{};
+    socklen_t length = sizeof(address);
+    if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&address), &length) < 0) {
+        return std::unexpected(get_last_socket_error());
+    }
+    return ntohs(address.sin_port);
+}
+
+std::expected<void, SocketError> TcpListener::wait_for_client() const noexcept {
+    std::array<pollfd, 2> watched{{
+        {.fd = listen_fd_,         .events = POLLIN, .revents = 0},
+        {.fd = stop_event_.fd(),   .events = POLLIN, .revents = 0},
+    }};
+    for (;;) {
+        if (::poll(watched.data(), watched.size(), -1) >= 0) { return {}; }
+        if (errno != EINTR) { return std::unexpected(get_last_socket_error()); }
+    }
+}
+
+std::expected<TcpConnection, SocketError> TcpListener::try_accept() const noexcept {
+    sockaddr_in client{};
+    socklen_t length = sizeof(client);
+    // The accepted socket starts blocking; its own Options decide later.
+    const int client_fd = ::accept4(listen_fd_, reinterpret_cast<sockaddr*>(&client), &length, SOCK_CLOEXEC);
+    if (client_fd >= 0) { return TcpConnection(client_fd, to_endpoint(client)); }
+
+    switch (errno) {
+        // The queued client is gone again (reset, aborted), or Linux reported a
+        // network error that belongs to it rather than to the listener: accept(2)
+        // says to treat these like EAGAIN.
+        case ECONNABORTED: case EPROTO: case ENETDOWN: case ENOPROTOOPT: case EHOSTDOWN:
+        case ENONET: case EHOSTUNREACH: case EOPNOTSUPP: case ENETUNREACH:
+            return std::unexpected(SocketError::WouldBlock);
+        default:
+            return std::unexpected(get_last_socket_error());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TcpConnection
+// ---------------------------------------------------------------------------
+
+TcpConnection::TcpConnection(int connected_fd, TcpEndpoint remote) noexcept
+    : fd_(connected_fd), remote_(std::move(remote)) {}
+
+// The moved-from side is left with fd -1 and an empty TcpEndpoint{} (a plain
+// std::move of the string would leave it "valid but unspecified").
 TcpConnection::TcpConnection(TcpConnection&& other) noexcept
     : fd_(std::exchange(other.fd_, -1)),
       options_(other.options_),
-      options_applied_(other.options_applied_) {}
+      options_applied_(other.options_applied_),
+      remote_(std::exchange(other.remote_, TcpEndpoint{})) {}
 
 TcpConnection& TcpConnection::operator=(TcpConnection&& other) noexcept {
     if (this == &other) { return *this; }
@@ -168,7 +293,12 @@ TcpConnection& TcpConnection::operator=(TcpConnection&& other) noexcept {
     fd_ = std::exchange(other.fd_, -1);
     options_ = other.options_;
     options_applied_ = other.options_applied_;
+    remote_ = std::exchange(other.remote_, TcpEndpoint{});
     return *this;
+}
+
+const TcpEndpoint& TcpConnection::remote_endpoint() const noexcept {
+    return remote_;
 }
 
 TcpConnection::~TcpConnection() {
@@ -290,7 +420,8 @@ std::expected<TcpConnection, SocketError> TcpConnection::connect(std::string_vie
 
     const int client_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (client_fd < 0) { return std::unexpected(get_last_socket_error()); }
-    TcpConnection connection(client_fd);   // closes the descriptor on every early return
+    // Closes the descriptor on every early return; the peer is where we dial.
+    TcpConnection connection(client_fd, to_endpoint(*destination));
 
     if (::connect(client_fd, reinterpret_cast<const sockaddr*>(&*destination), sizeof(*destination)) < 0) {
         return std::unexpected(get_last_socket_error());
@@ -305,7 +436,9 @@ std::expected<TcpConnection, SocketError> TcpConnection::connect_start(std::stri
 
     const int client_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (client_fd < 0) { return std::unexpected(get_last_socket_error()); }
-    TcpConnection connection(client_fd);   // closes the descriptor on every early return
+    // Closes the descriptor on every early return. The peer is where we dial:
+    // getpeername() could not tell while the handshake is still in flight.
+    TcpConnection connection(client_fd, to_endpoint(*destination));
 
     // Non-blocking is not optional: a blocking connect() would stall the caller.
     options.non_blocking = true;
@@ -433,24 +566,17 @@ EpollConnectionPool::EpollConnectionPool()
 
 EpollConnectionPool::EpollConnectionPool(Timeouts default_timeouts, size_t max_tx_buffer)
     : default_timeouts_(default_timeouts), max_tx_buffer_(max_tx_buffer) {
+    // wakeup_ is a member, created before this body runs; it closes itself if we throw.
     epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
     if (epoll_fd_ < 0) {
         throw std::system_error(errno, std::system_category(), "epoll_create1");
     }
 
-    wakeup_event_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (wakeup_event_fd_ < 0) {
-        const int err = errno;
-        ::close(epoll_fd_);
-        throw std::system_error(err, std::system_category(), "eventfd");
-    }
-
     epoll_event wake_event{};
     wake_event.events = EPOLLIN;
     wake_event.data.u64 = wakeToken_;
-    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wakeup_event_fd_, &wake_event) < 0) {
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wakeup_.fd(), &wake_event) < 0) {
         const int err = errno;
-        ::close(wakeup_event_fd_);
         ::close(epoll_fd_);
         throw std::system_error(err, std::system_category(), "epoll_ctl(eventfd)");
     }
@@ -459,7 +585,6 @@ EpollConnectionPool::EpollConnectionPool(Timeouts default_timeouts, size_t max_t
 EpollConnectionPool::~EpollConnectionPool() {
     // Entries close their sockets as connections_ is destroyed; closing a
     // descriptor removes it from the epoll set on its own.
-    ::close(wakeup_event_fd_);
     ::close(epoll_fd_);
 }
 
@@ -503,12 +628,6 @@ bool EpollConnectionPool::TimerNode::operator>(const TimerNode& other) const noe
     return deadline > other.deadline;
 }
 
-void EpollConnectionPool::wake() const noexcept {
-    const uint64_t one = 1;
-    // EAGAIN means the counter is already non-zero: a wakeup is pending anyway.
-    std::ignore = ::write(wakeup_event_fd_, &one, sizeof(one));
-}
-
 bool EpollConnectionPool::push_timer_locked(const TimerNode& node, bool wake_if_earliest) noexcept {
     const bool earliest = timers_.empty() || node.deadline < timers_.top().deadline;
     try {
@@ -516,21 +635,21 @@ bool EpollConnectionPool::push_timer_locked(const TimerNode& node, bool wake_if_
     } catch (...) {
         return false;
     }
-    if (wake_if_earliest && earliest) { wake(); }
+    if (wake_if_earliest && earliest) { wakeup_.signal(); }
     return true;
 }
 
 void EpollConnectionPool::stop() noexcept {
     stopping_.store(true, std::memory_order_release);
-    wake();
+    wakeup_.signal();
 }
 
 void EpollConnectionPool::interrupt() noexcept {
-    // The flag, not the eventfd, carries the request: handle_event_locked() drains
-    // the eventfd for every kind of wakeup, so only the flag survives until the
+    // The flag, not the wake-up event, carries the request: handle_event_locked() drains
+    // the wake-up event for every kind of wake-up, so only the flag survives until the
     // top of receive()'s loop sees it.
     interrupt_pending_.store(true, std::memory_order_release);
-    wake();
+    wakeup_.signal();
 }
 
 std::expected<uint64_t, EpollError> EpollConnectionPool::connection_add(TcpConnection connection) noexcept {
@@ -612,7 +731,7 @@ std::expected<uint64_t, EpollError> EpollConnectionPool::connection_dial(std::st
         } catch (...) {
             return std::unexpected(EpollError::RegisterFailed);
         }
-        wake();   // receive() may be parked in epoll_wait()
+        wakeup_.signal();   // receive() may be parked in epoll_wait()
         return id;
     }
 
@@ -826,8 +945,7 @@ EpollConnectionPool::ReceiveOutcome EpollConnectionPool::receive(std::span<std::
 
 void EpollConnectionPool::handle_event_locked(uint64_t token, uint32_t events) noexcept {
     if (token == wakeToken_) {
-        uint64_t counter = 0;
-        std::ignore = ::read(wakeup_event_fd_, &counter, sizeof(counter));
+        wakeup_.clear();
         return;
     }
 
@@ -973,7 +1091,7 @@ void EpollConnectionPool::fail_locked(EntryIt it, SocketError error) noexcept {
     if (it->second.status != Entry::Status::Closing) {
         try {
             notices_.push_back(std::unexpected(ReceiveError{it->first, error}));
-            wake();   // send() runs on other threads: receive() may be parked in epoll_wait()
+            wakeup_.signal();   // send() runs on other threads: receive() may be parked in epoll_wait()
         } catch (...) {
             // Out of memory: the connection is still dropped, only its report is lost.
         }
@@ -1005,7 +1123,7 @@ void EpollConnectionPool::finish_connect_locked(EntryIt it) noexcept {
         // Without the report the caller never learns the dial worked: give it up.
         fail_locked(it, SocketError::Unknown);
     }
-    // No wake(): this runs on receive()'s thread, which checks notices_ next.
+    // No wake-up: this runs on receive()'s thread, which checks notices_ next.
 }
 
 bool EpollConnectionPool::arm_read_timer_locked(EntryIt it, bool wake_if_earliest) noexcept {

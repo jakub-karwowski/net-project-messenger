@@ -15,6 +15,7 @@
 #include <queue>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -36,8 +37,37 @@ enum class SocketError {
     ConnectTimedOut,     // a dial did not complete within its connect timeout
     HostUnreachable,     // EHOSTUNREACH / ENETUNREACH
     NotConnected,        // the connection is still being dialled
+    TooManyOpenFiles,    // EMFILE / ENFILE: no descriptor for a new socket
     Stopped,
     Unknown
+};
+
+// An IPv4 address and port in plain C++ types (no <netinet/in.h> needed).
+struct TcpEndpoint {
+    std::string address;   // dotted quad, e.g. "127.0.0.1"
+    uint16_t port = 0;
+    friend bool operator==(const TcpEndpoint&, const TcpEndpoint&) = default;
+};
+
+// A wake-up signal (an eventfd). Any thread raises it with signal(); the thread
+// that waits watches fd() in poll()/epoll next to its sockets, and calls clear()
+// once it has woken. Signals raised before clear() collapse into one wake-up.
+// It carries no meaning of its own: keep the reason for waking in a flag next to it.
+class WakeupEvent {
+    public:
+        WakeupEvent();   // throws std::system_error when the eventfd cannot be created
+        ~WakeupEvent();
+        WakeupEvent(const WakeupEvent&) = delete;
+        WakeupEvent& operator=(const WakeupEvent&) = delete;
+        WakeupEvent(WakeupEvent&& other) noexcept;
+        WakeupEvent& operator=(WakeupEvent&& other) noexcept;
+
+        void signal() const noexcept;
+        void clear() const noexcept;
+        int fd() const noexcept;
+
+    private:
+        int fd_;
 };
 
 class SocketException : public std::runtime_error {
@@ -50,9 +80,11 @@ class SocketException : public std::runtime_error {
         SocketError code_;
 };
 
+// A TCP socket. Connections come from TcpListener::accept_client(),
+// TcpConnection::connect() or TcpConnection::connect_start(), which always know
+// the peer's address (see remote_endpoint()).
 class TcpConnection {
     public:
-        explicit TcpConnection(int connected_fd) noexcept; 
         ~TcpConnection();
     
         TcpConnection(const TcpConnection&) = delete;
@@ -136,6 +168,13 @@ class TcpConnection {
         // retries, ...).
         std::expected<bool, SocketError> connect_status() const noexcept;
 
+        // The peer's address, recorded when the connection was created: what
+        // accept() returned, or the destination of connect()/connect_start(). It
+        // stays readable after the peer has gone away, and travels with the object
+        // (into a pool and out of it again). A moved-from connection holds an empty
+        // TcpEndpoint{}, as it holds no descriptor.
+        const TcpEndpoint& remote_endpoint() const noexcept;
+
     protected:
         // Raw descriptor backing this connection, or -1 when moved from. Intended
         // for readiness polling/configuration (::poll(), fcntl()); all reads and
@@ -155,29 +194,58 @@ class TcpConnection {
         std::expected<size_t, SocketError> receive_once(std::span<std::byte> destination, int flags) noexcept;
 
         friend class EpollConnectionPool;
+        friend class TcpListener;
 
     private:
+        // Takes ownership of connected_fd, a socket connected (or connecting) to `remote`.
+        TcpConnection(int connected_fd, TcpEndpoint remote) noexcept;
+
         std::expected<void, SocketError> apply_options() noexcept;
 
         int fd_;
         Options options_{};
         bool options_applied_ = false;
+        TcpEndpoint remote_;
     };
 
 class TcpListener {
     public:
+        // Port 0 binds an ephemeral port; local_port() says which.
         TcpListener(std::string_view local_address, unsigned port, int backlog);
         ~TcpListener();
 
         TcpListener(const TcpListener&) = delete;
         TcpListener& operator=(const TcpListener&) = delete;
-        
+
+        // Not while another thread is inside accept_client().
         TcpListener(TcpListener&& other) noexcept;
         TcpListener& operator=(TcpListener&& other) noexcept;
-    
+
+        // Blocks until a client connects or stop() is called. Fails with:
+        //   Stopped           stop() was called (now or earlier; it is permanent)
+        //   TooManyOpenFiles  no descriptor for the new socket: back off and retry,
+        //                     the client stays queued
+        //   anything else     the error accept() reported
+        // A client that gives up between being queued and being accepted is skipped.
         std::expected<TcpConnection, SocketError> accept_client() noexcept;
+
+        // Makes the current and every later accept_client() return Stopped. Safe
+        // from any thread, and more than once. The socket stays open (clients still
+        // queued are refused when the listener is destroyed).
+        void stop() noexcept;
+
+        // The port the socket is bound to.
+        std::expected<uint16_t, SocketError> local_port() const noexcept;
+
     private:
+        // Blocks until a client is queued or stop() raised stop_event_.
+        std::expected<void, SocketError> wait_for_client() const noexcept;
+        // One non-blocking accept; WouldBlock when no client is ready any more.
+        std::expected<TcpConnection, SocketError> try_accept() const noexcept;
+
         int listen_fd_;
+        WakeupEvent stop_event_;
+        std::atomic<bool> stopping_{false};
     };
 
 enum class EpollError {
@@ -407,15 +475,15 @@ class EpollConnectionPool {
         std::mutex connections_mutex_;
         std::atomic<bool> stopping_{false};
         std::atomic<bool> interrupt_pending_{false};
+        // Wakes receive() out of epoll_wait(). Why it woke is told by stopping_,
+        // interrupt_pending_, notices_ or the timers, never by the event itself.
+        WakeupEvent wakeup_;
         int epoll_fd_ = -1;
-        int wakeup_event_fd_ = -1;
         uint64_t connection_next_id_{1};
         Timeouts default_timeouts_;
         size_t max_tx_buffer_;
 
         static constexpr uint64_t wakeToken_ = 0;   // connection ids start at 1
-
-        void wake() const noexcept;
 
         // All *_locked helpers require connections_mutex_ to be held.
 
