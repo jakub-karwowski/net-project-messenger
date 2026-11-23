@@ -1,25 +1,24 @@
 #pragma once
 
-#include <cstdint>
-#include <memory>
-#include <optional>
-#include <queue>
-#include <string>
-#include <vector>
-
+#include "Canvas.hpp"
+#include "Style.hpp"
 #include "TerminalUI.hpp"
 
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+// A rectangle of the screen with an optional margin, border and padding around
+// its content. Elements draw themselves into a Canvas (design.md §13.2): the
+// parent hands each child a canvas of the child's size at the child's position,
+// clipped to the parent, so no element can draw outside its own box.
 struct Element {
     struct Position {
         int x{0};
         int y{0};
-        int z{0};
-    };
-    struct RenderCommand {
-        enum struct Type { TEXT, CURSOR };
-        Position anchor;
-        std::string data;
-        Type type{Type::TEXT};
+        int z{0};   // paint order among siblings: higher is drawn later, on top
     };
     struct Border {
         enum struct BorderType : uint32_t {
@@ -63,7 +62,7 @@ struct Element {
             return character[static_cast<uint16_t>(type)];
         }
     };
-    
+
     struct Margin {
         int top{0};
         int bottom{0};
@@ -83,18 +82,32 @@ struct Element {
     int get_inner_width() const noexcept;
     Position get_position() const noexcept;
     int get_width() const noexcept;
-    std::string_view get_main_color() const noexcept;
-    void render(std::vector<RenderCommand>& buffer) noexcept;;
+    const Style& get_style() const noexcept;
     void set_border(Border border) noexcept;
-    void set_main_color(std::string_view color) noexcept;
     void set_margin(Margin margin) noexcept;
     void set_padding(Padding padding) noexcept;
+    // The style of the element's own cells: its background, border and padding.
+    void set_style(Style style) noexcept;
     virtual void set_position(Position relative_position) noexcept;
     virtual void set_size(int width, int height) noexcept;
     bool visible() const noexcept;
-    virtual void begin_render() = 0;
-    virtual void inner_content(int local_row, std::string& buffer) = 0;
-    virtual void end_render(std::vector<RenderCommand>& buffer) = 0;
+
+    // TRANSITIONAL (until step 4): a colour as an SGR string, read by widgets
+    // that still build their text with colour codes. Must outlive the element.
+    std::string_view get_main_color() const noexcept;
+    void set_main_color(std::string_view color) noexcept;
+
+    // Draws the element into `area`, a canvas of the element's size at its
+    // position. The margin is left untouched; the rest of the box is cleared in
+    // the element's style, then the border is drawn, then draw_content() fills
+    // the inner area (inside border and padding).
+    void draw(Canvas& area);
+
+protected:
+    // The element's content. `inner` is the area inside border and padding,
+    // get_inner_width() x get_inner_height(), already cleared.
+    virtual void draw_content(Canvas& inner) = 0;
+
 private:
     Position relative_position_;
     int width_;
@@ -102,38 +115,55 @@ private:
     Border border_;
     Margin margin_;
     Padding padding_;
+    Style style_{};
     std::string_view main_color_{};
     bool visible_;
 };
 
+// TRANSITIONAL (removed in step 4, design.md §13.3): the old interface for
+// widgets that still produce each inner row as a string with colour codes.
+// draw_content() calls begin_render(), then inner_content() once per inner row,
+// then end_render(), and writes what they produced into the canvas.
+struct LegacyElement : Element {
+    struct RenderCommand {
+        enum struct Type { TEXT, CURSOR };
+        Position anchor;   // relative to the inner area
+        std::string data;
+        Type type{Type::TEXT};
+    };
+
+    using Element::Element;
+
+    virtual void begin_render() = 0;
+    virtual void inner_content(int local_row, std::string& buffer) = 0;
+    virtual void end_render(std::vector<RenderCommand>& buffer) = 0;
+
+protected:
+    void draw_content(Canvas& inner) override;
+};
+
+// Places children at their positions inside its inner area and draws them in
+// z order (equal z: in the order they were added). As the root it is also the
+// Renderable that TerminalUI draws.
 struct AbsoluteLayout : public Element, Renderable {
     AbsoluteLayout(Element::Position relative_position, int width, int height);
 
     void add_element(std::shared_ptr<Element> element);
     void clear_elements() noexcept;
 
-    // Element interface. Both inner_content and end_render operate in this
-    // layout's content plane coordinates; Element::render translates the
-    // result into the parent element's coordinate system.
-    void begin_render() override;
-    void inner_content(int local_row, std::string& buffer) override;
-    void end_render(std::vector<RenderCommand>& buffer) override;
-
-    // Renderable interface: flattens the whole tree into `frame`'s cell grid,
-    // resizing it to get_width() x get_height() (which also blanks it, so the
-    // frame is complete rather than a patch of the previous one). Overlaps are
-    // resolved here by z order, then emission order; a cell holds its own glyph
-    // (plus the SGR sequences that precede it) so the caller can diff two frames
-    // cell by cell. Returns the cursor's 1-based cell when the tree asked for one.
+    // Renderable interface: sizes `frame` to get_width() x get_height() (which
+    // also blanks it) and draws the whole tree into it, offset by this layout's
+    // position. Returns the 1-based cell of the cursor if an element asked for one.
     std::optional<Renderable::Cursor> write_frame(FrameBuffer& frame) override;
 
     void resize(int width, int height) override;
 
     // Element interface: resizes this layout and rescales its children.
     void set_size(int width, int height) noexcept override;
+
+protected:
+    void draw_content(Canvas& inner) override;
+
 private:
     std::vector<std::shared_ptr<Element>> elements_;
 };
-
-
-

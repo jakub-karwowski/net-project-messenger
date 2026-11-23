@@ -29,7 +29,7 @@ private:
     void mutate_model() noexcept;
 };
 
-struct ChatWindow : public Element {
+struct ChatWindow : public LegacyElement {
     ChatWindow(Position relative_position, int width, int height);
     virtual void inner_content(int local_row, std::string& buffer) override;
     virtual void begin_render() override;
@@ -88,7 +88,7 @@ namespace Input {
     }
 }
 
-struct InputBox : public Element {
+struct InputBox : public LegacyElement {
     InputBox(Position relative_position, int width, int height);
     virtual void inner_content(int row, std::string& buffer) override;
     virtual void begin_render() override;

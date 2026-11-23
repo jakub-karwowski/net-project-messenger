@@ -4,13 +4,16 @@
 //
 // Plain assertions, no framework.
 
+#include "Canvas.hpp"
 #include "Style.hpp"
+#include "TextLayout.hpp"
 #include "TerminalUI.hpp"
 #include "Unicode.hpp"
 
 #include <cstdlib>
 #include <functional>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -213,6 +216,89 @@ void test_row_text_emits_style_changes_only() {
     check(plain.row_text(0) == "x  ", "a row in the default style has no escapes at all");
 }
 
+// --- Canvas -----------------------------------------------------------------------
+
+std::string row_glyphs(const FrameBuffer& f, int row) {
+    std::string out;
+    for (int column = 0; column < f.width; ++column) {
+        const auto& cell = f.at(row, column);
+        if (cell.continuation) { continue; }
+        out += cell.glyph.empty() ? std::string(" ") : std::string(cell.glyph.text());
+    }
+    return out;
+}
+
+void test_canvas_clipping() {
+    FrameBuffer f(6, 3);
+    std::optional<Canvas::Point> cursor;
+    Canvas screen(f, cursor);
+    Canvas a = screen.sub(1, 1, 3, 1);
+    check(a.text(0, 0, "abcdef") == 6, "text reports the columns it covered, clipped or not");
+    check(row_glyphs(f, 1) == " abc  ", "drawing stops at the clip");
+    a.text(-2, 0, "xyz");
+    check(row_glyphs(f, 1) == " zbc  ", "negative local coordinates are clipped too");
+    a.put(0, 1, glyph("q"), {});
+    check(row_glyphs(f, 2) == "      ", "rows outside the clip are not touched");
+
+    Canvas b = a.sub(2, 0, 10, 10);
+    check(b.width() == 10 && b.height() == 10, "a sub-canvas keeps the size it was given");
+    b.text(0, 0, "12345");
+    check(row_glyphs(f, 1) == " zb1  ", "but its clip is the intersection with its parent");
+    Canvas outside = a.sub(5, 0, 2, 1);
+    outside.text(0, 0, "!!");
+    check(row_glyphs(f, 1) == " zb1  ", "a sub-canvas entirely outside its parent draws nothing");
+}
+
+void test_canvas_wide_at_clip_edges() {
+    FrameBuffer f(6, 1);
+    std::optional<Canvas::Point> cursor;
+    Canvas screen(f, cursor);
+    screen.put(4, 0, glyph("z"), {});
+    Canvas a = screen.sub(1, 0, 3, 1);   // columns 1..3
+    a.put(2, 0, glyph("日"), kRed);       // right half would be column 4
+    check(f.at(0, 3).glyph.empty() && f.at(0, 3).style == kRed && f.at(0, 4).glyph.text() == "z",
+          "cut by the right edge: a space inside, nothing outside");
+    a.put(-1, 0, glyph("日"), kRed);      // left half would be column 0
+    check(f.at(0, 1).glyph.empty() && f.at(0, 1).style == kRed && f.at(0, 0).glyph.empty() && f.at(0, 0).style == Style{},
+          "cut by the left edge: a space where the right half would be");
+}
+
+void test_canvas_fill_and_text() {
+    FrameBuffer f(5, 2);
+    std::optional<Canvas::Point> cursor;
+    Canvas screen(f, cursor);
+    screen.sub(1, 0, 3, 2).fill(0, 0, 9, 9, glyph("#"), kRed);
+    check(row_glyphs(f, 0) == " ### " && row_glyphs(f, 1) == " ### " && f.at(1, 2).style == kRed,
+          "fill covers the clipped rectangle");
+    FrameBuffer w(5, 1);
+    Canvas wide_screen(w, cursor);
+    wide_screen.fill(0, 0, 5, 1, glyph("日"), {});
+    check(row_glyphs(w, 0) == "日日 ", "a wide fill steps by two, the cut-off last glyph is a space");
+
+    StyledText t;
+    t.add("ab", kRed).add("c", Style{});
+    const auto layout = TextLayout::wrap(t, 10);
+    FrameBuffer g(4, 1);
+    Canvas gs(g, cursor);
+    check(gs.text(1, 0, layout.line_glyphs(0)) == 3, "laid-out glyphs report their columns");
+    check(row_glyphs(g, 0) == " abc" && g.at(0, 1).style == kRed && g.at(0, 3).style == Style{},
+          "and keep their styles");
+}
+
+void test_canvas_cursor() {
+    FrameBuffer f(6, 3);
+    std::optional<Canvas::Point> cursor;
+    Canvas screen(f, cursor);
+    Canvas a = screen.sub(1, 1, 3, 1);
+    a.set_cursor(1, 0);
+    check(cursor == Canvas::Point{2, 1}, "frame coordinates");
+    a.set_cursor(10, 5);
+    check(cursor == Canvas::Point{3, 1}, "clamped into the visible area");
+    Canvas empty = a.sub(9, 9, 2, 2);
+    empty.set_cursor(0, 0);
+    check(cursor == Canvas::Point{3, 1}, "an invisible area cannot place the cursor");
+}
+
 }  // namespace
 
 int main() {
@@ -228,6 +314,10 @@ int main() {
     run("frame: wide over wide", test_put_wide_over_wide);
     run("frame: lone combining mark", test_put_lone_mark);
     run("frame: row_text", test_row_text_emits_style_changes_only);
+    run("canvas: clipping", test_canvas_clipping);
+    run("canvas: wide glyphs at the clip edges", test_canvas_wide_at_clip_edges);
+    run("canvas: fill and text", test_canvas_fill_and_text);
+    run("canvas: cursor", test_canvas_cursor);
 
     std::cout << (g_checks - g_failures) << '/' << g_checks << " checks passed\n";
     return g_failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

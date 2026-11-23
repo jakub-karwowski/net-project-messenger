@@ -58,11 +58,9 @@ struct Label : Element {
     std::vector<std::string> lines;
     Label(Position position, int width, int height, std::vector<std::string> text)
         : Element(position, width, height), lines(std::move(text)) {}
-    void begin_render() override {}
-    void inner_content(int row, std::string& buffer) override {
-        if (row >= 0 && static_cast<size_t>(row) < lines.size()) { buffer += lines[static_cast<size_t>(row)]; }
+    void draw_content(Canvas& inner) override {
+        for (size_t row = 0; row < lines.size(); ++row) { inner.text(0, static_cast<int>(row), lines[row]); }
     }
-    void end_render(std::vector<RenderCommand>&) override {}
 };
 
 struct Rendered {
@@ -183,6 +181,65 @@ void test_positions_and_nesting() {
     const auto r = draw(root);
     check(visible_row(r.frame, 2) == "  abc     ", "a child's position adds to its parent's");
     check(visible_row(r.frame, 1) == "          ", "nothing else is drawn");
+}
+
+// --- drawing into canvases (step 3) ------------------------------------------------
+
+// 10. Found while porting: AbsoluteLayout::set_size() rebuilt each child's
+// position without z, so a resize reset every z to 0.
+void test_z_survives_resize() {
+    AbsoluteLayout root({0, 0}, 3, 1);
+    root.add_element(std::make_shared<Label>(Element::Position{0, 0, 1}, 3, 1, std::vector<std::string>{"AAA"}));
+    root.add_element(std::make_shared<Label>(Element::Position{0, 0, 0}, 3, 1, std::vector<std::string>{"BBB"}));
+    root.resize(6, 2);
+    const auto r = draw(root);
+    check(visible_row(r.frame, 0) == "AAA   ", "10 (fixed in step 3): z survives a resize (before: \"BBB   \")");
+}
+
+void test_margin_shows_what_is_underneath() {
+    AbsoluteLayout root({0, 0}, 6, 1);
+    root.add_element(std::make_shared<Label>(Element::Position{0, 0}, 6, 1, std::vector<std::string>{"xxxxxx"}));
+    auto top = std::make_shared<Label>(Element::Position{0, 0}, 6, 1, std::vector<std::string>{"ab"});
+    top->set_margin({.top = 0, .bottom = 0, .left = 2, .right = 0});
+    root.add_element(top);
+    const auto r = draw(root);
+    check(visible_row(r.frame, 0) == "xxab  ", "the margin is not drawn; the box is cleared");
+}
+
+void test_children_are_clipped_to_their_parent() {
+    AbsoluteLayout root({0, 0}, 6, 1);
+    auto inner = std::make_shared<AbsoluteLayout>(Element::Position{0, 0}, 3, 1);
+    inner->add_element(std::make_shared<Label>(Element::Position{1, 0}, 10, 1, std::vector<std::string>{"abcdefg"}));
+    root.add_element(inner);
+    const auto r = draw(root);
+    check(visible_row(r.frame, 0) == " ab   ", "a child wider than its parent stops at the parent's edge");
+}
+
+void test_border_in_element_style() {
+    AbsoluteLayout root({0, 0}, 5, 3);   // inner area: columns 1..3, "hi" in 1..2
+    auto label = std::make_shared<Label>(Element::Position{0, 0}, 5, 3, std::vector<std::string>{"hi"});
+    label->set_border(Element::Border(Element::Border::BorderType::Hash));
+    label->set_style(Style{.fg = Color::ansi(4)});
+    root.add_element(label);
+    const auto r = draw(root);
+    check(r.frame.at(0, 0).style.fg == Color::ansi(4) && r.frame.at(1, 4).style.fg == Color::ansi(4)
+              && r.frame.at(1, 3).style.fg == Color::ansi(4),
+          "border and cleared inner cells take the element's style");
+    check(r.frame.at(1, 1).style == Style{}, "content drawn without a style stays plain");
+}
+
+void test_cursor_in_nested_layouts() {
+    AbsoluteLayout root({0, 0}, 10, 3);
+    auto inner = std::make_shared<AbsoluteLayout>(Element::Position{2, 1}, 8, 2);
+    auto model = std::make_shared<InputModel>();
+    auto box = std::make_shared<InputBox>(Element::Position{1, 0}, 5, 1);
+    box->set_model(model);
+    const InputModel::Edit edits[] = {Input::put(0, "hi"), Input::set_cursor(2)};
+    model->apply(edits);
+    inner->add_element(box);
+    root.add_element(inner);
+    const auto r = draw(root);
+    check(r.cursor && r.cursor->x == 6 && r.cursor->y == 2, "cursor offsets add up through nested layouts (1-based)");
 }
 
 // --- glyphs ------------------------------------------------------------------------
@@ -358,7 +415,7 @@ void bug_colour_leaks_into_border() {
     const auto r = draw(chat.root);
     const bool body_green = r.frame.at(1, 1 + static_cast<int>(kHeader.size())).style.fg == kGreen;
     const bool border_plain = r.frame.at(1, 39).style == Style{};
-    known_bug(body_green && border_plain, "4: the message is green, the right border is not");
+    check(body_green && border_plain, "4 (fixed in step 3): the message is green, the right border is not");
 }
 
 // 5. The truncation marker overwrites bytes, not glyphs.
@@ -381,7 +438,7 @@ void bug_no_clipping() {
     AbsoluteLayout root({0, 0}, 8, 1);
     root.add_element(std::make_shared<Label>(Element::Position{0, 0}, 3, 1, std::vector<std::string>{"abcdef"}));
     const auto r = draw(root);
-    known_bug(visible_row(r.frame, 0) == "abc     ", "6: text wider than its element is clipped to the element");
+    check(visible_row(r.frame, 0) == "abc     ", "6 (fixed in step 3): text wider than its element is clipped to the element");
 }
 
 // 7. Position::z does not affect paint order.
@@ -390,7 +447,7 @@ void bug_z_ignored() {
     root.add_element(std::make_shared<Label>(Element::Position{0, 0, 1}, 3, 1, std::vector<std::string>{"AAA"}));
     root.add_element(std::make_shared<Label>(Element::Position{0, 0, 0}, 3, 1, std::vector<std::string>{"BBB"}));
     const auto r = draw(root);
-    known_bug(visible_row(r.frame, 0) == "AAA", "7: the element with the higher z is drawn on top");
+    check(visible_row(r.frame, 0) == "AAA", "7 (fixed in step 3): the element with the higher z is drawn on top");
 }
 
 // 8. A wide glyph that does not fit at the frame's edge is half-drawn.
@@ -420,6 +477,11 @@ int main() {
     run("border", test_border);
     run("padding and margin", test_padding_and_margin);
     run("positions and nesting", test_positions_and_nesting);
+    run("z survives a resize", test_z_survives_resize);
+    run("margin shows what is underneath", test_margin_shows_what_is_underneath);
+    run("children are clipped to their parent", test_children_are_clipped_to_their_parent);
+    run("border in the element's style", test_border_in_element_style);
+    run("cursor in nested layouts", test_cursor_in_nested_layouts);
     run("wide glyphs", test_wide_glyphs);
     run("overwriting half a wide glyph", test_overwriting_half_a_wide_glyph);
     run("combining marks", test_combining_marks);

@@ -1,6 +1,5 @@
 #include "Element.hpp"
 #include "TerminalUI.hpp"
-#include "Utils.hpp"
 #include <algorithm>
 #include <cmath>
 #include <optional>
@@ -8,56 +7,7 @@
 #include <utility>
 #include <vector>
 
-namespace {
-
-// TRANSITIONAL (design.md §13.3, removed in step 3): elements still hand over
-// rows as strings that may carry colour codes. This turns such a string into
-// cells: SGR sequences update a running Style (it lasts until the end of the
-// string), every other escape sequence is dropped, and glyphs come from
-// unicode::next_glyph(), which turns control characters into U+FFFD. So no byte
-// of the string reaches the terminal as a control sequence.
-//
-// Writes `text` starting at the 0-based cell (row, column). '\n' moves to the
-// next row and back to column 0; anything outside the frame is dropped.
-void write_text(FrameBuffer& frame, int row, int column, std::string_view text) {
-    Style style{};
-    for (size_t i = 0; i < text.size();) {
-        const char byte = text[i];
-        if (byte == '\n') {
-            ++row;
-            column = 0;
-            ++i;
-            continue;
-        }
-        if (byte == '\r') {
-            column = 0;
-            ++i;
-            continue;
-        }
-        if (byte == '\033' && i + 1 < text.size() && text[i + 1] == '[') {
-            // CSI: parameters, then a final byte in 0x40..0x7E.
-            const size_t parameters = i + 2;
-            size_t end = parameters;
-            while (end < text.size()
-                   && !(static_cast<unsigned char>(text[end]) >= 0x40
-                        && static_cast<unsigned char>(text[end]) <= 0x7E)) { ++end; }
-            if (end < text.size() && text[end] == 'm') {
-                apply_sgr(style, text.substr(parameters, end - parameters));
-            }
-            i = std::min(end + 1, text.size());
-            continue;
-        }
-
-        const unicode::GlyphRead read = unicode::next_glyph(text, i);
-        i += read.length;
-        frame.put(row, column, read.glyph, style);
-        column += read.glyph.width();
-    }
-}
-
-} // namespace
-
-Element::Element(Element::Position relative_position, int width, int height) 
+Element::Element(Element::Position relative_position, int width, int height)
     : relative_position_(relative_position)
     , width_(width)
     , height_(height)
@@ -90,8 +40,7 @@ bool Element::visible() const noexcept {
 }
 
 void Element::set_border(Border border) noexcept {
-    // Sanitised on the way in so render() can use the sides directly: a negative
-    // thickness would become a huge size_t in string::append/reserve.
+    // Sanitised on the way in so draw() can use the sides directly.
     border_ = Border{border.type,
                      std::max(0, border.top),
                      std::max(0, border.bottom),
@@ -101,6 +50,14 @@ void Element::set_border(Border border) noexcept {
 
 void Element::set_main_color(std::string_view color) noexcept {
     main_color_ = color;
+}
+
+void Element::set_style(Style style) noexcept {
+    style_ = style;
+}
+
+const Style& Element::get_style() const noexcept {
+    return style_;
 }
 
 void Element::set_margin(Margin margin) noexcept {
@@ -150,80 +107,53 @@ Element::Border::Border(BorderType type, int top, int bottom, int left, int righ
     , left(left)
     , right(right) {}
 
-void Element::render(std::vector<RenderCommand>& buffer) noexcept {
+void Element::draw(Canvas& area) {
     if (!visible_) { return; }
-    const size_t initial_buffer_size = buffer.size();
-    // Sides are already non-negative (set_border sanitises), so no clamping here.
-    const int border_left_width = border_.left;
-    const int border_right_width = border_.right;
-    const int border_top_width = border_.top;
-    const int border_bottom_width = border_.bottom;
 
-    const int inner_offset_x = margin_.left + padding_.left + border_left_width;
-    const int inner_offset_y = margin_.top + padding_.top + border_top_width;
-
-    // The box is the element minus its margins; every border row spans the full
-    // box width (all sides share one character, so the corners come out right).
-    const int box_left = margin_.left;
+    // The box is the element minus its margins. The margin is not drawn: what
+    // lies under it stays visible.
     const int box_width = std::max(0, width_ - margin_.left - margin_.right);
-    const int box_top = margin_.top;
-    const int box_bottom = height_ - margin_.bottom;   // exclusive
+    const int box_height = std::max(0, height_ - margin_.top - margin_.bottom);
+    Canvas box = area.sub(margin_.left, margin_.top, box_width, box_height);
 
-    for (int i = 0; i < border_top_width; ++i) {
-        buffer.emplace_back(
-            Position{box_left, box_top + i},
-            std::string(static_cast<size_t>(box_width), Border::border_top(border_.type))
-        );
-    }
-    for (int i = 0; i < border_bottom_width; ++i) {
-        buffer.emplace_back(
-            Position{box_left, box_bottom - 1 - i},
-            std::string(static_cast<size_t>(box_width), Border::border_bottom(border_.type))
-        );
-    }
+    box.fill(0, 0, box_width, box_height, unicode::Glyph{}, style_);
 
-    std::string inner_row_buffer;
-    inner_row_buffer.reserve(static_cast<size_t>(std::max(0, get_inner_width())));
-    this->begin_render();
-    // Iterate every row between the top and bottom border, not just the content
-    // rows: the vertical padding rows carry no content but still need their
-    // left/right border characters drawn.
-    const int content_top = inner_offset_y;
-    const int content_bottom = height_ - (margin_.bottom + padding_.bottom + border_bottom_width);
-    for (int row = box_top + border_top_width; row < box_bottom - border_bottom_width; ++row) {
-        inner_row_buffer.clear();
-        if (row >= content_top && row < content_bottom) {
-            this->inner_content(row - content_top, inner_row_buffer);
+    // Every border row spans the full box width (all sides share one character,
+    // so the corners come out right); the side columns fill the rows between.
+    const auto edge = [](char c) { return unicode::Glyph::of(static_cast<unsigned char>(c)); };
+    for (int i = 0; i < border_.top; ++i) {
+        box.fill(0, i, box_width, 1, edge(Border::border_top(border_.type)), style_);
+    }
+    for (int i = 0; i < border_.bottom; ++i) {
+        box.fill(0, box_height - 1 - i, box_width, 1, edge(Border::border_bottom(border_.type)), style_);
+    }
+    const int side_top = border_.top;
+    const int side_height = box_height - border_.top - border_.bottom;
+    box.fill(0, side_top, border_.left, side_height, edge(Border::border_left(border_.type)), style_);
+    box.fill(box_width - border_.right, side_top, border_.right, side_height,
+             edge(Border::border_right(border_.type)), style_);
+
+    Canvas inner = box.sub(border_.left + padding_.left, border_.top + padding_.top,
+                           get_inner_width(), get_inner_height());
+    draw_content(inner);
+}
+
+void LegacyElement::draw_content(Canvas& inner) {
+    begin_render();
+    std::string row_text;
+    for (int row = 0; row < get_inner_height(); ++row) {
+        row_text.clear();
+        inner_content(row, row_text);
+        inner.write_legacy(0, row, row_text);
+    }
+    std::vector<RenderCommand> commands;
+    end_render(commands);
+    for (const RenderCommand& command : commands) {
+        if (command.type == RenderCommand::Type::CURSOR) {
+            inner.set_cursor(command.anchor.x, command.anchor.y);
+        } else {
+            inner.write_legacy(command.anchor.x, command.anchor.y, command.data);
         }
-        const int content_columns = utils::utf8::width(inner_row_buffer);
-        const int padding_columns = std::max(0, get_inner_width() - content_columns);
-
-        std::string row_text;
-        row_text.reserve(static_cast<size_t>(std::max(0, width_)));
-        row_text.append(static_cast<size_t>(border_left_width), Border::border_left(border_.type));
-        row_text.append(static_cast<size_t>(padding_.left), ' ');
-        row_text.append(inner_row_buffer);
-        row_text.append(static_cast<size_t>(padding_columns), ' ');
-        row_text.append(static_cast<size_t>(padding_.right), ' ');
-        row_text.append(static_cast<size_t>(border_right_width), Border::border_right(border_.type));
-
-        buffer.emplace_back(Position{box_left, row}, std::move(row_text));
-        inner_row_buffer.clear();
-    }
-    const size_t end_render_command_buffer_start = buffer.size();
-    this->end_render(buffer);
-    for (size_t i = end_render_command_buffer_start; i < buffer.size(); ++i) {
-        auto& [x, y, z]  = buffer[i].anchor;
-        (void)z;
-        x += inner_offset_x;
-        y += inner_offset_y;
-    }
-
-    for (size_t i = initial_buffer_size; i < buffer.size(); ++i) {
-        auto& [x, y, z]  = buffer[i].anchor;
-        (void)z;
-        x += relative_position_.x;
-        y += relative_position_.y;
     }
 }
 
@@ -238,61 +168,35 @@ void AbsoluteLayout::clear_elements() noexcept {
     elements_.clear();
 }
 
-// The layout has no content of its own; children are drawn in end_render. The
-// base Element::render still emits a blank (space padded) row per inner row,
-// which conveniently clears this layout's area before the children are drawn.
-void AbsoluteLayout::begin_render() {}
+void AbsoluteLayout::draw_content(Canvas& inner) {
+    // Painter's order: lower z first. stable_sort keeps the insertion order for
+    // equal z, so later siblings still cover earlier ones.
+    std::vector<Element*> order;
+    order.reserve(elements_.size());
+    for (const auto& element : elements_) { order.push_back(element.get()); }
+    std::stable_sort(order.begin(), order.end(), [](const Element* a, const Element* b) {
+        return a->get_position().z < b->get_position().z;
+    });
 
-void AbsoluteLayout::inner_content(int /*local_row*/, std::string& /*buffer*/) {}
-
-// Children render in this layout's content plane coordinates; Element::render
-// later shifts those commands by (relative_position + inner offset) so that the
-// layout works both as a nested element and as the tree's root.
-void AbsoluteLayout::end_render(std::vector<RenderCommand>& buffer) {
-    for (const auto& element : elements_) {
-        element->render(buffer);
+    for (Element* element : order) {
+        const Position p = element->get_position();
+        Canvas area = inner.sub(p.x, p.y, element->get_width(), element->get_height());
+        element->draw(area);
     }
 }
 
-// Flattens the whole element tree into the frame grid. render() emits anchors
-// relative to the screen's content plane (0-based) and already folds the
-// element's margin/padding/border plus its relative position in, so the only
-// conversion left is the +1 to terminal (ANSI) coordinates for the cursor.
 std::optional<Renderable::Cursor> AbsoluteLayout::write_frame(FrameBuffer& frame) {
-    std::vector<RenderCommand> commands;
-    render(commands);
-
-    // Element::render translates x/y but not z, and the tree is emitted depth
-    // first. A stable sort gives the requested paint order while ties (the
-    // layout's own blank rows before its children) keep their emission order.
-    std::stable_sort(
-        commands.begin(), commands.end(),
-        [](const RenderCommand& lhs, const RenderCommand& rhs) {
-            return lhs.anchor.z < rhs.anchor.z;
-        }
-    );
-
     frame.resize(get_width(), get_height());
-    std::optional<Renderable::Cursor> cursor;
-    for (const auto& command : commands) {
-        if (command.type == RenderCommand::Type::CURSOR) {
-            // A cursor is not drawn on its own; remember the (last) requested
-            // cell so the caller can park the terminal cursor there once the
-            // frame has been drawn. Clamped, since a stale cursor may sit
-            // outside the layout after a shrink.
-            cursor = Renderable::Cursor{
-                std::clamp(command.anchor.x + 1, 1, std::max(1, frame.width)),
-                std::clamp(command.anchor.y + 1, 1, std::max(1, frame.height)),
-                Renderable::Cursor::State::VISIBLE
-            };
-            continue;
-        }
-        write_text(frame, command.anchor.y, command.anchor.x, command.data);
-    }
+    std::optional<Canvas::Point> cursor;
+    Canvas screen(frame, cursor);
+    const Position p = get_position();
+    Canvas area = screen.sub(p.x, p.y, get_width(), get_height());
+    draw(area);
 
-    return cursor;
+    if (!cursor) { return std::nullopt; }
+    // Canvas coordinates are 0-based; the terminal's are 1-based.
+    return Renderable::Cursor{cursor->x + 1, cursor->y + 1, Renderable::Cursor::State::VISIBLE};
 }
-
 
 // Renderable entry point: forwards the new terminal size into the (virtual)
 // Element::set_size override below.
@@ -324,7 +228,8 @@ void AbsoluteLayout::set_size(int width, int height) noexcept {
     const auto scale_position = [&](Element::Position position, double x_ratio, double y_ratio) {
         return Element::Position{
             std::max(0, scale_scalar(position.x, x_ratio)),
-            std::max(0, scale_scalar(position.y, y_ratio))
+            std::max(0, scale_scalar(position.y, y_ratio)),
+            position.z
         };
     };
 

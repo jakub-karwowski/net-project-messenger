@@ -46,7 +46,7 @@ void ChatModel::mutate_model() noexcept {
 }
 
 ChatWindow::ChatWindow(Element::Position relative_position, int width, int height) 
-    : Element(relative_position, width, height) {}
+    : LegacyElement(relative_position, width, height) {}
 
 
 void ChatWindow::set_model(std::weak_ptr<ChatModel> model) noexcept {
@@ -130,7 +130,7 @@ void ChatWindow::inner_content(const int row, std::string& buffer) {
 void ChatWindow::end_render(std::vector<RenderCommand>& buffer) {}
 
 InputBox::InputBox(Position relative_position, int width, int height)
-    : Element(relative_position, width, height) {}
+    : LegacyElement(relative_position, width, height) {}
 
 void InputBox::begin_render() {
     auto m_ptr = model_.lock();
