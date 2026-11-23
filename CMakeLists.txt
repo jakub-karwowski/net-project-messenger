@@ -18,3 +18,4 @@ enable_testing()
 add_subdirectory(TcpSocket)
 add_subdirectory(TerminalUI)
 
+add_subdirectory(tests)
