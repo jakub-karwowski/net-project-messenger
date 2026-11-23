@@ -18,3 +18,7 @@ add_test(NAME test_terminal_ui COMMAND test_terminal_ui)
 add_executable(test_cells test_cells.cpp)
 target_link_libraries(test_cells PRIVATE TerminalUI)
 add_test(NAME test_cells COMMAND test_cells)
+
+add_executable(test_layout test_layout.cpp)
+target_link_libraries(test_layout PRIVATE TerminalUI)
+add_test(NAME test_layout COMMAND test_layout)
