@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Unicode.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <limits>
@@ -72,36 +74,10 @@ namespace utf8 {
         return codepoint;
     }
 
-    inline bool is_combining(char32_t codepoint) noexcept {
-        return (codepoint >= 0x0300 && codepoint <= 0x036F)
-            || (codepoint >= 0x1AB0 && codepoint <= 0x1AFF)
-            || (codepoint >= 0x1DC0 && codepoint <= 0x1DFF)
-            || (codepoint >= 0x20D0 && codepoint <= 0x20FF)
-            || (codepoint >= 0xFE20 && codepoint <= 0xFE2F);
-    }
-
-    // East-Asian Wide/Fullwidth approximation (common ranges).
-    inline bool is_wide(char32_t codepoint) noexcept {
-        return (codepoint >= 0x1100  && codepoint <= 0x115F)
-            || (codepoint >= 0x2E80  && codepoint <= 0x303E)
-            || (codepoint >= 0x3041  && codepoint <= 0x33FF)
-            || (codepoint >= 0x3400  && codepoint <= 0x4DBF)
-            || (codepoint >= 0x4E00  && codepoint <= 0x9FFF)
-            || (codepoint >= 0xA000  && codepoint <= 0xA4CF)
-            || (codepoint >= 0xAC00  && codepoint <= 0xD7A3)
-            || (codepoint >= 0xF900  && codepoint <= 0xFAFF)
-            || (codepoint >= 0xFE30  && codepoint <= 0xFE4F)
-            || (codepoint >= 0xFF00  && codepoint <= 0xFF60)
-            || (codepoint >= 0xFFE0  && codepoint <= 0xFFE6)
-            || (codepoint >= 0x1F300 && codepoint <= 0x1FAFF)
-            || (codepoint >= 0x20000 && codepoint <= 0x3FFFD);
-    }
-
+    // The width table lives in Unicode.hpp; this namespace keeps the byte-level
+    // helpers line_split() and InputModel still use (design.md §13.3, step 2).
     inline int codepoint_width(char32_t codepoint) noexcept {
-        if (codepoint < 0x20 || (codepoint >= 0x7F && codepoint < 0xA0)) { return 0; }
-        if (is_combining(codepoint)) { return 0; }
-        if (is_wide(codepoint)) { return 2; }
-        return 1;
+        return unicode::width(codepoint);
     }
 
     // Display columns of s[0, up_to), ignoring CSI/SGR escape sequences and

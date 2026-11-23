@@ -1,5 +1,8 @@
 #pragma once
 
+#include "Style.hpp"
+#include "Unicode.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <memory>
@@ -12,10 +15,11 @@
 // TerminalUI only redraws the rows that actually changed.
 struct FrameBuffer {
     struct Cell {
-        // Bytes drawn at this column: a UTF-8 glyph plus the SGR sequences that
-        // preceded it, so a changed row can be redrawn without depending on the
-        // previous frame's colour state.
-        std::string text;
+        // What is drawn here; a blank glyph is drawn as a space.
+        unicode::Glyph glyph;
+        // How it is drawn. Every cell states its full style, so a row never
+        // depends on the colour state left by the cells before it.
+        Style style;
         // This column is the right half of a wide glyph starting on its left;
         // it emits nothing of its own.
         bool continuation{false};
@@ -50,15 +54,30 @@ struct FrameBuffer {
                    + static_cast<size_t>(column)];
     }
 
+    // Draws `glyph` at (row, column), keeping wide glyphs whole:
+    //   - a wide glyph partly covered (either half) is blanked entirely, so no
+    //     half of a character is ever left behind;
+    //   - a wide glyph whose right half would fall outside the frame is drawn as
+    //     a space instead.
+    // Outside the frame: nothing happens. A glyph of width 0 (a lone combining
+    // mark) is added to the glyph on its left instead, if there is one.
+    void put(int row, int column, const unicode::Glyph& glyph, const Style& style) noexcept;
+
     // True when `row` renders identically in both frames. Frames of different
     // sizes never match, so a resize forces a full repaint.
     bool row_equal(const FrameBuffer& other, int row) const noexcept;
 
-    // The bytes that reproduce `row`: one chunk per display column, blanks as
-    // spaces, a wide glyph emitted once.
+    // The bytes that reproduce `row`: an SGR sequence wherever the style changes
+    // from the previous cell (and a reset at the end if needed), each glyph once,
+    // blanks as spaces.
     std::string row_text(int row) const;
 
     bool operator==(const FrameBuffer& other) const = default;
+
+private:
+    // Blanks whatever occupies `column`; when that is half of a wide glyph, the
+    // other half too.
+    void detach(int row, int column) noexcept;
 };
 
 struct Renderable {

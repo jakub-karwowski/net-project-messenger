@@ -10,106 +10,48 @@
 
 namespace {
 
-// Flattening writes into a FrameBuffer cell grid, addressed by display column
-// rather than byte offset: element text mixes UTF-8 glyphs (1-2 columns each)
-// with ANSI SGR sequences (0 columns), so a byte-based overlay would shift
-// everything to the right of a multi-byte character.
-
-// Blanks whatever occupies `column`, including the other half of a wide glyph,
-// so overwriting one column never leaves half a character behind.
-void detach_glyph(FrameBuffer& frame, int row, int column) {
-    if (!frame.contains(row, column)) { return; }
-    FrameBuffer::Cell& cell = frame.at(row, column);
-    if (cell.continuation) {
-        cell.text.clear();
-        cell.continuation = false;
-        if (column > 0) {
-            FrameBuffer::Cell& left = frame.at(row, column - 1);
-            left.text = " ";
-            left.continuation = false;
-        }
-        return;
-    }
-    if (frame.contains(row, column + 1) && frame.at(row, column + 1).continuation) {
-        FrameBuffer::Cell& right = frame.at(row, column + 1);
-        right.text.clear();
-        right.continuation = false;
-    }
-}
-
-// Overlays `text` starting at the 0-based cell (row, column). '\n' moves to the
-// next row and back to column 0; anything outside the frame is dropped. Colour
-// sequences are kept as a prefix of the glyph they decorate, and zero-width
-// codepoints stay attached to the glyph on their left.
+// TRANSITIONAL (design.md §13.3, removed in step 3): elements still hand over
+// rows as strings that may carry colour codes. This turns such a string into
+// cells: SGR sequences update a running Style (it lasts until the end of the
+// string), every other escape sequence is dropped, and glyphs come from
+// unicode::next_glyph(), which turns control characters into U+FFFD. So no byte
+// of the string reaches the terminal as a control sequence.
+//
+// Writes `text` starting at the 0-based cell (row, column). '\n' moves to the
+// next row and back to column 0; anything outside the frame is dropped.
 void write_text(FrameBuffer& frame, int row, int column, std::string_view text) {
-    std::string pending;  // escapes / combining marks awaiting a glyph
+    Style style{};
     for (size_t i = 0; i < text.size();) {
-        const unsigned char byte = static_cast<unsigned char>(text[i]);
+        const char byte = text[i];
         if (byte == '\n') {
             ++row;
             column = 0;
-            pending.clear();
             ++i;
             continue;
         }
         if (byte == '\r') {
             column = 0;
-            pending.clear();
             ++i;
             continue;
         }
-        // CSI sequence (SGR and friends): zero display columns, so it is parked
-        // until the next glyph is placed.
         if (byte == '\033' && i + 1 < text.size() && text[i + 1] == '[') {
-            const size_t start = i;
-            i += 2;
-            while (i < text.size()
-                   && !(static_cast<unsigned char>(text[i]) >= 0x40
-                        && static_cast<unsigned char>(text[i]) <= 0x7E)) { ++i; }
-            if (i < text.size()) { ++i; }
-            pending.append(text.substr(start, i - start));
-            continue;
-        }
-
-        const size_t start = i;
-        i = utils::utf8::next(text, i);
-        const std::string_view glyph = text.substr(start, i - start);
-        size_t decode_at = start;
-        const int glyph_width =
-            utils::utf8::codepoint_width(utils::utf8::decode(text, decode_at));
-
-        if (glyph_width <= 0) {
-            // Combining mark: belongs to the glyph already drawn to its left.
-            if (column > 0 && frame.contains(row, column - 1)) {
-                frame.at(row, column - 1).text.append(glyph);
-            } else {
-                pending.append(glyph);
+            // CSI: parameters, then a final byte in 0x40..0x7E.
+            const size_t parameters = i + 2;
+            size_t end = parameters;
+            while (end < text.size()
+                   && !(static_cast<unsigned char>(text[end]) >= 0x40
+                        && static_cast<unsigned char>(text[end]) <= 0x7E)) { ++end; }
+            if (end < text.size() && text[end] == 'm') {
+                apply_sgr(style, text.substr(parameters, end - parameters));
             }
+            i = std::min(end + 1, text.size());
             continue;
         }
 
-        if (!frame.contains(row, column)) {
-            column += glyph_width;
-            pending.clear();  // the escapes decorated a dropped glyph
-            continue;
-        }
-
-        // Blow away the right half before the left one: detaching the right
-        // half blanks its left neighbour, which would otherwise erase the glyph
-        // written in the previous iteration.
-        detach_glyph(frame, row, column + 1);
-        detach_glyph(frame, row, column);
-        FrameBuffer::Cell& cell = frame.at(row, column);
-        cell.text = pending;
-        cell.text.append(glyph);
-        cell.continuation = false;
-        pending.clear();
-        if (glyph_width > 1 && frame.contains(row, column + 1)) {
-            FrameBuffer::Cell& right = frame.at(row, column + 1);
-            right.text.clear();
-            right.continuation = true;
-        }
-        column += glyph_width;
+        const unicode::GlyphRead read = unicode::next_glyph(text, i);
+        i += read.length;
+        frame.put(row, column, read.glyph, style);
+        column += read.glyph.width();
     }
 }
 

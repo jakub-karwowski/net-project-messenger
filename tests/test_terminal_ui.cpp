@@ -103,6 +103,8 @@ std::string repeat(std::string_view piece, int times) {
     return out;
 }
 
+const Color kGreen = Color::ansi(2);   // what "\033[32m" sets
+
 // 2026-11-23 14:05 UTC, rendered by ChatWindow as "2026-11-23[14:05]".
 std::chrono::system_clock::time_point fixed_time() {
     using namespace std::chrono;
@@ -206,7 +208,7 @@ void test_combining_marks() {
     AbsoluteLayout root({0, 0}, 3, 1);
     root.add_element(std::make_shared<Label>(Element::Position{0, 0}, 3, 1, std::vector<std::string>{"éx"}));
     const auto r = draw(root);
-    check(r.frame.at(0, 0).text == "é" && r.frame.at(0, 1).text == "x",
+    check(r.frame.at(0, 0).glyph.text() == "é" && r.frame.at(0, 1).glyph.text() == "x",
           "a combining mark joins the glyph on its left");
 }
 
@@ -322,7 +324,18 @@ void bug_peer_text_reaches_terminal() {
         const std::string raw = raw_row(r.frame, row);
         clean = clean && raw.find('\033') == std::string::npos && raw.find('\a') == std::string::npos;
     }
-    known_bug(clean, "2: escape and control characters from a message never reach the terminal");
+    check(clean, "2 (fixed in step 1): escape and control characters from a message never reach the terminal");
+}
+
+// 2b. A peer can still colour its own text: the transitional write_text()
+// turns SGR codes in any text into styles. Fixed once text is cleaned at the
+// input boundary (step 5).
+void bug_peer_can_set_colours() {
+    ChatSetup chat(40, 3);
+    chat.add("\033[31mred");
+    const auto r = draw(chat.root);
+    const int body = static_cast<int>(kHeader.size());
+    known_bug(r.frame.at(2, body).style == Style{}, "2b: colour codes in a message do not change its style");
 }
 
 // 3. A wrapped line loses the colour of the text it continues. The body is
@@ -332,7 +345,7 @@ void bug_wrapped_line_loses_colour() {
     chat.window->set_main_color("\033[32m");
     chat.add("aaaa bbbb cccc dddd eeee ffff gggg hhhh");
     const auto r = draw(chat.root);
-    known_bug(visible_row(r.frame, 3).starts_with("gggg") && raw_row(r.frame, 3).find("\033[32m") != std::string::npos,
+    known_bug(visible_row(r.frame, 3).starts_with("gggg") && r.frame.at(3, 0).style.fg == kGreen,
               "3: a continuation line is still drawn in the message colour");
 }
 
@@ -343,12 +356,9 @@ void bug_colour_leaks_into_border() {
     chat.window->set_main_color("\033[32m");
     chat.add("hi");
     const auto r = draw(chat.root);
-    const std::string raw = raw_row(r.frame, 1);
-    const size_t green = raw.rfind("\033[32m");
-    const size_t reset = raw.find("\033[0m", green == std::string::npos ? 0 : green);
-    const size_t border = raw.rfind('#');
-    known_bug(green != std::string::npos && reset != std::string::npos && reset < border,
-              "4: the colour is reset before the right border");
+    const bool body_green = r.frame.at(1, 1 + static_cast<int>(kHeader.size())).style.fg == kGreen;
+    const bool border_plain = r.frame.at(1, 39).style == Style{};
+    known_bug(body_green && border_plain, "4: the message is green, the right border is not");
 }
 
 // 5. The truncation marker overwrites bytes, not glyphs.
@@ -388,8 +398,8 @@ void bug_wide_glyph_at_edge() {
     AbsoluteLayout root({0, 0}, 3, 1);
     root.add_element(std::make_shared<Label>(Element::Position{2, 0}, 2, 1, std::vector<std::string>{"日"}));
     const auto r = draw(root);
-    known_bug(r.frame.at(0, 2).text.find("日") == std::string::npos,
-              "8: a wide glyph that would stick out of the frame is not drawn");
+    check(r.frame.at(0, 2).glyph.text().find("日") == std::string::npos,
+          "8 (fixed in step 1): a wide glyph that would stick out of the frame is not drawn");
 }
 
 // 9. Drawing a narrow glyph breaks the wide glyph to its right: write_text()
@@ -400,8 +410,8 @@ void bug_narrow_glyph_breaks_right_neighbour() {
     root.add_element(std::make_shared<Label>(Element::Position{0, 0}, 4, 1, std::vector<std::string>{"日本"}));
     root.add_element(std::make_shared<Label>(Element::Position{1, 0}, 1, 1, std::vector<std::string>{"x"}));
     const auto r = draw(root);
-    known_bug(r.frame.at(0, 3).continuation && visible_row(r.frame, 0) == " x本  ",
-              "9: the wide glyph right of an overwritten cell keeps its right half");
+    check(r.frame.at(0, 3).continuation && visible_row(r.frame, 0) == " x本  ",
+          "9 (fixed in step 1): the wide glyph right of an overwritten cell keeps its right half");
 }
 
 }  // namespace
@@ -426,6 +436,7 @@ int main() {
     run("known bugs", [] {
         bug_wrap_counts_escapes();
         bug_peer_text_reaches_terminal();
+        bug_peer_can_set_colours();
         bug_wrapped_line_loses_colour();
         bug_colour_leaks_into_border();
         bug_truncation_splits_a_glyph();

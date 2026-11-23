@@ -50,16 +50,77 @@ bool FrameBuffer::row_equal(const FrameBuffer& other, int row) const noexcept {
     );
 }
 
+void FrameBuffer::detach(int row, int column) noexcept {
+    if (!contains(row, column)) { return; }
+    Cell& cell = at(row, column);
+    if (cell.continuation) {
+        // The right half of a wide glyph: its left half goes too.
+        if (column > 0) {
+            Cell& left = at(row, column - 1);
+            left.glyph = unicode::Glyph{};
+            left.continuation = false;
+        }
+    } else if (cell.glyph.width() == 2 && contains(row, column + 1)) {
+        // The left half of a wide glyph: its right half goes too.
+        Cell& right = at(row, column + 1);
+        right.glyph = unicode::Glyph{};
+        right.continuation = false;
+    }
+    cell.glyph = unicode::Glyph{};
+    cell.continuation = false;
+}
+
+void FrameBuffer::put(int row, int column, const unicode::Glyph& glyph, const Style& style) noexcept {
+    if (glyph.width() == 0) {
+        // A lone combining mark: it belongs to the glyph on its left.
+        int left = column - 1;
+        if (contains(row, left) && at(row, left).continuation) { --left; }
+        if (contains(row, left) && !at(row, left).glyph.empty()) {
+            for (size_t pos = 0; pos < glyph.text().size();) {
+                const unicode::Decoded mark = unicode::decode(glyph.text(), pos);
+                std::ignore = at(row, left).glyph.append(mark.codepoint);
+                pos += mark.length;
+            }
+        }
+        return;
+    }
+    if (!contains(row, column)) { return; }
+
+    // Only the columns the new glyph covers are cleared; a neighbour is touched
+    // only when one of them held half of it.
+    const bool wide = glyph.width() == 2;
+    const bool fits = !wide || contains(row, column + 1);
+    detach(row, column);
+    if (wide && fits) { detach(row, column + 1); }
+
+    Cell& cell = at(row, column);
+    cell.glyph = fits ? glyph : unicode::Glyph{};   // cut off by the edge: a space instead
+    cell.style = style;
+    cell.continuation = false;
+    if (wide && fits) {
+        Cell& right = at(row, column + 1);
+        right.glyph = unicode::Glyph{};
+        right.style = style;
+        right.continuation = true;
+    }
+}
+
 std::string FrameBuffer::row_text(int row) const {
     std::string text;
     if (row < 0 || row >= height) { return text; }
     text.reserve(static_cast<size_t>(width));
+    Style current{};   // TerminalUI::render() starts every row with a reset
     for (int column = 0; column < width; ++column) {
         const Cell& cell = at(row, column);
         if (cell.continuation) { continue; }
-        if (cell.text.empty()) { text.push_back(' '); }
-        else { text.append(cell.text); }
+        if (cell.style != current) {
+            append_sgr(text, cell.style);
+            current = cell.style;
+        }
+        if (cell.glyph.empty()) { text.push_back(' '); }
+        else { text.append(cell.glyph.text()); }
     }
+    if (current != Style{}) { append_sgr(text, Style{}); }
     return text;
 }
 
