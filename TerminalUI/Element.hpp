@@ -92,11 +92,6 @@ struct Element {
     virtual void set_size(int width, int height) noexcept;
     bool visible() const noexcept;
 
-    // TRANSITIONAL (until step 4): a colour as an SGR string, read by widgets
-    // that still build their text with colour codes. Must outlive the element.
-    std::string_view get_main_color() const noexcept;
-    void set_main_color(std::string_view color) noexcept;
-
     // Draws the element into `area`, a canvas of the element's size at its
     // position. The margin is left untouched; the rest of the box is cleared in
     // the element's style, then the border is drawn, then draw_content() fills
@@ -116,30 +111,7 @@ private:
     Margin margin_;
     Padding padding_;
     Style style_{};
-    std::string_view main_color_{};
     bool visible_;
-};
-
-// TRANSITIONAL (removed in step 4, design.md §13.3): the old interface for
-// widgets that still produce each inner row as a string with colour codes.
-// draw_content() calls begin_render(), then inner_content() once per inner row,
-// then end_render(), and writes what they produced into the canvas.
-struct LegacyElement : Element {
-    struct RenderCommand {
-        enum struct Type { TEXT, CURSOR };
-        Position anchor;   // relative to the inner area
-        std::string data;
-        Type type{Type::TEXT};
-    };
-
-    using Element::Element;
-
-    virtual void begin_render() = 0;
-    virtual void inner_content(int local_row, std::string& buffer) = 0;
-    virtual void end_render(std::vector<RenderCommand>& buffer) = 0;
-
-protected:
-    void draw_content(Canvas& inner) override;
 };
 
 // Places children at their positions inside its inner area and draws them in

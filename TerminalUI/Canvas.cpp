@@ -72,38 +72,3 @@ void Canvas::set_cursor(int x, int y) noexcept {
     *cursor_ = Point{std::clamp(origin_x_ + x, clip_left_, clip_right_ - 1),
                      std::clamp(origin_y_ + y, clip_top_, clip_bottom_ - 1)};
 }
-
-void Canvas::write_legacy(int x, int y, std::string_view text) noexcept {
-    Style style{};
-    int column = x;
-    for (size_t i = 0; i < text.size();) {
-        if (text[i] == '\n') {
-            ++y;
-            column = x;
-            ++i;
-            continue;
-        }
-        if (text[i] == '\r') {
-            column = x;
-            ++i;
-            continue;
-        }
-        if (text[i] == '\033' && i + 1 < text.size() && text[i + 1] == '[') {
-            // CSI: parameters, then a final byte in 0x40..0x7E. Only SGR is kept.
-            const size_t parameters = i + 2;
-            size_t end = parameters;
-            while (end < text.size()
-                   && !(static_cast<unsigned char>(text[end]) >= 0x40
-                        && static_cast<unsigned char>(text[end]) <= 0x7E)) { ++end; }
-            if (end < text.size() && text[end] == 'm') {
-                apply_sgr(style, text.substr(parameters, end - parameters));
-            }
-            i = std::min(end + 1, text.size());
-            continue;
-        }
-        const unicode::GlyphRead read = unicode::next_glyph(text, i);
-        i += read.length;
-        put(column, y, read.glyph, style);
-        column += read.glyph.width();
-    }
-}

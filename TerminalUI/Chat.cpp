@@ -4,7 +4,7 @@
 #include "Utils.hpp"
 #include <algorithm>
 #include <cstddef>
-#include <iterator>
+#include <format>
 #include <type_traits>
 #include <variant>
 
@@ -15,6 +15,8 @@ namespace {
     template<class>
     inline constexpr bool always_false_v = false;
 }
+
+// --- ChatModel --------------------------------------------------------------------
 
 void ChatModel::add_message(std::chrono::time_point<std::chrono::system_clock> recived_time, std::string sender, std::string message) {
     msg_.emplace_back(recived_time, std::move(sender), std::move(message));
@@ -45,201 +47,138 @@ void ChatModel::mutate_model() noexcept {
     if (++model_state_ == 0) { ++model_state_; }
 }
 
-ChatWindow::ChatWindow(Element::Position relative_position, int width, int height) 
-    : LegacyElement(relative_position, width, height) {}
+// --- ChatWindow -------------------------------------------------------------------
 
+ChatWindow::ChatWindow(Element::Position relative_position, int width, int height)
+    : Element(relative_position, width, height) {}
 
 void ChatWindow::set_model(std::weak_ptr<ChatModel> model) noexcept {
     model_ = std::move(model);
     last_model_state_ = 0;
 }
 
-void ChatWindow::set_separator_color(std::string_view color) noexcept {
-    sep_color_ = color;
+void ChatWindow::set_separator_style(Style style) noexcept {
+    separator_style_ = style;
     last_model_state_ = 0;
 }
 
-void ChatWindow::begin_render() {
-    auto m_ptr = model_.lock();
-    if (!m_ptr) { return; }
+void ChatWindow::set_message_style(Style style) noexcept {
+    message_style_ = style;
+    last_model_state_ = 0;
+}
 
-    const size_t current_state = m_ptr->get_state();
-    const int current_width = get_inner_width();
-    const int current_height = get_inner_height();
+StyledText ChatWindow::styled(const ChatModel::ChatMsg& message) const {
+    StyledText text;
+    text.add(std::format("{}@{:%Y-%m-%d[%H:%M]}{}", message.sender, message.recived_time, sep_), separator_style_);
+    text.add(message.message, message_style_);
+    return text;
+}
 
-    if (current_state == last_model_state_ &&
-        current_width == last_width_ &&
-        current_height == last_height_) 
-    { 
-        return; 
+void ChatWindow::rebuild(const ChatModel& model, int width, int height) {
+    layouts_.clear();
+    rows_.clear();
+    truncated_ = false;
+    const auto messages = model.get_messages();
+    if (height <= 0 || messages.empty()) { return; }
+
+    // Newest first, only as many messages as it takes to fill the window.
+    const size_t wanted = static_cast<size_t>(height);
+    size_t lines = 0;
+    size_t first = messages.size();
+    while (first > 0 && lines < wanted) {
+        --first;
+        layouts_.push_back(TextLayout::wrap(styled(messages[first]), width));
+        lines += layouts_.back().lines().size();
     }
+    std::reverse(layouts_.begin(), layouts_.end());
 
-    last_model_state_ = current_state;
-    last_width_ = current_width;
-    last_height_ = current_height;
-
-    line_buffer_.clear();
-    frame_buffer_.clear(); 
-
-    auto messages = m_ptr->get_messages();
-    if (messages.empty()) { return; }
-
-    const size_t max_n_char_needed = current_height * current_width;
-    size_t n_char_to_buffer = 0;
-    auto itr = messages.end();
-    do {
-        --itr;
-        n_char_to_buffer += itr->message.size();
-    } while (
-        itr != messages.begin() 
-        && std::distance(itr, messages.end()) <= current_height
-        && n_char_to_buffer < max_n_char_needed
-    );
-    
-
-    for (const auto& chat_msg : std::span{itr, messages.end()}) {
-        std::format_to(
-            std::back_inserter(frame_buffer_), 
-            "{}{}@{:%Y-%m-%d[%H:%M]}{}{}{}\n", 
-            sep_color_, chat_msg.sender, chat_msg.recived_time, sep_, get_main_color(), chat_msg.message
-        );
-    }
-
-    const auto [n_lines, is_consumed] = utils::line_split_tail(
-        line_buffer_, frame_buffer_, current_width, current_height
-    );
-
-    if (!is_consumed && !line_buffer_.empty()) {
-        auto first_line = line_buffer_.front();
-        if (first_line.size() > trunc_symbol_.size()) {
-            size_t offset = first_line.data() - frame_buffer_.data();
-            frame_buffer_.replace(offset, trunc_symbol_.size(), trunc_symbol_);
+    // The last `height` lines of those messages, in order.
+    size_t skip = lines > wanted ? lines - wanted : 0;
+    truncated_ = skip > 0 || first > 0;
+    for (size_t i = 0; i < layouts_.size(); ++i) {
+        for (size_t line = 0; line < layouts_[i].lines().size(); ++line) {
+            if (skip > 0) { --skip; continue; }
+            rows_.push_back(Row{i, line});
         }
     }
 }
 
-void ChatWindow::inner_content(const int row, std::string& buffer) {
-    if (row >= get_inner_height()) { return; }
-    int empty_rows = get_inner_height() - line_buffer_.size();
-    if (row >= empty_rows) {
-        int line_idx = row - empty_rows;
-        buffer.append(line_buffer_[line_idx]);
+void ChatWindow::draw_content(Canvas& inner) {
+    const auto model = model_.lock();
+    if (!model) { return; }
+
+    const int width = get_inner_width();
+    const int height = get_inner_height();
+    if (model->get_state() != last_model_state_ || width != last_width_ || height != last_height_) {
+        rebuild(*model, width, height);
+        last_model_state_ = model->get_state();
+        last_width_ = width;
+        last_height_ = height;
+    }
+
+    const int top = height - static_cast<int>(rows_.size());   // bottom-aligned
+    for (size_t i = 0; i < rows_.size(); ++i) {
+        inner.text(0, top + static_cast<int>(i), layouts_[rows_[i].layout].line_glyphs(rows_[i].line));
+    }
+
+    // Something is hidden above: the top row starts with the marker, drawn in the
+    // style of what it covers. Drawn as glyphs, so it can only ever replace
+    // whole glyphs (a wide glyph it half covers is blanked by Canvas::put).
+    if (truncated_ && !rows_.empty()) {
+        const auto first_line = layouts_[rows_.front().layout].line_glyphs(rows_.front().line);
+        const int columns = layouts_[rows_.front().layout].lines()[rows_.front().line].columns;
+        if (columns > static_cast<int>(trunc_symbol_.size())) {
+            inner.text(0, top, trunc_symbol_, first_line.front().style);
+        }
     }
 }
 
-void ChatWindow::end_render(std::vector<RenderCommand>& buffer) {}
+// --- InputBox ---------------------------------------------------------------------
 
 InputBox::InputBox(Position relative_position, int width, int height)
-    : LegacyElement(relative_position, width, height) {}
+    : Element(relative_position, width, height) {}
 
-void InputBox::begin_render() {
-    auto m_ptr = model_.lock();
-    if (!m_ptr) { return; }
-
-    const size_t current_state = m_ptr->get_state();
-    const int current_width = get_inner_width();
-    const int current_height = get_inner_height();
-
-    if (current_state == last_model_state_ &&
-        current_width == last_width_ &&
-        current_height == last_height_) {
-        if (const auto current_cursor = m_ptr->get_cursor(); current_cursor != last_model_cursor_) {
-            move_cursor(current_cursor);
-            last_model_cursor_ = current_cursor;
-        }
-        return;
-    }
-
-    last_model_state_ = current_state;
-    last_width_ = current_width;
-    last_height_ = current_height;
-
-    line_buffer_.clear();
-    frame_buffer_.clear();
-
-    const auto [content_view, cursor_pos] = m_ptr->get_content();
-    
-    frame_buffer_ = content_view;
-
-    // Unbounded: the viewport window picks which lines are displayed, so the
-    // wrap must not stop at the visible height.
-    utils::line_split(line_buffer_, frame_buffer_, current_width);
-
-    cursor_visible_ = false;
-    cursor_draw_x_ = 0;
-    cursor_draw_y_ = 0;
-
-    if (frame_buffer_.empty()) {
-        cursor_visible_ = true;
-        first_visible_line_ = 0;
-        last_model_cursor_ = cursor_pos;
-        return;
-    }
-
-    move_cursor(cursor_pos);
-    // Keep the cache in sync with what was just drawn: a later cursor move back
-    // to this exact offset would otherwise be skipped as a no-op and leave the
-    // cursor (and the window it drives) showing the previous position.
-    last_model_cursor_ = cursor_pos;
+void InputBox::set_model(std::weak_ptr<InputModel> model) noexcept {
+    model_ = std::move(model);
+    last_model_state_ = 0;
 }
 
-void InputBox::move_cursor(size_t cursor_pos) {
-    const size_t cursor_target = utils::utf8::align(frame_buffer_, std::min(cursor_pos, frame_buffer_.size()));
-    for (int row = 0; row < static_cast<int>(line_buffer_.size()); ++row) {
-        const auto& line = line_buffer_[row];
-        size_t line_start_idx = std::distance<const char*>(frame_buffer_.data(), line.data());
-        size_t next_line_start = (row + 1 < static_cast<int>(line_buffer_.size())) 
-            ? std::distance<const char*>(frame_buffer_.data(), line_buffer_[row + 1].data()) 
-            : std::string::npos; 
-        if (cursor_target < next_line_start) {
-            // Minimal scrolling: the window keeps its place while the cursor
-            // stays inside it and follows only when the cursor leaves it. It
-            // never scrolls past the final line, so the last page is shown in
-            // full instead of leaving blank rows below it.
-            const size_t height = static_cast<size_t>(std::max(0, get_inner_height()));
-            const size_t cursor_row = static_cast<size_t>(row);
-            if (cursor_row < first_visible_line_) {
-                first_visible_line_ = cursor_row;
-            } else if (cursor_row >= first_visible_line_ + height) {
-                first_visible_line_ = cursor_row + 1 - height;
-            }
-            const size_t last_start =
-                line_buffer_.size() > height ? line_buffer_.size() - height : 0;
-            first_visible_line_ = std::min(first_visible_line_, last_start);
+void InputBox::draw_content(Canvas& inner) {
+    const auto model = model_.lock();
+    if (!model) { return; }
 
-            cursor_draw_y_ = row - static_cast<int>(std::min(first_visible_line_, cursor_row));
-            const size_t logical_x = std::min(cursor_target - line_start_idx, line.size());
-            cursor_draw_x_ = utils::utf8::width(line.substr(0, logical_x));
-            cursor_visible_ = true;
-            break;
-        }
+    const auto [content, cursor] = model->get_content();
+    const int width = get_inner_width();
+    const int height = get_inner_height();
+    if (model->get_state() != last_model_state_ || width != last_width_ || get_style() != last_style_) {
+        // Unbounded: the view picks which lines are shown, so the wrap must not
+        // stop at the visible height.
+        layout_ = TextLayout::wrap(StyledText(content, get_style()), width);
+        last_model_state_ = model->get_state();
+        last_width_ = width;
+        last_style_ = get_style();
     }
+    if (height <= 0) { return; }
+
+    // Minimal scrolling: follow the cursor only when it leaves the view, and
+    // never scroll past the last line, so the last page is shown in full.
+    const TextLayout::Position at = layout_.locate(cursor);
+    const size_t visible = static_cast<size_t>(height);
+    if (at.line < first_visible_line_) {
+        first_visible_line_ = at.line;
+    } else if (at.line >= first_visible_line_ + visible) {
+        first_visible_line_ = at.line + 1 - visible;
+    }
+    const size_t line_count = layout_.lines().size();
+    first_visible_line_ = std::min(first_visible_line_, line_count > visible ? line_count - visible : 0);
+
+    for (size_t row = 0; row < visible && first_visible_line_ + row < line_count; ++row) {
+        inner.text(0, static_cast<int>(row), layout_.line_glyphs(first_visible_line_ + row));
+    }
+    inner.set_cursor(at.column, static_cast<int>(at.line - first_visible_line_));
 }
 
-void InputBox::inner_content(int row, std::string& buffer) {
-    // Element::render only asks for rows inside the box, so the viewport is a
-    // plain offset into the wrapped lines; the bounds check also covers a stale
-    // first_visible_line_ (no row matched in move_cursor).
-    const size_t line = first_visible_line_ + static_cast<size_t>(row);
-    if (line < line_buffer_.size()) {
-        buffer.append(line_buffer_[line]);
-    }
-}
-
-void InputBox::end_render(std::vector<RenderCommand> &buffer) {
-    // The row is box-local, so a cursor outside the rendered rows (possible when
-    // the element is no taller than its borders) must not be anchored.
-    if (!cursor_visible_ || cursor_draw_y_ < 0 || cursor_draw_y_ >= get_inner_height()) {
-        return;
-    }
-    buffer.push_back(
-        RenderCommand{
-            Position{cursor_draw_x_, cursor_draw_y_},
-            {}, 
-            RenderCommand::Type::CURSOR
-        }
-    );
-}
+// --- InputModel -------------------------------------------------------------------
 
 void InputModel::apply(std::span<const Edit> edits) {
     bool content_changed = false;
@@ -286,9 +225,4 @@ size_t InputModel::get_state() const noexcept {
 
 void InputModel::mutate_content() noexcept {
     if (++content_state_ == 0) { ++content_state_; }
-}
-
-void InputBox::set_model(std::weak_ptr<InputModel> model) noexcept {
-    model_ = std::move(model);
-    last_model_state_ = 0;
 }

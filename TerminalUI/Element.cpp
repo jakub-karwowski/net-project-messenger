@@ -48,10 +48,6 @@ void Element::set_border(Border border) noexcept {
                      std::max(0, border.right)};
 }
 
-void Element::set_main_color(std::string_view color) noexcept {
-    main_color_ = color;
-}
-
 void Element::set_style(Style style) noexcept {
     style_ = style;
 }
@@ -88,10 +84,6 @@ int Element::get_inner_width() const noexcept {
     return width_ - (margin_.left + margin_.right)
                    - (padding_.left + padding_.right)
                    - (border_.left + border_.right);
-}
-
-std::string_view Element::get_main_color() const noexcept {
-    return main_color_;
 }
 
 Element::Border::Border()
@@ -136,25 +128,6 @@ void Element::draw(Canvas& area) {
     Canvas inner = box.sub(border_.left + padding_.left, border_.top + padding_.top,
                            get_inner_width(), get_inner_height());
     draw_content(inner);
-}
-
-void LegacyElement::draw_content(Canvas& inner) {
-    begin_render();
-    std::string row_text;
-    for (int row = 0; row < get_inner_height(); ++row) {
-        row_text.clear();
-        inner_content(row, row_text);
-        inner.write_legacy(0, row, row_text);
-    }
-    std::vector<RenderCommand> commands;
-    end_render(commands);
-    for (const RenderCommand& command : commands) {
-        if (command.type == RenderCommand::Type::CURSOR) {
-            inner.set_cursor(command.anchor.x, command.anchor.y);
-        } else {
-            inner.write_legacy(command.anchor.x, command.anchor.y, command.data);
-        }
-    }
 }
 
 AbsoluteLayout::AbsoluteLayout(Element::Position relative_position, int width, int height)

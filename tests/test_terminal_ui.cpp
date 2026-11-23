@@ -41,7 +41,8 @@ void check(bool condition, const std::string& what) {
     }
 }
 
-void known_bug(bool wanted_behaviour_holds, const std::string& what) {
+// Unused while no bug is open; kept for the next one found.
+[[maybe_unused]] void known_bug(bool wanted_behaviour_holds, const std::string& what) {
     if (wanted_behaviour_holds) {
         ++g_fixed_bugs;
         std::cout << "  XPASS (fixed, make it a check): " << what << '\n';
@@ -101,7 +102,7 @@ std::string repeat(std::string_view piece, int times) {
     return out;
 }
 
-const Color kGreen = Color::ansi(2);   // what "\033[32m" sets
+const Color kGreen = Color::ansi(2);
 
 // 2026-11-23 14:05 UTC, rendered by ChatWindow as "2026-11-23[14:05]".
 std::chrono::system_clock::time_point fixed_time() {
@@ -303,6 +304,45 @@ void test_chat_truncation_marker() {
     check(visible_row(r.frame, 0).starts_with("...ld foo bar baz"), "a cut-off top line starts with ...");
 }
 
+void test_chat_styles() {
+    ChatSetup chat(30, 1);
+    chat.window->set_separator_style(Style{.fg = Color::ansi(1)});
+    chat.window->set_message_style(Style{.fg = kGreen});
+    chat.add("abc");
+    const auto r = draw(chat.root);
+    const int body = static_cast<int>(kHeader.size());
+    check(r.frame.at(0, 0).style.fg == Color::ansi(1) && r.frame.at(0, body - 1).style.fg == Color::ansi(1),
+          "the header is in the separator style");
+    check(r.frame.at(0, body).style.fg == kGreen && r.frame.at(0, body + 2).style.fg == kGreen,
+          "the text is in the message style");
+}
+
+void test_chat_multiline_message() {
+    ChatSetup chat(30, 3);
+    chat.add("one\ntwo");
+    const auto r = draw(chat.root);
+    check(visible_row(r.frame, 1).starts_with(kHeader + "one") && visible_row(r.frame, 2).starts_with("two "),
+          "a newline in a message starts a new row");
+}
+
+void test_chat_marker_when_older_messages_are_hidden() {
+    ChatSetup chat(30, 1);
+    chat.add("old");
+    chat.add("new");
+    const auto r = draw(chat.root);
+    check(visible_row(r.frame, 0).starts_with("...") && visible_row(r.frame, 0).find("new") != std::string::npos,
+          "older messages above the window are marked too");
+}
+
+void test_chat_marker_over_wide_glyphs() {
+    ChatSetup chat(30, 1);
+    chat.add(repeat("日", 30));   // the visible line is all wide glyphs
+    const auto r = draw(chat.root);
+    check(visible_row(r.frame, 0).starts_with("... 日"), "the marker blanks the wide glyph it half covers");
+    check(!r.frame.at(0, 3).continuation && r.frame.at(0, 4).glyph.text() == "日" && r.frame.at(0, 5).continuation,
+          "and no half glyph is left");
+}
+
 // --- InputBox -------------------------------------------------------------------
 
 void test_input_cursor() {
@@ -344,6 +384,30 @@ void test_input_scrolls_with_cursor() {
     check(r.cursor && r.cursor->x == 1 && r.cursor->y == 1, "cursor at the start");
 }
 
+void test_input_newline_moves_the_cursor_down() {
+    InputSetup input(10, 3);
+    input.set("ab\n", 3);
+    const auto r = draw(input.root);
+    check(r.cursor && r.cursor->x == 1 && r.cursor->y == 2,
+          "after a trailing newline the cursor is at the start of the next line (new in step 4)");
+}
+
+void test_input_shows_controls_and_keeps_the_cursor() {
+    InputSetup input(10, 1);
+    input.set("a\x01" "b", 3);   // split: "\x01b" would be the one byte 0x1B
+    const auto r = draw(input.root);
+    check(visible_row(r.frame, 0).starts_with("a\uFFFDb"), "a control character shows as U+FFFD");
+    check(r.cursor && r.cursor->x == 4, "and the cursor after it is still in the right column");
+}
+
+void test_input_uses_the_element_style() {
+    InputSetup input(10, 1);
+    input.box->set_style(Style{.fg = kGreen});
+    input.set("hi", 2);
+    const auto r = draw(input.root);
+    check(r.frame.at(0, 0).style.fg == kGreen && r.frame.at(0, 5).style.fg == kGreen, "text and background in the box's style");
+}
+
 void test_input_model_edits_respect_glyphs() {
     InputModel model;
     const InputModel::Edit put_e[] = {Input::put(0, "é")};
@@ -364,11 +428,11 @@ void test_input_model_edits_respect_glyphs() {
 // 1. Wrapping counts colour escape bytes as visible columns.
 void bug_wrap_counts_escapes() {
     ChatSetup chat(30, 3);
-    chat.window->set_separator_color("\033[31m");
-    chat.window->set_main_color("\033[32m");
+    chat.window->set_separator_style(Style{.fg = Color::ansi(1)});
+    chat.window->set_message_style(Style{.fg = kGreen});
     chat.add("abcdefg");   // header + body = exactly 30 columns
     const auto r = draw(chat.root);
-    known_bug(visible_row(r.frame, 2) == kHeader + "abcdefg", "1: coloured text that fits one row stays on one row");
+    check(visible_row(r.frame, 2) == kHeader + "abcdefg", "1 (fixed in step 4): coloured text that fits one row stays on one row");
 }
 
 // 2. Control sequences in a peer's message reach the terminal.
@@ -392,25 +456,25 @@ void bug_peer_can_set_colours() {
     chat.add("\033[31mred");
     const auto r = draw(chat.root);
     const int body = static_cast<int>(kHeader.size());
-    known_bug(r.frame.at(2, body).style == Style{}, "2b: colour codes in a message do not change its style");
+    check(r.frame.at(2, body).style == Style{}, "2b (fixed in step 4): colour codes in a message do not change its style");
 }
 
 // 3. A wrapped line loses the colour of the text it continues. The body is
 // longer than a row, so its second row is a continuation line.
 void bug_wrapped_line_loses_colour() {
     ChatSetup chat(30, 4);
-    chat.window->set_main_color("\033[32m");
+    chat.window->set_message_style(Style{.fg = kGreen});
     chat.add("aaaa bbbb cccc dddd eeee ffff gggg hhhh");
     const auto r = draw(chat.root);
-    known_bug(visible_row(r.frame, 3).starts_with("gggg") && r.frame.at(3, 0).style.fg == kGreen,
-              "3: a continuation line is still drawn in the message colour");
+    check(visible_row(r.frame, 3).starts_with("hhhh") && r.frame.at(3, 0).style.fg == kGreen,
+              "3 (fixed in step 4): a continuation line is still drawn in the message colour");
 }
 
 // 4. Content colour leaks into the padding and right border.
 void bug_colour_leaks_into_border() {
     ChatSetup chat(40, 3);
     chat.window->set_border(Element::Border(Element::Border::BorderType::Hash));
-    chat.window->set_main_color("\033[32m");
+    chat.window->set_message_style(Style{.fg = kGreen});
     chat.add("hi");
     const auto r = draw(chat.root);
     const bool body_green = r.frame.at(1, 1 + static_cast<int>(kHeader.size())).style.fg == kGreen;
@@ -430,7 +494,7 @@ void bug_truncation_splits_a_glyph() {
         else if (row[i] == ' ') { ++i; }
         else { only_e = false; }
     }
-    known_bug(only_e, "5: after the ... marker every glyph is intact");
+    check(only_e, "5 (fixed in step 4): after the ... marker every glyph is intact");
 }
 
 // 6. An element can draw outside its own box.
@@ -489,10 +553,17 @@ int main() {
     run("chat: several messages", test_chat_several_messages);
     run("chat: word wrap", test_chat_word_wrap);
     run("chat: truncation marker", test_chat_truncation_marker);
+    run("chat: styles", test_chat_styles);
+    run("chat: multi-line message", test_chat_multiline_message);
+    run("chat: marker when older messages are hidden", test_chat_marker_when_older_messages_are_hidden);
+    run("chat: marker over wide glyphs", test_chat_marker_over_wide_glyphs);
     run("input: cursor", test_input_cursor);
     run("input: wrap and cursor", test_input_wrap_and_cursor);
     run("input: cursor after wide glyphs", test_input_cursor_after_wide_glyphs);
     run("input: scrolls with the cursor", test_input_scrolls_with_cursor);
+    run("input: a newline moves the cursor down", test_input_newline_moves_the_cursor_down);
+    run("input: controls shown, cursor kept", test_input_shows_controls_and_keeps_the_cursor);
+    run("input: element style", test_input_uses_the_element_style);
     run("input model: edits respect glyphs", test_input_model_edits_respect_glyphs);
 
     run("known bugs", [] {

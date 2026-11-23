@@ -50,11 +50,6 @@ class Canvas {
         // area. The last request in a frame wins; none at all for an empty area.
         void set_cursor(int x, int y) noexcept;
 
-        // TRANSITIONAL (removed in step 4): draws a string that may carry colour
-        // codes. SGR sequences set a running style for the rest of the string,
-        // other escape sequences are dropped, '\n' goes to the next row at x.
-        void write_legacy(int x, int y, std::string_view text) noexcept;
-
     private:
         Canvas(FrameBuffer* frame, std::optional<Point>* cursor, int origin_x, int origin_y,
                int width, int height, int clip_left, int clip_top, int clip_right, int clip_bottom) noexcept;

@@ -41,11 +41,6 @@ std::string sgr(const Style& style) {
     return out;
 }
 
-Style parsed(std::string_view parameters, Style start = {}) {
-    apply_sgr(start, parameters);
-    return start;
-}
-
 unicode::Glyph glyph(std::string_view text) {
     return unicode::next_glyph(text, 0).glyph;
 }
@@ -122,25 +117,6 @@ void test_append_sgr() {
     check(sgr(Style{.fg = Color::ansi256(200)}) == "\033[0;38;5;200m", "palette colour");
     check(sgr(Style{.bg = Color::rgb(1, 2, 3)}) == "\033[0;48;2;1;2;3m", "true colour");
     check(sgr(Style{.attrs = Style::Bold | Style::Underline}) == "\033[0;1;4m", "attributes");
-}
-
-void test_apply_sgr() {
-    check(parsed("31").fg == Color::ansi(1), "31: red");
-    check(parsed("1;32") == Style{.fg = Color::ansi(2), .attrs = Style::Bold}, "1;32: bold green");
-    check(parsed("94").fg == Color::ansi(12), "94: bright blue");
-    check(parsed("38;5;200").fg == Color::ansi256(200), "38;5;n: palette");
-    check(parsed("48;2;10;20;30").bg == Color::rgb(10, 20, 30), "48;2;r;g;b: true colour");
-    const Style red_bold{.fg = Color::ansi(1), .attrs = Style::Bold};
-    check(parsed("0", red_bold) == Style{}, "0: reset");
-    check(parsed("", red_bold) == Style{}, "empty parameters: reset");
-    check(parsed("39", red_bold) == Style{.attrs = Style::Bold}, "39: default foreground only");
-    check(parsed("22", red_bold) == Style{.fg = Color::ansi(1)}, "22: normal intensity only");
-    check(parsed("999;31").fg == Color::ansi(1), "unknown parameters are skipped");
-    check(parsed("38;5").fg == Color{}, "an incomplete extended colour is ignored");
-    for (const Style& s : {Style{}, red_bold, Style{.fg = Color::ansi256(7), .bg = Color::rgb(1, 2, 3)}}) {
-        const std::string out = sgr(s);
-        check(parsed(std::string_view(out).substr(2, out.size() - 3)) == s, "append_sgr round-trips through apply_sgr");
-    }
 }
 
 // --- FrameBuffer ----------------------------------------------------------------
@@ -308,7 +284,6 @@ int main() {
     run("unicode: glyph equality", test_glyph_equality);
     run("unicode: sanitize", test_sanitize);
     run("style: append_sgr", test_append_sgr);
-    run("style: apply_sgr", test_apply_sgr);
     run("frame: put", test_put_basic);
     run("frame: wide glyphs", test_put_wide);
     run("frame: wide over wide", test_put_wide_over_wide);

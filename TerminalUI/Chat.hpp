@@ -1,12 +1,19 @@
 # pragma once
 
 #include "Element.hpp"
+#include "Style.hpp"
+#include "TextLayout.hpp"
+
 #include <chrono>
 #include <cstddef>
 #include <limits>
+#include <memory>
 #include <span>
+#include <string>
 #include <string_view>
+#include <tuple>
 #include <variant>
+#include <vector>
 
 struct ChatModel {
     struct ChatMsg {
@@ -29,22 +36,42 @@ private:
     void mutate_model() noexcept;
 };
 
-struct ChatWindow : public LegacyElement {
+// The newest messages of a ChatModel, bottom-aligned: the latest message ends on
+// the last row. Each message is "sender@YYYY-MM-DD[HH:MM]::> " in the separator
+// style followed by its text in the message style, wrapped to the inner width.
+// When anything is hidden above the top row, the top row starts with "...".
+// Message text is shown as text: control characters appear as U+FFFD.
+struct ChatWindow : public Element {
     ChatWindow(Position relative_position, int width, int height);
-    virtual void inner_content(int local_row, std::string& buffer) override;
-    virtual void begin_render() override;
-    virtual void end_render(std::vector<RenderCommand>& buffer) override;
     void set_model(std::weak_ptr<ChatModel> model) noexcept;
-    void set_separator_color(std::string_view color) noexcept;
+    void set_separator_style(Style style) noexcept;
+    void set_message_style(Style style) noexcept;
+
+protected:
+    void draw_content(Canvas& inner) override;
+
 private:
-    size_t last_model_state_{0};
-    int last_width_{0};
-    int last_height_{0};
-    std::string frame_buffer_;
-    std::vector<std::string_view> line_buffer_;
+    struct Row {
+        size_t layout;   // index into layouts_
+        size_t line;     // line within it
+    };
+
+    // Lays out just the messages that reach the window, newest first, until the
+    // window is full; rows_ are the last `height` of their lines.
+    void rebuild(const ChatModel& model, int width, int height);
+    StyledText styled(const ChatModel::ChatMsg& message) const;
+
     std::weak_ptr<ChatModel> model_;
+    Style separator_style_{};
+    Style message_style_{};
+    // What rows_ was built for; a style change resets last_model_state_.
+    size_t last_model_state_{0};
+    int last_width_{-1};
+    int last_height_{-1};
+    std::vector<TextLayout> layouts_;   // oldest first
+    std::vector<Row> rows_;             // top to bottom, at most `height`
+    bool truncated_{false};             // something is hidden above rows_
     std::string_view sep_{"::> "};
-    std::string_view sep_color_{};
     std::string_view trunc_symbol_{"..."};
 };
 
@@ -88,27 +115,24 @@ namespace Input {
     }
 }
 
-struct InputBox : public LegacyElement {
+// An editable text area for an InputModel: the content wrapped to the inner
+// width, in the element's style, with the terminal cursor at the model's
+// cursor. The view scrolls minimally: it moves only when the cursor leaves it,
+// and never past the last line.
+struct InputBox : public Element {
     InputBox(Position relative_position, int width, int height);
-    virtual void inner_content(int row, std::string& buffer) override;
-    virtual void begin_render() override;
-    virtual void end_render(std::vector<RenderCommand>& buffer) override;
     void set_model(std::weak_ptr<InputModel> model) noexcept;
+
+protected:
+    void draw_content(Canvas& inner) override;
+
 private:
-    int last_width_{0};
-    int last_height_{0};
-    std::string frame_buffer_;
-    std::vector<std::string_view> line_buffer_;
     std::weak_ptr<InputModel> model_;
     size_t last_model_state_{0};
-    size_t last_model_cursor_{0};
-    // First wrapped line shown by the viewport; the cursor's line always lies in
-    // [first_visible_line_, first_visible_line_ + get_inner_height()).
+    int last_width_{-1};
+    Style last_style_{};
+    TextLayout layout_;
+    // First line shown; the cursor's line always lies in
+    // [first_visible_line_, first_visible_line_ + inner height).
     size_t first_visible_line_{0};
-    int cursor_draw_x_{0};
-    // Row of the cursor inside the box (0-based), not an index into line_buffer_.
-    int cursor_draw_y_{0};
-    bool cursor_visible_{false};
-
-    void move_cursor(size_t cursor_pos);
 };

@@ -1,9 +1,7 @@
 #pragma once
 
-// Style.hpp - how a cell looks, as data. Escape sequences exist only at the
-// edges: append_sgr() writes one for the terminal, and apply_sgr() reads one
-// (only for text that still carries colour codes, until the widgets set
-// Style directly).
+// Style.hpp - how a cell looks, as data. Escape sequences exist only where the
+// frame is written to the terminal (append_sgr).
 
 #include <cstdint>
 #include <string>
@@ -35,7 +33,3 @@ struct Style {
 // ("\033[0;...m"; "\033[0m" for the default style), so it never depends on the
 // terminal's previous state.
 void append_sgr(std::string& out, const Style& style);
-
-// Applies the parameters of one SGR sequence (the text between "\033[" and "m",
-// e.g. "1;31" or "38;5;200") to `style`. Unknown parameters are ignored.
-void apply_sgr(Style& style, std::string_view parameters) noexcept;
