@@ -1,0 +1,1478 @@
+# TCP p2p messaging app: detailed component design
+
+Expands [project.md](project.md). The code already on the `rewrite` branch
+([TcpSocket](TcpSocket/TcpSocket.hpp), [Wire.hpp](Wire.hpp),
+[ThreadQueue.hpp](ThreadQueue.hpp), [TerminalUI](TerminalUI/TerminalUI.hpp), the
+[RouterWorker](RouterWorker/RouterWorker.hpp) / [StoreWorker](StoreWorker/StoreWorker.hpp)
+sketches) is the baseline. Where this document departs from project.md, section 1
+says why.
+
+**Scope decisions**
+
+| Topic | In scope now | Designed for later |
+|---|---|---|
+| Conversations | Direct only: one conversation per peer, one TCP link per peer | Group conversations (§12.1). Ad-hoc routing/relaying is out of scope. |
+| Persistence | None: history and ids live in memory | Persistent peers, ids and history behind a Store-only interface (§12.2) |
+| Inbound backpressure | Unbounded queues | Not planned |
+
+---
+
+## 1. Changes to the original plan
+
+| # | project.md | This design | Why |
+|---|---|---|---|
+| D1 | One queue per edge (`Store -router q-> Router`, `Pt-i -router q-> Router`, `Balancer -router q-> Router`) | **One inbox per thread.** Each inbox is a `ThreadQueue<std::variant<...>>` of everything that thread accepts | A thread can block on only one `ThreadQueue`. With three inboxes it would have to poll. |
+| D2 | Router → Pt-i is a queue | **Two channels.** Router calls `pool.send()` directly: the pool is thread-safe and returns `BufferFull` straight away. Lifecycle commands (adopt, release, dial, probe, shutdown) go through a Pt-i command queue that wakes `receive()` via a new `pool.interrupt()` | Sends skip a hop and a wakeup. Commands that touch per-connection state the Pt-i owns (its decoder) must run on the Pt-i thread. |
+| D3 | Inbound messages go Pt-i → Router → Store | **Pt-i → Store directly** for chat frames. Lifecycle events still go through the Router | Otherwise one Router thread serialises all inbound traffic and the Pt-i parallelism is lost. The Store already knows the peer, so ordering is safe (§5.2). |
+| D4 | New connection: Listener → Store checks the peer_id | **Listener → Router → Pt-i (handshake) → Router → Store** | The peer_id is only known once the `Connect` frame has been read. Reading it in the Listener would let one slow peer stall `accept()`. |
+| D5 | Router → Balancer after every send/receive | **The Balancer samples.** Every tick it probes each Pt-i, and the Pt-i replies with a stats report. That reply is also the heartbeat | One message per chat message to the Balancer is pure overhead. A probe with a deadline detects stalled threads, which a self-sent heartbeat cannot do when the thread is parked in `epoll_wait`. |
+| D6 | Dial: "Router under mutex on LoadLog" and the `AssignmentPolicy` mutex | **No shared mutable state between workers.** The Balancer sends `SetPolicy` to the Router | Router and Balancer are single-threaded owners. Message passing removes the lock and the ordering questions that come with it. |
+| D7 | Pt-i does a non-blocking TCP connect | Kept, implemented **inside `EpollConnectionPool`** (`connection_dial`) | The pool already has epoll, timers and error reporting. Today `TcpConnection::connect()` blocks for up to the SYN retry budget. |
+| D8 | Each conversation is identified by `conv_id` only | Adds a **`link_id`** (one per TCP connection, assigned by the Router, unchanged when the connection moves between Pt-i) | Pool connection ids are per pool and change on a move, and a link exists before its peer is known (during the handshake). |
+| D9 | Router/Pt-i tables are keyed by `conv_id` | **Below the Store everything is keyed by `peer_id`.** Conversations exist only in the Store and Frontend | A link connects to a peer, not to a conversation. With groups, one link carries several conversations and one conversation spans several links. Keeping conversations out of the Router means groups need no Router or Pt-i changes (§12.1). |
+| D10 | Render reads keys, interprets commands and draws | **Frontend = input thread + `CommandProcessor` + view.** Two frontends share the command layer: the TUI (Keyboard + `TuiView`) and a headless **agent CLI** (`LineReader` + `JsonlWriter`) with no keyboard listener and no rendering (§14) | Command handling becomes a pure, testable layer. The CLI lets scripts and agents drive real nodes end to end, without a TTY. |
+| D11 | Requests from the UI are fire-and-forget | Every frontend request carries a **`ReqId`**; the Store answers each with exactly one `Reply` | An agent has to know which `conv` its `/dial` created and whether a command failed, without guessing from later events. |
+
+Everything else (thread set, ownership of PeerTable/ConvStore/ConnTable/LoadLog,
+the scenario list) stays as in project.md.
+
+---
+
+## 2. Threads and inboxes
+
+```
+                    ┌───────────┐  Key | InputLine
+   Input ──────────►│ Frontend  │◄──────────────┐ FrontendMsg (events, Reply)
+                    └─────┬─────┘               │
+                StoreMsg (requests + ReqId)     │
+                          ▼                     │
+                    ┌───────────┐───────────────┘
+      ┌────────────►│   Store   │◄───► Persistence (interface; no-op today, §12.2)
+      │ ChatIn      └─────┬─────┘▲
+      │       StoreToRouter│      │RouterToStore
+      │                   ▼      │
+      │             ┌───────────┐◄──── Listener (InboundAccepted)
+      │             │  Router   │◄──── Balancer (SetPolicy / Move / Evict / Spawn / Retire / Probe)
+      │             └─┬───────┬─┘
+      │  pool.send()  │       │ PtCommand queue (+ pool.interrupt())
+      │  (direct)     ▼       ▼
+      │             ┌───────────┐  PtReport (heartbeat + stats)
+      └─────────────│  Pt-0..n  │───────────────────────► Balancer
+                    └─────┬─────┘
+                          │ PtEvent (link lifecycle)
+                          └──────────────────────────────► Router
+
+   Logger: every thread pushes LogRecord; it is the only consumer.
+```
+
+| Thread | Blocks on | Inbox type | Owns |
+|---|---|---|---|
+| Input: Keyboard (TUI) | `TerminalUI::read_byte(timeout)` | none (stop flag) | escape-sequence decoder |
+| Input: LineReader (CLI) | `poll(stdin, WakeupEvent)` | none (`stop()` raises the event) | partial-line buffer, line counter |
+| Frontend (main thread) | `frontend_q.pop()` | `FrontendMsg` | `CommandProcessor` (active conv, `ReqId`s); TUI: `TerminalUI`, layout, `ChatModel`/`InputModel`; CLI: `JsonlWriter` |
+| Store | `store_q.pop()` | `StoreMsg` | `PeerTable`, `ConvStore`, subscriptions, id minting, persistence hooks |
+| Router | `router_q.pop()` | `RouterMsg` | `ConnTable`, Pt-i handles and threads, `AssignmentPolicy` cursor |
+| Listener | `TcpListener::accept_client()` | none (`stop()` wakes accept) | `TcpListener` |
+| Pt-i | `pool.receive()` | `ThreadQueue<PtCommand>`, drained on `Interrupted` | `EpollConnectionPool`, per-link `wire::Decoder` + handshake state |
+| Balancer | `balancer_q.pop()`, which also yields its `BalancerTick` (a queue timer, §5.4) | `BalancerMsg` | `LoadLog`, policy computation |
+| Logger | `log_q.pop()` | `LogRecord` | log sink |
+
+**Queue rules.**
+- Every queue is unbounded, so a `push` never blocks. That keeps the
+  Store↔Router and Router↔Pt-i cycles deadlock-free.
+- The only backpressure is the pool's TX buffer limit. `BufferFull` surfaces as a
+  failed send in the UI.
+- A `push` that returns `false` means the target is shutting down. The sender
+  drops the message and logs it at debug level.
+
+---
+
+## 3. Identifiers
+
+| Id | Minted by | Scope / lifetime | Meaning |
+|---|---|---|---|
+| `peer_id` | Store | local, stable | **our** name for a peer. Sent as `ConnectInfo.peer_id`; the peer re-presents it as `assigned_peer_id`. The key for everything below the Store (D9). |
+| `host_id` | the peer | stable | the peer's name **for us**, learned from Connect/Ack and re-presented when we dial it. |
+| `conv_id` | Store | local, stable | one conversation. Today each peer has exactly one direct conversation. Never leaves the Store/Frontend. |
+| `group_id` | group creator | global | future: identifies a group conversation on the wire (§12.1). `0` means the direct conversation. |
+| `msg_id` | Store | per conv, monotonic | index in the conversation history. |
+| `link_id` | Router | one TCP connection, survives moves | the routing key below the Router. |
+| `pt_id` | Router | lifetime of a Pt-i thread | worker index. |
+| `pool_conn_id` | `EpollConnectionPool` | one pool membership | changes when a link moves. Never leaves Router/Pt-i. |
+
+**Id rules.**
+- Every id the Store mints (`peer_id`, `conv_id`) is a **random 64-bit value** from
+  one `IdMinter` (`mt19937_64` seeded from `std::random_device`, retried on
+  collision with the known set), not a counter:
+  - a sequential `peer_id` lets anyone who guesses it impersonate a known peer on
+    reconnect;
+  - random ids stay unique across restarts, which persistence will need (§12.2).
+- `0` is reserved as "unknown / none" for every id.
+
+**Wire fields of `ChatMessage`** (this changes what the current
+[Wire.hpp](Wire.hpp) comment says):
+- `conversation_id` = `group_id`, so `0` for a direct message. It is no longer the
+  sender's local conv id, which meant nothing to the receiver.
+- `sender_id` = the sender's `host_id` for this peer, which is the receiver's own
+  `peer_id` for the sender. The receiver checks that it matches the link's peer
+  and drops the frame on mismatch. For relayed group messages this field would
+  need a global identity; relaying is out of scope.
+
+---
+
+## 4. Messages (one variant per inbox)
+
+They live in `Messages/Messages.hpp` (its own header-only target, because it needs the socket and wire types), in namespace `msg` (names such as `Close`, `Bind` and `Stop` are too generic for the global namespace). They are plain structs with no behaviour, always moved between threads.
+
+```cpp
+using ConvId = uint64_t; using PeerId = uint64_t; using LinkId = uint64_t;
+using PtId = uint32_t;   using MsgId = uint64_t;
+
+// Opaque to the Router: echoed back in SendResult so the Store can update the
+// right message (per member once groups exist).
+struct SendTag { ConvId conv; MsgId msg; };
+
+enum class LinkDownReason { PeerClosed, ReadTimedOut, WriteTimedOut, SocketError,
+                            HandshakeFailed, ProtocolError, Superseded,
+                            BalancerEvicted, Shutdown };
+
+using ReqId = uint64_t;   // per frontend, 0 = no reply wanted (§14.3)
+
+// ---- Frontend inbox (conversation level); the Store doesn't know which frontend runs
+// from the input thread
+struct Key        { enum Type { Text, Enter, Backspace, Left, Right, Up, Down,
+                                PageUp, PageDown, Tab, Exit } type; std::string text; };  // TUI
+struct InputLine  { uint64_t line_no; std::string text; };                                // CLI
+struct InputClosed {};                                                                    // CLI: stdin EOF
+// from the Store
+struct Reply      { ReqId req; bool ok; ConvId conv; std::string error; };  // exactly one per ReqId != 0
+struct ConvSnapshot   { ConvId conv; std::vector<StoredMessage> msgs; ConvStatus status; };
+struct MsgAppended    { ConvId conv; MsgId id; StoredMessage msg; };
+struct MsgStatus      { ConvId conv; MsgId id; DeliveryState state; };
+struct ConvState      { ConvId conv; ConvStatus status; std::string detail; };
+struct ConvNotify     { ConvId conv; size_t unread; };
+struct ConvList       { std::vector<ConvSummary> convs; };
+struct SystemNotice   { std::string text; };          // notices not tied to a request
+struct ShutdownDone   {};
+using FrontendMsg = std::variant<Key, InputLine, InputClosed, Reply, ConvSnapshot, MsgAppended,
+                                 MsgStatus, ConvState, ConvNotify, ConvList, SystemNotice,
+                                 ShutdownDone>;
+// Each frontend gets only one of Key / InputLine+InputClosed; it handles the others
+// with an explicit no-op, so the no-catch-all rule (§9) still holds.
+
+// ---- Store inbox
+// from the Frontend (conversation level); each carries a ReqId (§14.3)
+struct SendText   { ReqId req; ConvId conv; std::string body; };   // Reply.conv = conv, MsgAppended carries the msg_id
+struct DialReq    { ReqId req; wire::Endpoint ep; };               // Reply.conv = the new conversation
+struct ReconnectReq { ReqId req; ConvId conv; };
+struct CloseReq   { ReqId req; ConvId conv; };                     // → ClosePeer to the Router for each member
+struct Subscribe  { ReqId req; ConvId conv; Subscription sub; };   // see §6.3
+struct SetDefaultSubscription { Subscription sub; };              // applied to existing and new convs
+struct ListReq    { ReqId req; };
+struct QuitReq    { ReqId req; };
+// from Pt-i / Router (peer level)
+struct ChatIn     { PeerId peer; LinkId link; wire::ChatMessage msg; };  // Pt-i, D3
+struct PeerHello  { LinkId link; wire::ConnectInfo info; wire::Endpoint remote; };
+struct DialDone   { LinkId link; PeerId peer; wire::ConnectInfoAck ack; };
+struct PeerUp     { PeerId peer; LinkId link; };
+struct PeerDown   { PeerId peer; LinkId link; LinkDownReason why; };
+struct SendResult { PeerId peer; SendTag tag; bool ok; SocketError err; };
+struct RouterStopped {};
+using StoreMsg = std::variant<SendText, DialReq, ReconnectReq, CloseReq, Subscribe,
+                              SetDefaultSubscription, ListReq, QuitReq,
+                              ChatIn, PeerHello, DialDone, PeerUp, PeerDown, SendResult,
+                              RouterStopped>;
+
+// ---- Router inbox (peer level only, D9)
+struct InboundAccepted { TcpConnection conn; };   // Listener; conn.remote_endpoint() holds the peer address
+struct RouteSend   { PeerId peer; SendTag tag; std::vector<std::byte> frame; }; // Store, pre-encoded
+struct RouteDial   { PeerId peer; wire::Endpoint ep; std::vector<std::byte> hello_frame; };
+struct BindLink    { LinkId link; PeerId peer; std::vector<std::byte> ack_frame; };
+struct RejectLink  { LinkId link; };
+struct ClosePeer   { PeerId peer; };
+struct Shutdown    { std::chrono::milliseconds grace; };
+// from Pt-i (PtEvent)
+struct LinkHello   { LinkId link; wire::ConnectInfo info; };
+struct LinkAcked   { LinkId link; wire::ConnectInfoAck ack; };
+struct LinkDown    { LinkId link; LinkDownReason why; SocketError err; };
+struct LinkReleased{ LinkId link; ReleasedConnection rc; wire::Decoder dec; };
+struct LinkAdopted { LinkId link; PtId pt; uint64_t pool_conn_id; };
+struct PtStopped   { PtId pt; };
+// from Balancer
+struct SetPolicy   { std::vector<PtId> next_assignments; uint64_t epoch; };
+struct MoveLink    { LinkId link; PtId to; };
+struct EvictLink   { LinkId link; };
+struct SpawnPt     {};  struct RetirePt { PtId pt; };
+struct ProbeAll    { uint64_t seq; };
+using RouterMsg = std::variant<...all of the above...>;
+
+// ---- Pt-i command queue
+struct Adopt   { LinkId link; PeerId peer; Role role; TcpConnection conn;
+                 std::vector<std::byte> pending_tx; wire::Decoder dec; HandshakeState hs; };
+struct Dial    { LinkId link; PeerId peer; wire::Endpoint ep; std::vector<std::byte> hello_frame; };
+struct Bind    { LinkId link; PeerId peer; std::vector<std::byte> ack_frame; };
+struct Release { LinkId link; };
+struct Close   { LinkId link; bool graceful; };
+struct Probe   { uint64_t seq; };
+struct Stop    { std::chrono::steady_clock::time_point deadline; };
+using PtCommand = std::variant<Adopt, Dial, Bind, Release, Close, Probe, Stop>;
+
+// ---- Balancer inbox
+struct PtReport { PtId pt; uint64_t seq; Clock::time_point at; size_t cmd_backlog;
+                  std::vector<LinkSample> links; };   // LinkSample: link, peer, rx/tx bytes, rx/tx frames since last
+struct TopologyChanged { PtId pt; bool added; };        // Router → Balancer
+struct LinkGone  { LinkId link; };
+struct StopBalancer {};
+struct BalancerTick {};                                  // from the Balancer's own queue timer (§5.4)
+using BalancerMsg = std::variant<PtReport, TopologyChanged, LinkGone, StopBalancer, BalancerTick>;
+```
+
+**Size budget.** Measured with g++ 13.3 (x86-64, libstdc++), using the real
+`wire::*`, `TcpConnection`, `ReleasedConnection` and `Decoder` types:
+
+| Inbox | `sizeof` | Largest alternative | Hot alternatives |
+|---|---|---|---|
+| `FrontendMsg` | 88 | `MsgAppended` 80 | `MsgAppended` 80, `MsgStatus` 24 |
+| `StoreMsg` | 96 | `PeerHello` 88 | `ChatIn` 64, `SendResult` 32, `SendText` 48 |
+| `RouterMsg` | 184 | `LinkReleased` 176, `InboundAccepted` 96 | `RouteSend` 48 |
+| `PtCommand` | 192 | `Adopt` 184 | none (commands are rare, D2) |
+| `BalancerMsg` | 64 | `PtReport` 56 | `PtReport` |
+| `LogRecord` | 72 | – | – |
+
+- **What drives the sizes:** `TcpConnection` is 96 bytes (`Options` 40,
+  `TcpEndpoint` 40), `ReleasedConnection` 136, `Decoder` 32, `std::string` 32,
+  `std::vector` 24.
+- **A queue hop costs about 120 ns, and the mutex and condition variable dominate
+  it.** In a cross-thread `ThreadQueue` benchmark the variant size adds about
+  20–40 ns between 72 and 200 bytes.
+- **The cliff is 512 bytes.** At that size `std::deque` holds one element per
+  512-byte block, so every message costs a malloc and free, and the hop takes about
+  250 ns.
+- **The Router's inbox pays a little for rare messages.** `RouteSend` takes a
+  184-byte slot because of `LinkReleased` and `Adopt`, which costs half a deque
+  allocation per send. That is small next to the queue hop and the `send()`
+  syscall.
+- **Payload allocations cost more than variant sizes.** A chat message costs about
+  3 heap allocations on send (body, frame, the frontend's copy) and about 2 on
+  receive (the decoded body, the frontend's copy).
+
+**Rules**, enforced in `Messages.hpp`:
+```cpp
+template <class V> constexpr bool inbox_ok =
+    std::is_nothrow_move_constructible_v<V> && std::is_nothrow_move_assignable_v<V>
+    && sizeof(V) <= 256;   // at least two per deque block
+static_assert(inbox_ok<FrontendMsg> && inbox_ok<StoreMsg> && inbox_ok<RouterMsg>
+           && inbox_ok<PtCommand> && inbox_ok<BalancerMsg>);
+```
+- Moves must not throw, so a push or pop can never leave a variant
+  `valueless_by_exception`.
+- Messages stay copyable for tests, but are always moved: `push(std::move(m))`,
+  and handlers take `X&`.
+- If profiling ever shows the Router inbox as the bottleneck, there are two cheap
+  fixes. Box the rare large alternatives (`std::unique_ptr<LinkReleased>`,
+  `std::unique_ptr<Adopt>`), which brings `RouterMsg` to about 80 bytes and
+  `PtCommand` to about 88. Better, give `ThreadQueue` a growable ring buffer
+  instead of `std::queue`, which removes steady-state allocations from every
+  inbox. Neither is done now.
+
+**Frame encoding rules.**
+- The Store encodes every frame (`wire::encode`): chat frames for `RouteSend`, and
+  the handshake frames `hello_frame` and `ack_frame`, because the Store owns the
+  ids.
+- The Router and Pt-i only ever handle bytes. Pt-i decodes inbound frames and
+  hands the Store the decoded `wire::ChatMessage` without interpreting it.
+
+---
+
+## 5. Components
+
+### 5.1 Router (`RouterWorker/`)
+
+**State**
+```cpp
+struct Link {
+    LinkId id; PeerId peer;            // 0 while handshaking
+    PtId pt; uint64_t pool_conn_id;    // 0 while Adopt/Dial is in flight
+    enum class Status { Dialing, Handshaking, Connected, Moving, Closing } status;
+    Role role;                         // Inbound | Outbound
+    std::deque<RouteSend> parked;      // sends that arrived while Moving
+    Clock::time_point since;
+};
+struct PtHandle {
+    PtId id; std::thread thread;
+    std::unique_ptr<EpollConnectionPool> pool;      // Router calls pool->send()
+    std::unique_ptr<ThreadQueue<PtCommand>> cmds;   // + pool->interrupt() after push
+    std::unordered_set<LinkId> links; bool retiring = false;
+};
+std::unordered_map<LinkId, Link> links_;
+std::unordered_map<PeerId, LinkId> peer_to_link_;   // at most one live link per peer
+std::map<PtId, PtHandle> pts_;
+AssignmentPolicy policy_;                            // plain struct, no mutex (D6)
+```
+This replaces `RoutingTable` in [RouterWorker.hpp](RouterWorker/RouterWorker.hpp).
+The map key changes from conversation to peer, and `RoutingEntry::Status` grows
+from `{Normal, Moving, Closed}` to the five states above. The Router never sees a
+`conv_id`.
+
+**`AssignmentPolicy::next()`**
+1. Take the next entry of the Balancer's list. Skip pts that are retiring or
+   missing.
+2. When the list is exhausted or stale, fall back to the pt with the fewest
+   links.
+3. When there are no pts at all, spawn one. When every pt is at
+   `max_links_per_pt` and fewer than `max_pts` exist, spawn one too.
+
+**Handlers (summary)**
+
+| Message | Action |
+|---|---|
+| `InboundAccepted` | Over `max_links`: drop the connection and log. Otherwise create a Link (`Handshaking`, Inbound), choose a pt, push `Adopt{role=Inbound, hs=AwaitConnect}` and call `interrupt()`. |
+| `RouteDial` | If the peer already has a live link: reply `PeerUp` (idempotent). Otherwise create a Link (`Dialing`), choose a pt, push `Dial`. |
+| `LinkHello` | Forward to the Store as `PeerHello`. |
+| `BindLink` | If the peer already has a different live link, resolve it with the duplicate-link rule (§7.4). Set `peer_to_link_`, push `Bind{ack_frame}`, set `Connected`, send `PeerUp` to the Store. |
+| `LinkAcked` | Outbound handshake done: `Connected`, `peer_to_link_`, `DialDone` to the Store. |
+| `RouteSend` | Look up `peer_to_link_`. `Connected`: call `pool->send()` and return `SendResult` from its result. `Moving`: park the send. Missing or other states: `SendResult{ok=false, ConnectionNotFound}`. |
+| `LinkDown` | Erase the link. If it was bound, send `PeerDown` to the Store and `LinkGone` to the Balancer. Fail parked sends. |
+| `MoveLink` | Only allowed when `Connected` and `to` is alive and not retiring. Set `Moving`, push `Release` to the source pt. |
+| `LinkReleased` | Push `Adopt{conn, pending_tx, dec, hs=Established}` to the target pt. |
+| `LinkAdopted` | Update pt and `pool_conn_id`, go back to `Connected`, flush parked sends in order. |
+| `EvictLink` / `ClosePeer` | Push `Close{graceful=true}`. The final state arrives via `LinkDown`. |
+| `SpawnPt` / `RetirePt` | Spawn: create pool, queue and thread, send `TopologyChanged`. Retire: mark it retiring, `MoveLink` every link elsewhere, then `Stop`. |
+| `ProbeAll` | Push `Probe{seq}` to every pt. |
+| `Shutdown` | §7.8. |
+
+**Invariant.** Only the Router changes `Link::status`. A Pt-i reports facts; the
+Router decides.
+
+### 5.2 Pt-i, the IO worker (`IoWorker/`)
+
+**State**
+```cpp
+struct LinkState {
+    LinkId link; PeerId peer; Role role;
+    enum class Hs { Connecting, AwaitConnect, AwaitAck, Established } hs;
+    wire::Decoder dec;
+    uint64_t rx_bytes, tx_bytes, rx_frames, tx_frames;   // since the last report
+};
+std::unordered_map<uint64_t /*pool_conn_id*/, LinkState> by_conn_;
+std::unordered_map<LinkId, uint64_t> by_link_;
+```
+
+**Loop**
+```
+for (;;) {
+    auto r = pool.receive(rx_buf);
+    if (r)                                   -> on_bytes(r->connection_id, span)
+    else switch (r.error())
+      {0, Interrupted}                       -> drain cmds.try_pop() until empty
+      {0, Stopped}                           -> report PtStopped, return
+      {id, Connected}                        -> dial finished: send hello, hs = AwaitAck   (new event, §8.1)
+      {id, err}                              -> LinkDown{link, map(err)}, erase
+}
+```
+
+**`on_bytes`**: feed `dec`, then for each decoded frame:
+
+| hs | frame | action |
+|---|---|---|
+| AwaitConnect | `ConnectInfo` | `LinkHello` → Router. hs stays put until `Bind` arrives. |
+| AwaitAck | `ConnectInfoAck` | `LinkAcked` → Router, hs = Established, then `set_timeouts(established)`. |
+| Established | `ChatMessage` | `ChatIn{peer, link, msg}` → **Store** (D3). |
+| any | anything else / `WireError` | protocol error: `connection_drop`, `LinkDown{ProtocolError}`. Tolerate N resyncs before dropping. |
+
+**Ordering argument for D3.** A link's peer_id is set when Pt-i handles `Bind` (or
+the Ack). The Store created that peer before it sent `BindLink` or `RouteDial`. So
+any `ChatIn` the Store receives names a peer it already has. `ChatIn` may overtake
+`PeerUp`; the Store treats a message from a peer that is not "up" yet as implying
+it is up. Protocol rule: **the initiator sends no `ChatMessage` before it has
+received the `ConnectAck`**. Pt-i sends the Ack itself while handling `Bind`, after
+the peer is set, so no reply can arrive before the peer is known.
+
+**Commands**
+- `Adopt`: `pool.connection_add(conn, timeouts_for(hs), pending_tx)`, record the
+  state, send `LinkAdopted` → Router.
+- `Dial`: `pool.connection_dial(ep, connect_timeout)`. The hello is sent when
+  `Connected` arrives.
+- `Bind`: set the peer, `pool.send(ack_frame)`, hs = Established,
+  `set_timeouts(established)`.
+- `Release`: `pool.connection_release(id)` returns the `TcpConnection` and unsent
+  TX. Move the decoder out and send `LinkReleased` → Router. This runs on the Pt-i
+  thread, so no `receive()` is in flight.
+- `Probe`: build a `PtReport` from the counters, reset them, push it to the
+  Balancer.
+- `Stop`: §7.8.
+
+**Timeouts per handshake state**
+
+| State | Read timeout | Write timeout |
+|---|---|---|
+| Connecting, AwaitConnect, AwaitAck | handshake, e.g. 5 s | 5 s |
+| Established | 0 (disabled) | 5 s |
+
+Established links rely on `SO_KEEPALIVE` for dead-peer detection, so an idle chat
+is not killed. A `Ping` frame can come later if faster detection is needed.
+
+### 5.3 Store (`StoreWorker/`)
+
+The Store is the only component that knows about conversations. It translates
+between the conversation level (Frontend) and the peer level (Router, Pt-i).
+
+**State**
+```cpp
+struct StoredMessage { MsgId id; PeerId sender; /*0 = me*/ std::string body;
+                       system_clock::time_point at; DeliveryState state; };
+enum class DeliveryState { PendingSend, Sent, Failed, Received };
+enum class ConvStatus { New, Dialing, Connected, Disconnected, Failed };
+
+struct Peer {                                    // one remote node
+    PeerId peer_id; PeerId host_id;
+    std::vector<wire::Endpoint> endpoints;       // last advertised, used for reconnect
+    enum class Link { Down, Dialing, Handshaking, Up } link_state; LinkId link;
+};
+struct Conversation {
+    ConvId id;
+    enum class Kind { Direct, Group } kind;      // only Direct is created today
+    uint64_t group_id;                           // 0 for Direct (the wire conversation_id)
+    std::vector<PeerId> members;                 // Direct: exactly one
+    std::vector<StoredMessage> msgs; size_t read_upto;
+};
+
+class PeerTable {                                // owned by the Store
+    std::unordered_map<PeerId, Peer> peers_;                 // recognition: our name → peer
+    std::unordered_map<LinkId, PeerId> by_link_;
+};
+class ConvStore {
+    std::unordered_map<ConvId, Conversation> convs_;
+    std::unordered_map<PeerId, ConvId> direct_conv_of_;      // peer → its direct conv
+    std::unordered_map<uint64_t, ConvId> by_group_id_;       // empty until groups (§12.1)
+};
+```
+This replaces the sketch in [StoreWorker.hpp](StoreWorker/StoreWorker.hpp).
+
+- The sketch's `InboundMapping` and `OutboundMapping` are replaced by the
+  `Peer` / `Conversation` split.
+- Peer and conversation stay **separate records with a membership list**, even
+  though today every conversation has one member. That is the seam groups need.
+- A conversation's status is derived from its members' link states:
+  - Direct: the status of its single peer.
+  - Group: Connected if any member is up.
+
+**Resolving an inbound `ChatIn`**
+1. `msg.sender_id != peer`: the frame does not belong to this link. Drop it and
+   log.
+2. `msg.conversation_id == 0`: append to `direct_conv_of_[peer]`. Create the
+   conversation if it is missing.
+3. Otherwise look the id up in `by_group_id_`. If found and `peer` is a member,
+   append there. Otherwise drop and log. Today the lookup always misses.
+
+**Handshake logic (inbound `PeerHello`)**
+1. Look up `info.assigned_peer_id` in `peers_`. If found, this is a known peer
+   reconnecting: reuse the record.
+2. Otherwise mint a `peer_id` and create the Peer and its direct conversation.
+3. Set `host_id = info.peer_id` and `endpoints = info.endpoints`.
+4. Reply `BindLink{link, peer_id, encode(Ack{peer_id, host_id})}`.
+5. Garbage (`info.peer_id == 0`) gets `RejectLink`.
+
+**Dial (`DialReq` / `ReconnectReq`)**
+- `DialReq` creates a Peer (fresh `peer_id`, `host_id = 0`) and its direct
+  conversation. `ReconnectReq` resolves the conversation to its peer, or to its
+  members for a group.
+- `hello = ConnectInfo{peer_id, host_id, my_endpoints}`, then
+  `RouteDial{peer, ep, encode(hello)}`. Try `endpoints` in order.
+- `DialDone`: `host_id = ack.peer_id`, then check `ack.ack_peer_id == peer_id`
+  (log a mismatch), then mark the peer Up.
+
+**Send**
+1. Append `{PendingSend}` to the conversation.
+2. For each member, send
+   `RouteSend{member, {conv, id}, encode(ChatMessage{group_id, member.host_id, body})}`.
+   Direct conversations have exactly one member.
+3. `SendResult` moves the message to `Sent` or `Failed`. With several members the
+   state becomes per member; see §12.1.
+
+"Sent" means the transport accepted the message. True delivery needs an ack frame
+(§8.4).
+
+**Persistence hooks.** Every mutation of a `Peer`, `Conversation` or
+`StoredMessage` goes through one private function per kind:
+`commit_peer(const Peer&)`, `commit_conv(const Conversation&)` and
+`commit_message(ConvId, const StoredMessage&)`. Each updates the in-memory table
+and then calls the `Persistence` interface (§12.2). Today that interface is a
+no-op.
+
+**Subscriptions (§6.3)** decide what goes to Frontend. The current
+`SubscriptionManager` enums (`Ignore`/`Notify`/`Forward`/`Echo`) stay. They are
+keyed by `conv_id`, with lifecycle notifications fanned out from peer to
+conversation. `Echo` bounces inbound messages back without storing them, which is
+the stress-test mode used in earlier experiments.
+
+### 5.4 Balancer (`BalancerWorker/`)
+
+**State** (replaces `conversatoin_metrics_`)
+```cpp
+struct LinkLoad { LinkId link; PeerId peer; PtId pt; double rx_bps, tx_bps, fps;  // EWMA
+                  Clock::time_point last_active, last_moved; };
+struct PtLoad   { PtId pt; uint64_t last_seq_seen; Clock::time_point last_report;
+                  size_t links; double load; bool stalled; size_t cmd_backlog; };
+std::unordered_map<LinkId, LinkLoad> links_;
+std::map<PtId, PtLoad> pts_;
+```
+
+**Where ticks come from.** The Balancer registers a timer on its own inbox in its
+constructor: `tick_timer_ = inbox.every(config.period, BalancerTick{})`. It cancels
+the timer in its destructor. `pop()` then returns a `BalancerTick` whenever one is
+due, ahead of queued reports. A late tick is not made up, so ticks never pile up.
+Ticks are ordinary messages, so tests push `BalancerTick{}` by hand and need no
+real time (§8.3).
+
+**Tick** (every `balance_period`, default 500 ms):
+1. Send `ProbeAll{seq}` to the Router.
+2. Fold in the reports that arrived since the last tick:
+   EWMA with α = 0.3, `load(pt) = Σ (tx_bps + rx_bps)/byte_cost + links·link_cost`.
+3. A pt with no report for `k_missed = 3` ticks is marked **stalled**: it is
+   excluded from the policy and logged at warn. Links cannot be released from a
+   stalled thread, so this is detection only.
+4. Policy: build the next `policy_len = 64` assignments by weighted round robin
+   with weights ∝ `max(ε, capacity − load)`. Send `SetPolicy` only when it changed
+   noticeably.
+5. Scale out: if mean load > `hi_watermark` and `pts < max_pts`, send `SpawnPt`.
+6. Scale in: if mean load < `lo_watermark` for `scale_in_ticks` and
+   `pts > min_pts`, send `RetirePt` for the least-loaded pt.
+7. Rebalance: if `max_load − min_load > imbalance_threshold`, move the hottest
+   links from the hottest pt to the coldest. A link moves only if
+   `now − last_moved > move_cooldown`, and at most `max_moves_per_tick` links move
+   per tick (hysteresis, so links don't ping-pong between pts).
+8. Evict: if links exceed `max_links`, `EvictLink` the oldest links idle longer
+   than `idle_evict_after` (this policy is optional, off by default).
+
+Logic and decisions live in a pure function,
+`Decisions decide(const State&, Config, now)`, so they can be unit-tested without
+threads.
+
+### 5.5 Listener (`ListenerWorker/`)
+
+```
+loop:
+    accept_client()
+    ok                    -> set options (non_blocking, tcp_nodelay, keep_alive),
+                             push InboundAccepted{conn}   (conn.remote_endpoint() is already set)
+    TooManyOpenFiles      -> log, sleep 100 ms (the client stays queued)
+    Stopped               -> exit
+    other                 -> log, retry
+```
+`accept_client()` itself skips clients that give up while queued, and retries
+when interrupted. `stop()` raises a `WakeupEvent` that `accept_client()` polls
+next to the listening socket (§8.2).
+
+### 5.6 Frontends (`Frontend/`)
+
+A frontend is three parts (D10, §14): an **input thread**, the shared
+**`CommandProcessor`**, and a **view**. This section covers the TUI. §14 covers the
+agent CLI and the command layer both use.
+
+**Keyboard thread** (TUI input): `read_byte(timeout = 100 ms)`, decodes UTF-8 (`read_utf8_char`)
+and CSI sequences (`ESC [ A/B/C/D/5~/6~`) into `Key`, pushes to `frontend_q`. It
+checks a `std::atomic<bool> stop` on every timeout. `0x03` (Ctrl+C) becomes
+`Key::Exit`.
+
+**TUI loop** (main thread). `Key`s edit the `InputModel`; Enter hands the line to
+`CommandProcessor::submit`, and a parse error becomes a local notice. `Reply`
+with `ok = false` is shown as a notice too.
+```
+while (auto m = frontend_q.pop()) {
+    apply(*m);
+    while (auto more = render_q.try_pop()) apply(*more);   // coalesce bursts
+    if (dirty) ui.render(layout);                             // FrameBuffer diff already skips unchanged rows
+    if (shutdown_done) break;
+}
+```
+
+**Layout** uses the existing `AbsoluteLayout`, `ChatWindow` and `InputBox`, plus a
+new one-line `StatusBar` element (active conv, status, unread counts, pts/links).
+
+The command set is in §14.2 and is the same in both frontends; Tab is a TUI key
+binding for `/open` of the next conv.
+
+The frontend deals only in conversations and never sees peer ids. A future `/group ...`
+command family only needs new Store messages and new parser cases.
+
+The TUI keeps a `ChatModel` only for the active conversation. A switch asks the
+Store for a snapshot (`Subscribe` returns `ConvSnapshot`), so the Store stays the
+single source of truth.
+
+### 5.7 Logger (`Common/Logger.hpp`)
+
+`Logger` is a cheap handle `{ThreadQueue<LogRecord>*, thread_name}` with
+`log(level, fmt, args...)`. `LogRecord{steady ts, wall ts, thread, level,
+component, text}`. The worker writes one line per record to a file, since stdout
+belongs to the TUI.
+
+A `Metric` level writes key=value lines (`pt=2 links=14 rx_bps=...`) that the
+experiment scripts can parse. The level filter is applied before formatting, so
+debug logging costs nothing when it is off.
+
+### 5.8 App / main (`App/`)
+
+`AppConfig` holds:
+- listen address and port, advertised endpoints
+- `min_pts`, `max_pts`, `max_links`, `max_links_per_pt`
+- the timeouts from §5.2
+- the Balancer parameters from §5.4
+- log file and level
+- `persistence` (`none` today; a future data-directory option, §12.2)
+- `frontend`: `tui` (default) or `cli` (`--cli`, §14)
+
+It is parsed from argv.
+
+Start order: Supervisor (§9.2; it sets the signal mask, so it comes before every
+other thread) → Logger → Store (with its `Persistence` implementation) → Router
+(spawns `min_pts` Pt-i) → Balancer → Listener → input thread (Keyboard or
+LineReader) → frontend loop on the main thread. In CLI mode `TerminalUI` is never
+constructed. Shutdown is the reverse, driven by messages (§7.8). `main` joins every
+thread in reverse start order, the Logger second to last and the Supervisor last.
+If shutdown stalls, the Supervisor escalates it (§9.2).
+
+---
+
+## 6. Data structure notes
+
+### 6.1 ConnTable (Router)
+`links_` is keyed by `link_id`, with `peer_to_link_` as a secondary index and
+`PtHandle::links` as the per-pt view. All three are updated together, in one
+handler.
+
+### 6.2 LoadLog (Balancer)
+Per-link EWMA plus a raw delta from the last report. `last_read` from project.md
+becomes the report timestamp.
+
+### 6.3 Subscriptions (Store)
+One subscription per conv:
+`{ inbound: Ignore|Notify|Forward, outbound: Ignore|Notify|Echo, lifecycle: Ignore|Notify }`.
+
+- New convs default to `{Notify, Ignore, Notify}`.
+- The active conv gets `{Forward, Notify, Notify}`. Subscribing to it sends a
+  `ConvSnapshot` first, then deltas (`MsgAppended`/`MsgStatus`), and advances
+  `read_upto`.
+- Notify sends `ConvNotify{unread}` and does not advance `read_upto`.
+- `PeerUp`/`PeerDown` become a `ConvState` for every conversation the peer is a
+  member of. Today that is just its direct conversation.
+
+---
+
+## 7. Scenarios (revised sequences)
+
+Notation: `A → B: Msg [action at B]`.
+
+### 7.1 Send message
+1. Frontend → Store: `SendText` [append `PendingSend`. If subscribed: `MsgAppended` → Frontend]
+2. Store → Router: `RouteSend` per member [look up `peer_to_link_`]
+3. Router: `pool_i->send(frame)` [direct write or TX buffer; synchronous result]
+4. Router → Store: `SendResult` [`Sent`/`Failed`. If subscribed: `MsgStatus` → Frontend]
+
+Counters reach the Balancer at the next probe (no per-message traffic). A frame
+that later fails to flush shows up as `LinkDown{WriteTimedOut}` (§7.5). Messages
+still `Sent` at that point stay `Sent`; acks (§8.4) would tighten this.
+
+### 7.2 Receive message
+1. Pt-i: decode → Store: `ChatIn` [resolve the conv (§5.3), append `Received`. If subscribed: forward or notify → Frontend]
+
+### 7.3 New incoming connection
+1. Listener → Router: `InboundAccepted` [new Link `Handshaking`, choose pt]
+2. Router → Pt-i: `Adopt{AwaitConnect}` [pool add, handshake read timeout]
+3. Pt-i → Router: `LinkAdopted`, later `LinkHello`
+4. Router → Store: `PeerHello` [recognise or mint, build the Ack]
+5. Store → Router: `BindLink` [resolve duplicates, `Connected`] or `RejectLink`
+6. Router → Pt-i: `Bind` [set peer, send Ack, established timeouts]
+7. Router → Store: `PeerUp` [peer Up] → Frontend: `ConvState` for its conversations
+8. Router → Balancer: `TopologyChanged`/link known at the next report
+
+### 7.4 Dial
+1. Frontend → Store: `DialReq`/`ReconnectReq` [peer `Dialing`, build hello]
+2. Store → Router: `RouteDial` [new Link `Dialing`, choose pt]
+3. Router → Pt-i: `Dial` [`pool.connection_dial`, non-blocking]
+4. Pt-i: `Connected` → send hello, `AwaitAck`. Failure → Router: `LinkDown{SocketError: ConnectionRefused|ConnectTimedOut}`
+5. Pt-i → Router: `LinkAcked` [`Connected`]
+6. Router → Store: `DialDone` [record `host_id`, peer Up] → Frontend: `ConvState`.
+   On failure: `PeerDown` → `ConvStatus::Failed`.
+
+**Duplicate links** (simultaneous dial, or a reconnect while the old link is not
+yet known to be dead). The Router learns that one peer has two live links.
+
+- If the old link is from an earlier session (it was `Connected` before the new
+  one started its handshake): keep the **new** link and close the old one with
+  `Superseded`. The peer has evidently reconnected.
+- If both links are in their handshakes at the same time (a simultaneous dial):
+  both sides must keep the *same* TCP connection. Rule: **keep the link that the
+  side with the numerically larger `(peer_id, host_id)` initiated.**
+  - Each node compares the pair as it sees it: `(our name for them, their name for
+    us)`. The other node sees the same two values swapped, so both nodes reach the
+    same decision.
+  - This needs the `host_id`, so on an inbound link the decision waits for
+    `PeerHello`, and on an outbound link it waits for `LinkAcked`.
+- A simultaneous **first** dial cannot be detected this way. Neither side has
+  named the other yet (`assigned_peer_id = 0`), so each side's inbound hello
+  creates a second Peer. This is accepted: the user sees two conversations with
+  the same endpoint. Merging them would need a global node identity, which is out
+  of scope.
+
+### 7.5 Peer disconnection
+1. Pool reports `{conn, err}` → Pt-i → Router: `LinkDown`
+2. Router → Store: `PeerDown` [peer Down; keep its record and endpoints for reconnect] → Frontend: `ConvState`
+3. Router → Balancer: `LinkGone`
+
+### 7.6 Balancer-initiated disconnect
+1. Balancer → Router: `EvictLink` [`Closing`]
+2. Router → Pt-i: `Close{graceful}` [`connection_remove`: flush then close]
+3. The pool reports the close → Pt-i → Router: `LinkDown{BalancerEvicted}` → Store / Balancer as in §7.5
+
+### 7.7 Rebalance (move a link)
+1. Balancer → Router: `MoveLink{link, to=j}` [`Moving`, sends are parked from now on]
+2. Router → Pt-i: `Release` [`connection_release`, take the decoder]
+3. Pt-i → Router: `LinkReleased{conn, pending_tx, decoder}`
+4. Router → Pt-j: `Adopt{Established, pending_tx, decoder}`
+5. Pt-j → Router: `LinkAdopted` [`Connected`, flush parked sends in order]
+6. The Balancer sees the new pt at the next report and records `last_moved`.
+
+Bytes the kernel receives during the move stay in the socket buffer. Unsent TX
+travels with the connection. Partial frames travel inside the decoder. Nothing is
+lost or reordered.
+
+If Pt-i finds the link gone when `Release` arrives, it answers `LinkDown`. The
+Router then fails the parked sends.
+
+### 7.8 App closing
+1. Frontend → Store: `QuitReq`
+2. Store → Router: `Shutdown{grace = 1 s}`
+3. Router:
+   - `listener.stop()` and join it
+   - Balancer: `StopBalancer`
+   - every Pt-i: `Stop{deadline = now + grace}`
+4. Pt-i: `connection_remove` on every link (graceful flush). It keeps running
+   `receive()` until the pool is empty or the deadline passes, then calls
+   `pool.stop()`, and sends `PtStopped` → Router.
+5. Router: join every Pt-i, then → Store: `RouterStopped`
+6. Store: `persistence.flush()` (a no-op today), then → Frontend: `ShutdownDone`
+7. The frontend exits its loop. main stops the input thread, closes every queue
+   (`graceful_shutdown`), joins the Store, Router and Balancer, then the Logger.
+
+The per-link `LinkDown{Shutdown}` messages reach the Router while it waits. It
+does not forward them to the Store.
+
+---
+
+## 8. Changes needed in existing code
+
+### 8.1 `EpollConnectionPool` ([TcpSocket.hpp](TcpSocket/TcpSocket.hpp)): **done**
+
+| Addition | Purpose |
+|---|---|
+| `interrupt()`: the next `receive()` returns `ReceiveError{0, Interrupted}` once; calls made before it reports collapse into one | Pt-i command queue (D2) |
+| `connection_dial(address, port, Options, Timeouts, connect_timeout)`: non-blocking, built on `TcpConnection::connect_start()` / `connect_status()`. `receive()` reports `ReceiveResult{id, 0, Kind::Connected}` or `{id, ConnectionRefused / HostUnreachable / ConnectTimedOut / ...}`. Only a malformed address fails synchronously | D7 |
+| `connection_release(id)` → `ReleasedConnection{TcpConnection, unsent_tx, stats}`, without closing the socket | Rebalance |
+| `connection_add(TcpConnection, Timeouts, initial_tx)` | Adopt after a move |
+| `set_timeouts(id, Timeouts)` (read timers carry a generation, so the old one is retired) | Handshake → established |
+| `take_stats(id)` → `{bytes_received, bytes_sent}` since the last call | Balancer reports |
+
+The pool wakes `receive()` through a `WakeupEvent` (§8.2).
+
+### 8.2 `TcpConnection` / `TcpListener` / `WakeupEvent`: **done**
+- **`WakeupEvent`** (now `Common/WakeupEvent.hpp`, its own target, so code outside
+  the socket library can use it without depending on sockets): an eventfd wrapper
+  with `signal()` (any thread), `clear()` and `fd()`. One rule throughout: an atomic flag next to the event records *why*,
+  and the event only wakes the waiting thread. The pool and the listener both
+  use it.
+- **`TcpEndpoint{address, port}`**: plain C++ types, so `TcpSocket.hpp` includes no
+  C networking header and does not depend on `Wire.hpp`. The Router converts it to
+  `wire::Endpoint`.
+- **`TcpConnection::remote_endpoint()`** → `const TcpEndpoint&`, always set for a live connection.
+  The address is recorded when the connection is created:
+  - `accept_client()` stores what `accept()` returned;
+  - `connect()` / `connect_start()` store the destination they dialled;
+  - the raw-descriptor constructor is private, so no connection is created without an address; a moved-from one holds `TcpEndpoint{}`.
+
+  It stays readable after the peer disconnects. It moves with the object, into a
+  pool and out again (`connection_release`).
+- **`TcpListener::stop()`**: sets a flag and raises a `WakeupEvent`.
+  `accept_client()` is built from two helpers:
+  - `wait_for_client()`: `poll()` on the non-blocking listening socket plus the
+    event;
+  - `try_accept()`: one `accept4()`.
+
+  Stop is permanent, idempotent, safe from any thread, and wins over a client
+  that is already queued.
+- **New `SocketError::TooManyOpenFiles`** (EMFILE/ENFILE), so the Listener can back
+  off.
+- **`TcpListener::local_port()`**, so tests can bind to port 0.
+
+### 8.3 `ThreadQueue` timers: **done**
+- `TimerId every(period, Tick)` and `cancel(TimerId)`. While a timer is due,
+  `pop()` / `try_pop()` return `T(tick)` before queued values.
+  - A late timer yields one tick, never a burst, and the schedule does not drift.
+  - No ticks after either shutdown.
+  - Safe from any thread.
+- **A tick is an ordinary message.** `every()` requires
+  `std::constructible_from<T, Tick>`: the tick type must be one of the consumer's
+  inbox alternatives. The timer stores the `Tick`, not a `T`, so move-only inboxes
+  work. `pop()` keeps its signature (`std::optional<T>`, `nullopt` = closed).
+- **Why not `pop_until(deadline)` or a ticker thread.** Both were considered.
+  - `pop_until` puts the deadline bookkeeping (per-message check, catch-up, drift)
+    in every consumer, and time becomes a hidden input that tests can't inject.
+  - A ticker thread delays ticks behind a backed-up inbox, lets them pile up, and
+    adds a thread with lifetime rules.
+  - Queue timers have none of these problems.
+- **Rules for workers that use timers:**
+  1. The consumer registers its timers on its own inbox, in its constructor, and
+     cancels them in its destructor. Timer, tick type and handler then sit in one
+     class.
+  2. Dispatch with `std::visit([this](auto& m) { on(m); }, msg)` over `on(...)`
+     overloads. With no catch-all handler, a missing `on(Tick&)`, or a missing
+     handler for any new inbox type, fails to compile.
+
+### 8.4 `Wire.hpp`
+- **Now:** update the `ChatMessage` comment to the field meanings in §3. The
+  layout stays the same, and so does `kVersion`.
+- **Later, optional:**
+  - `MessageAck{conversation_id, msg_id}` (type 4) for real delivery state.
+    `ChatMessage` would gain `msg_id`, which needs a version bump.
+  - `Ping`/`Pong` if keepalive is too slow.
+  - The group control frames from §12.1.
+- New message types take fresh type numbers. An unknown type is already a
+  recoverable `WireError::UnknownType`, so an older node drops the frame and keeps
+  the link.
+
+### 8.5 Sketches to replace
+- `RoutingTable` → §5.1 state: keyed by peer, not conv. Drop the
+  `AssignmentPolicy` mutex.
+- `BalancerWorker` → §5.4. Fix the `conversatoin_` typo. Move it out of `RouterWorker/`.
+- `StoreWorker`/`PeerTable`/`ConversationStore` → §5.3 (`Peer` / `Conversation`
+  split, messages stored in the conv, commit hooks).
+- All headers need `#pragma once`.
+
+---
+
+## 9. Source layout
+
+```
+Common/        ThreadQueue.hpp  WakeupEvent.hpp/.cpp (own target; TcpSocket uses it)  Ids.hpp (IdMinter)
+               Logger.hpp/.cpp  Worker.hpp/.cpp (§9.1)  Supervisor.hpp/.cpp (§9.2)  AppConfig.hpp
+               No networking: Common does not depend on TcpSocket.
+Messages/      Messages.hpp (header-only; depends on Common, TcpSocket, Wire.hpp)
+TcpSocket/     (existing) + dial/release/interrupt
+TerminalUI/    cell-based rendering (§13): Unicode, Style, TextLayout, Canvas, Element::draw; + StatusBar element
+Wire.hpp       (existing)
+StoreWorker/   StoreWorker.hpp/.cpp  PeerTable.hpp/.cpp  ConvStore.hpp/.cpp
+               Subscriptions.hpp  Persistence.hpp (interface + NullPersistence)
+RouterWorker/  RouterWorker.hpp/.cpp  AssignmentPolicy.hpp
+IoWorker/      IoWorker.hpp/.cpp
+BalancerWorker/BalancerWorker.hpp/.cpp  BalancerPolicy.hpp/.cpp   (pure decide())
+ListenerWorker/ListenerWorker.hpp/.cpp
+Frontend/      Commands.hpp/.cpp (pure parser)  CommandProcessor.hpp/.cpp
+               Tui: TuiView.hpp/.cpp  KeyboardWorker.hpp/.cpp
+               Cli: LineReader.hpp/.cpp  JsonlWriter.hpp/.cpp  Json.hpp (escaping, hex ids)
+App/           main.cpp
+tests/         one test_*.cpp per module (CTest)
+```
+
+Each worker exposes `run()` (the thread body) and is constructed with references to
+the inboxes it writes to. It never holds another worker's object. This keeps every
+worker unit-testable by feeding its inbox and inspecting the queues it writes to.
+
+Every worker handles its inbox the same way:
+```cpp
+while (auto msg = inbox_.pop()) {
+    std::visit([this](auto& m) { on(m); }, *msg);   // one on(X&) overload per inbox type
+}
+```
+There is no catch-all overload (`void on(auto&)`), so a message type without a
+handler, ticks included, is a compile error (§8.3). `Common/Worker.hpp` (§9.1)
+provides this loop.
+
+### 9.1 `Common/Worker.hpp`
+
+Each worker class is still written by hand. The helper's job is to remove what
+can go wrong around that loop: a thread that never finishes joining, an exception
+that brings down the process, a reference to a queue that no longer exists, and a
+shutdown sequence left half done.
+
+```cpp
+// Dispatch: checked at compile time; the error names the missing alternative
+template <class W, class M>
+concept Handles = requires(W& w, M& m) { w.on(m); };
+
+template <class W, class... Ts>
+void dispatch(W& w, std::variant<Ts...>& msg) {
+    (check_handles<W, Ts>(), ...);              // static_assert per type: "no on(InputLine&)"
+    std::visit([&](auto& m) { w.on(m); }, msg);
+}
+
+// Loop: ends when the inbox closes, or when the worker reports done()
+template <class W, class T>
+void run_inbox(W& w, ThreadQueue<T>& inbox) {
+    while (auto m = inbox.pop()) {
+        dispatch(w, *m);
+        if constexpr (requires { w.done(); }) if (w.done()) break;   // e.g. Pt-i after Stop
+    }
+}
+
+// For tests: no thread and no waiting. Handles whatever is queued, returns the count.
+template <class W, class T>
+size_t drain(W& w, ThreadQueue<T>& inbox);
+
+// Thread ownership
+class WorkerThread {
+public:
+    WorkerThread(std::string name, std::function<void()> body,
+                 std::function<void()> stop, Supervisor&);
+    void request_stop();         // calls `stop` exactly once; safe from any thread
+    void join();
+    bool finished() const;       // set as the body returns; the Supervisor reports stuck threads
+    ~WorkerThread();             // request_stop(); join();
+};
+```
+
+**`stop` is per worker, because each one blocks on something different:**
+
+| Worker | Blocks on | `stop` |
+|---|---|---|
+| Store, Router, Balancer, Logger, frontend loop | `inbox.pop()` | `inbox.graceful_shutdown()` |
+| Pt-i | `pool.receive()` | `pool.stop()` |
+| Listener | `accept_client()` | `listener.stop()` |
+| LineReader | `poll(stdin, event)` | `event.signal()` |
+| Keyboard | `read_byte(100 ms)` | the atomic flag |
+
+**Rules**
+1. **Exceptions end the process deliberately.** The `WorkerThread` body catches
+   everything, logs `fatal` with the thread name, and calls
+   `Supervisor::fatal()`, which goes straight to the Emergency phase (§9.2).
+   Keeping the rest of the process running is not an option: if the Store dies,
+   the shutdown chain in §7.8 hangs, because it runs through the Store. Handlers
+   are not expected to throw at all. The catch is there only so a bug fails loudly
+   instead of silently (an exception escaping a `std::thread` calls
+   `std::terminate` with no log line).
+2. **Declaration order sets the lifetimes.** `App` declares the queues first, then
+   the worker objects, then the `WorkerThread`s. C++ destroys members in reverse
+   order, so threads are joined before the objects and queues they use go away.
+3. **Exactly one way to exit per worker.** A worker leaves its loop either because
+   its inbox closed or because `done()` returned true. It never calls `return`
+   from inside a handler, and nothing outside it stops the thread.
+4. **A worker that owns threads stops and joins them itself**, in its `run()`
+   epilogue after the loop. The Router does this for its Pt-i threads. The
+   Supervisor's registry therefore contains only threads that exist before
+   start-up finishes, and needs no lock.
+5. **Every thread goes through `WorkerThread`**, including the Pt-i threads the
+   Router spawns, so the same catch, naming and stop rules apply everywhere.
+   Threads are named with `pthread_setname_np` (for example `store` or `pt-3`), so
+   gdb, `top -H` and log lines identify each one.
+6. **Handlers never block on I/O.** No helper can interrupt a handler that blocks.
+   §9.2 turns such a hang into a bounded exit, but not into correct behaviour.
+
+**Not used**
+- **A `Worker` base class with a virtual `run()`.** It adds nothing to the
+  templates and hides the inbox type.
+- **`std::jthread`'s stop_token as the stop mechanism.** A stop_token can't wake
+  `pop()`, `receive()` or `poll()` by itself, so the per-worker `stop` function is
+  needed anyway. `jthread` is fine as the thread type inside `WorkerThread`.
+- **A supervisor that restarts failed workers.** A restarted Store or Router would
+  have lost its tables, so a restart can't recover correctly. Fail-fast with a
+  clean log is the honest behaviour.
+
+### 9.2 Shutdown watchdog (`Common/Supervisor.hpp`)
+
+**Guarantee:** once shutdown starts, the process exits within a fixed time,
+whatever else goes wrong. Exiting cleanly is preferred, and when the exit is not
+clean, the logs say why.
+
+```
+Running ──quit / SIGTERM / EOF──► Graceful ──deadline──► Emergency ──deadline──► Hard exit
+   │                                 │  ▲                    │
+   └──worker exception───────────────┼──┼──────────────────► │
+                                     │  └ 2nd SIGTERM ───────┘ (skip ahead)
+                                     └──all joined──► Done (exit 0)
+```
+
+| Phase | What happens | Deadline (default) | Exit code if it ends here |
+|---|---|---|---|
+| Graceful | §7.8 runs as messages: Pt-i flush, `ShutdownDone`, main joins everything | `grace + 1 s` = 2 s | 0 |
+| Emergency | `force_shutdown()` on every queue except `log_q`, `request_stop()` on every `WorkerThread`, main joins | 1 s | 3 if graceful timed out, 2 after a worker exception |
+| Hard exit | restore the terminal, write one log line with raw `write(2)`, `_exit` | — | 4 |
+
+Startup failures exit with 1 (CLI: a `fatal` event, §14.4). The phases only move
+forward, and moving between them is one atomic compare-and-swap, so every trigger
+is safe from any thread and safe to fire more than once. `--shutdown-grace` sets
+`grace`. The graceful deadline is `grace + 1 s`, and the emergency deadline is
+1 s.
+
+**It runs on its own thread, not as a timer on `frontend_q`.** The main thread is
+one of the things that can get stuck:
+- in CLI mode, an agent that stops reading leaves stdout's pipe full, so
+  `JsonlWriter` blocks in `write`;
+- main's own `join()` calls can hang.
+
+The Supervisor starts first and is joined last. It also owns signal handling,
+which needs a thread for the same reason.
+
+```cpp
+class Supervisor {
+public:
+    explicit Supervisor(ShutdownTimings, Logger);
+    // Must be called on main before any other thread starts: blocks SIGINT, SIGTERM
+    // and SIGHUP in every thread (they inherit the mask) and ignores SIGPIPE.
+    void start();
+
+    void register_queue(std::function<void()> force_shutdown);   // before workers start
+    void register_thread(WorkerThread&);                          // before workers start
+    void set_graceful_trigger(std::function<void()>);             // pushes QuitReq{0} to store_q
+    void set_terminal_restore(void (*)() noexcept);               // TUI only, async-signal-safe
+
+    void begin_shutdown(std::string_view reason);   // frontend: /quit, EOF, Ctrl+C
+    void fatal(std::string_view thread, std::string_view what);   // WorkerThread's catch block
+    int  finish();                                   // main, after every join: disarm, return exit code
+};
+```
+
+**Loop.** A `poll` on a `signalfd` and a `WakeupEvent`, with the remaining time to
+the current deadline as the timeout:
+- **First signal:** call the graceful trigger and arm the Graceful deadline.
+- **Second signal:** go straight to Emergency.
+- **WakeupEvent:** the phase or deadline changed, so recompute the timeout.
+- **Timeout:** escalate one phase.
+
+**Rules**
+0. **The Logger thread is not registered with `register_thread`.** It is expected
+   to be running (draining) during an emergency, so it would always be listed as
+   stuck. Its queue is registered with `register_log_queue` instead.
+1. **The Logger's queue drains even in Emergency.** Every other queue is
+   force-closed, but `log_q` gets `graceful_shutdown()`, so records already queued
+   (including the fatal one) are still written. If that hangs, Hard exit is the
+   backstop.
+2. **The log names the threads that got stuck.** On each escalation the Supervisor
+   logs, for example,
+   `shutdown phase=emergency reason=graceful_timeout stuck=[store,pt-2]`, using
+   `WorkerThread::finished()` for the threads it registered. A stuck Pt-i shows up
+   as the stuck Router, because the Router joins its own Pt-i threads (§9.1, rule 4).
+3. **Hard exit uses only async-signal-safe calls:**
+   - the TUI restore hook: `tcsetattr` with the saved termios, then `write` of the
+     escapes that leave the alternate screen and show the cursor;
+   - one `write(2)` to the log file's fd;
+   - `_exit(4)`.
+
+   No destructors run and nothing takes a lock. Log records still queued are lost.
+4. **CLI output during an escalation is best effort.** The Supervisor `try_lock`s
+   the `JsonlWriter` mutex and writes
+   `{"ev":"shutdown_forced","phase":"emergency","stuck":[...]}` with a
+   non-blocking write. If the lock is held or stdout is full, it writes nothing
+   there. The exit code still tells the agent what happened.
+5. **EPIPE on stdout counts as a quit.** It is treated like `InputClosed`: the
+   agent has gone, so the node shuts down instead of buffering events forever.
+
+**main**
+```cpp
+int main(int argc, char** argv) {
+    App app{parse(argv)};              // queues, then workers, then threads (destroyed in reverse)
+    app.supervisor.start();            // signal mask first, before any other thread exists
+    app.start_workers();               // registers queues and threads, then starts them
+    app.frontend.run();                // returns on ShutdownDone, or when frontend_q is force-closed
+    app.join_all();                    // reverse start order; the Logger last
+    return app.supervisor.finish();    // 0 / 2 / 3; Hard exit never gets here
+}
+```
+In Emergency, `frontend_q` is force-closed too, so `frontend.run()` returns. Main
+then reaches `join_all()` by the same route as in a graceful shutdown. Only one
+shutdown sequence exists in main; the phases differ only in how hard the queues
+are closed.
+
+**Tests** (`test_supervisor`, with timings shrunk to ~100 ms)
+
+| Case | Expected |
+|---|---|
+| Normal quit | no escalation, exit 0, no `shutdown_forced` line |
+| A Store handler blocks on a test latch the shutdown never releases | Graceful expires, Emergency succeeds once the latch is released, exit 3, `stuck=[store]` |
+| A handler blocks and cannot be woken (a `sleep` loop with no wake-up) | Hard exit within graceful + emergency + ε, exit 4, termios restored (checked on a pty) |
+| A handler throws | exit 2, the `fatal` log line names the thread, Graceful is skipped |
+| SIGTERM, then a second SIGTERM | the first starts Graceful, the second escalates at once |
+| CLI: the agent stops reading stdout, then sends SIGTERM | exit within the deadlines, even though main is stuck in `write` |
+| CLI: stdout is closed (EPIPE) | normal quit, exit 0 |
+
+The two CLI rows are tested at the Supervisor level in step 2 (main blocked in
+`write` on a full pipe) and end to end in step 6. Under ThreadSanitizer, run with
+`TSAN_OPTIONS=atexit_sleep_ms=0` (and `setarch -R` on WSL2): TSan's default 1 s
+sleep inside `_exit` otherwise breaks the timing checks of the hard-exit cases.
+
+---
+
+## 10. Build order and tests
+
+| Step | Deliverable | Tests |
+|---|---|---|
+| 1 ✅ | Pool extensions (§8.1); `WakeupEvent`, `TcpListener::stop`, `remote_endpoint` (§8.2); `ThreadQueue` timers (§8.3) | `test_pool`: interrupt coalescing, dial ok/refused/timeout, release then add on a second pool with no byte loss, `set_timeouts`, stats. `test_listener`: stop (blocked, permanent, beats a queued client), `TooManyOpenFiles`, remote address on both sides and across moves. `test_queue`: FIFO/shutdown, tick timing, ticks first, no burst, several timers, cancel, move-only inbox |
+| 2 ✅ | `Common/`: `ThreadQueue.hpp` (moved), `WakeupEvent` (moved out of TcpSocket into its own target), `Ids.hpp` (`IdMinter`), `Logger`, `Worker.hpp`, `Supervisor`. `Messages/Messages.hpp` (every inbox of §4, in namespace `msg`, size budget as `static_assert`s) | `test_ids` 19 checks (id uniqueness, `reserve`, messages through a queue, budget); `test_logger` 24 (level filter skips formatting, escaping incl. UTF-8 C1, line format, 4 threads × 2000 records in per-thread order, drain on graceful shutdown); `test_worker` 21 (dispatch, `done()`, `drain`, ticks, naming, stop once with 8 callers, exception → `fatal`, stop for inbox / pool / listener / poll); `test_supervisor` 27 (every row of the §9.2 table, each scenario in its own child process). Clean under TSan and ASan+UBSan |
+| 3 | Store, single-threaded and fed by its inbox, with `NullPersistence` and a recording fake | handshake recognition (new / reconnect / bad id), dial flow, send-status transitions, `ChatIn` resolution (direct, unknown group id, sender mismatch), subscriptions, `SetDefaultSubscription`, `CloseReq`; exactly one `Reply` per `ReqId != 0`, on success and on every failure path; the fake sees one commit per mutation |
+| 4 | Pt-i alone, driven by a fake Router queue | inbound and outbound handshake, protocol errors, handshake timeout, release/adopt of a decoder holding half a frame |
+| 5 | Router with N Pt-i, without the Balancer (static round-robin policy) | two in-process nodes over loopback: dial, chat, disconnect, reconnect keeps the conv, simultaneous dial converges on one link on both sides |
+| 6 | Command layer and agent CLI (§14): `Commands`, `CommandProcessor`, `LineReader`, `JsonlWriter`, `App/main --cli` | `test_commands` (every command, bad arguments, active conv vs explicit `/send`, `ReqId` = line number); `test_jsonl` (escaping of controls and invalid UTF-8, hex ids, one object per line); `test_cli_e2e`: two `node --cli` processes over loopback, driven through pipes: `ready` with the bound port, dial, chat, `/close`, reconnect keeps the conv, stdin EOF → `shutdown_done` and exit 0 |
+| 7 | Balancer `decide()` as a pure function | policy weights, stall detection, move hysteresis, scale in/out |
+| 8 | Balancer thread wired in | forced imbalance → moves happen and traffic is uninterrupted (scripted through the CLI), a stalled pt (blocked by a test hook) gets excluded |
+| 9 | TUI frontend: `TuiView`, `KeyboardWorker`, on the same `CommandProcessor` | headless view test (feed `FrontendMsg`, compare FrameBuffer); key → line → same `StoreMsg` as the CLI produces |
+| 10 | Shutdown | quit with buffered TX, all threads join within grace + ε, no lost log lines, in both frontends |
+
+**Why the CLI comes before the Balancer and the TUI.** After step 5 the network
+stack works but nothing outside a test binary can drive it. The CLI makes real
+nodes scriptable, so later steps are checked end to end by tests, scripts and
+agents through the same interface.
+
+A load generator (as `stressgen` was before the rewrite) comes after step 8. It is
+a script that drives N `node --cli` peers × M msg/s against one node, so the
+Balancer's effect can be measured for the report.
+
+---
+
+## 11. Invariants that keep the extensions open
+
+1. **Conversations live only in the Store and Frontend.** The Router, Pt-i, Balancer
+   and Listener deal in peers and links. Adding groups or persistence changes no
+   thread except the Store (plus Frontend for new UI).
+2. **The Store is the only stateful owner of identity and history.** Every other
+   table can be rebuilt from live connections, so persistence never needs to
+   reach outside the Store.
+3. **The Store mutates its tables only through `commit_*`.** Persistence plugs
+   into those functions alone.
+4. **Ids are random and never reused,** so ids persisted from earlier runs cannot
+   collide with new ones.
+5. **Unknown wire types are skipped, not fatal.** New frame types can ship
+   without breaking older nodes.
+6. **Frontends are interchangeable.** The Store sees only `StoreMsg` requests and
+   emits only `FrontendMsg` events. Commands are parsed in one place (§14.2), so
+   the TUI and the CLI cannot drift apart.
+
+---
+
+## 12. Future extensions (designed for, not built)
+
+### 12.1 Group conversations
+
+**Scope.** Groups among peers that each have a **direct link to every other
+member** (full mesh). Delivering to a member who is only reachable through another
+peer (ad-hoc routing or relaying) stays out of scope. It would need a global node
+identity, forwarding and deduplication, none of which this design provides.
+
+**Already in place**
+- `Conversation{kind, group_id, members}` and `ConvStore::by_group_id_`
+- the wire `conversation_id` set to `group_id`, `0` meaning the direct conversation
+- per-member fan-out in the Store's send, and `SendTag` echoed back per peer
+- the Router being peer-only (invariant 1)
+
+**Would still need**
+- Wire control frames (new types):
+  - `GroupInvite{group_id, name, members as (endpoint)}`
+  - `GroupJoin`, `GroupLeave`
+  - optionally `GroupMembers` for a sync.
+  Members are named by endpoint plus the inviter's vouching. A node does not know
+  the other members' names for each other, so it dials any member it has no peer
+  record for.
+- The Store:
+  - mint a random `group_id` (64-bit; collisions are negligible)
+  - handle the control frames: Pt-i forwards a new `ControlIn` variant on the same
+    D3 path as `ChatIn`
+  - store per-member delivery state: `StoredMessage::state` becomes a
+    `small_map<PeerId, DeliveryState>` for group convs.
+- Frontend: `/group new|invite|leave`, and group status in the status bar.
+
+**Ordering caveat.** Without relaying, two members may see messages from
+different senders in different orders. If that matters, display order can use a
+(Lamport clock, sender) pair, which would mean adding a field to `ChatMessage`
+behind a version bump.
+
+### 12.2 Persistent peers, ids and history
+
+**Interface, owned by the Store and called only from `commit_*`:**
+```cpp
+struct Persistence {
+    virtual ~Persistence() = default;
+    virtual LoadedState load() = 0;                          // peers, convs, histories at startup
+    virtual void save_peer(const Peer&) = 0;                 // endpoints, peer_id, host_id
+    virtual void save_conv(const Conversation&) = 0;         // kind, group_id, members, read_upto
+    virtual void append_message(ConvId, const StoredMessage&) = 0;
+    virtual void update_message(ConvId, MsgId, DeliveryState) = 0;
+    virtual void flush() = 0;                                // called on shutdown (§7.8 step 6)
+};
+struct NullPersistence final : Persistence { /* all no-ops; load() returns empty */ };
+```
+
+**Rules that make it a drop-in later**
+- On startup the Store seeds `PeerTable`/`ConvStore` from `load()`, and the
+  `IdMinter` from the loaded ids. Every peer starts with `link_state = Down`.
+  Transient state is never persisted: link ids, statuses and subscriptions.
+- `host_id` and `endpoints` are already kept per peer. After a restart a
+  reconnect re-presents the same `assigned_peer_id`, so the remote side
+  recognises us with no protocol change.
+- `msg_id` stays a per-conversation sequence. After a load the next one is
+  `msgs.size()`.
+- A message still `PendingSend` at load time becomes `Failed`.
+- Calls run on the Store thread. A file-based implementation should make
+  `append_message` an append to a per-conversation log and batch its `fsync`, or
+  the Store thread will stall. If that turns out too slow, the implementation can
+  run its own writer thread behind the same interface, and no caller changes.
+
+---
+
+## 13. TerminalUI: cell-based rendering
+
+A track of its own, independent of the build order in §10. Today the UI passes
+text down as `std::string`s with UTF-8 and colour escape sequences mixed in. The
+pipeline then decodes the same text up to four times: wrapping, row padding, the
+grid overlay, and the cursor. This section replaces that with text decoded
+**once** into styled glyphs, and every layer below works in cells.
+
+### 13.1 Problems in the current code
+
+All nine are recorded as `known_bug` cases in `tests/test_terminal_ui.cpp`.
+
+| # | Bug | Cause |
+|---|---|---|
+| 1 | Coloured text wraps too early | `line_split` counts colour escape bytes as visible columns. After a break it re-measures with `utf8::width`, which skips them, so the two counts disagree. |
+| 2 | **A peer's message can send commands to the user's terminal** (OSC 52 clipboard write, clear screen, bell) | Message text is passed through raw; `write_text` stores escapes in cells and emits them |
+| 3 | Wrapped lines lose their colour | Only the first piece of a message carries the escape, and every row starts with a reset |
+| 4 | Content colour leaks into padding and the right border | Nothing resets after a row's content |
+| 5 | The `...` truncation marker can split a glyph or an escape | `ChatWindow` overwrites the first 3 bytes of the top line |
+| 6 | An element can draw outside its own box | There is no clipping |
+| 7 | `Position::z` has no effect | `Element::render` never puts z into its commands, so the stable sort never reorders anything |
+| 8 | A wide glyph is half-drawn at the frame's right edge | `write_text` draws the left half when the right half doesn't fit |
+| 9 | Drawing a narrow glyph breaks the wide glyph to its right, so the row is emitted one column too wide | `write_text` always clears the next cell's continuation flag, even for a 1-column glyph |
+
+| 10 | A resize resets every child's z to 0 (found in step 3) | `AbsoluteLayout::set_size` rebuilt each position as `{x, y}` |
+
+**Status: all fixed.** Bugs 2, 8 and 9 were fixed in step 1; 4, 6, 7 and 10 in
+step 3; 1, 2b, 3 and 5 in step 4. Every one of them is now a `check`.
+Bug 2 was only partly fixed. Control characters can no longer reach the terminal,
+but colour codes in a message still become styles. That is recorded as known bug
+**2b**, fixed by cleaning text at the input boundary (step 5).
+
+### 13.2 Design
+
+**Style is data, not escape codes.** Text never carries escapes. Untrusted text
+is cleaned once, where it becomes styled text.
+
+```cpp
+struct Color { enum class Kind : uint8_t { Default, Ansi16, Ansi256, Rgb } kind{}; uint8_t r{}, g{}, b{}; };
+struct Style { Color fg, bg; uint8_t attrs = 0; /* Bold, Dim, Italic, Underline, Reverse */ };
+
+// One user-perceived character: a base codepoint plus the combining marks after it,
+// stored inline as UTF-8. Fixed size, no heap.
+struct Glyph { std::array<char, 15> bytes{}; uint8_t size = 0; uint8_t width = 1; };
+struct Cell  { Glyph glyph; Style style; bool continuation = false; };
+
+// Text plus styles: what models and widgets produce. The text is kept as given:
+// TextLayout shows control characters and bad bytes as U+FFFD (through next_glyph),
+// so display safety doesn't depend on cleaning, and byte offsets stay those of
+// the original text (InputBox's cursor offsets need that).
+class StyledText { /* runs of {Style, std::string}; add(text, style) */ };
+```
+
+There are four layers. Each is the only place that does its job.
+
+1. **`Unicode.hpp`: the only place that decodes UTF-8.**
+   - `next_glyph(text, pos)` returns `{Glyph, byte length}`, using the existing
+     wide and combining tables.
+   - `sanitize(text)` turns C0, DEL and C1 control characters (so `ESC` too) into
+     `U+FFFD`, and tabs into spaces.
+   - `InputModel` keeps its byte-based, codepoint-aligned editing.
+2. **`TextLayout`: shape and wrap once.**
+   - `layout(StyledText, width)` returns the glyphs, each with its style and source
+     byte offset, plus the wrapped lines (word wrap, hard break for over-long words,
+     `'\n'`).
+   - Each glyph carries its style, so wrapped lines keep their colour.
+   - Widths are known in advance, so wrapping is exact.
+   - The source offsets give `InputBox` its cursor column with a lookup.
+   - It replaces `line_split` and `line_split_tail`.
+3. **`Canvas`: a clipped, offset view of the `FrameBuffer`.**
+   - Operations: `sub(rect)`, `put(x, y, Glyph, Style)`, `text(x, y, line)`,
+     `fill(rect, ...)`, `set_cursor(x, y)`.
+   - Nothing can be drawn outside it.
+   - `put` keeps wide glyphs intact: covering either half blanks the whole glyph,
+     and a glyph cut by the clip edge becomes a space.
+4. **`Element::draw(Canvas&)`**, replacing `begin_render` / `inner_content` /
+   `end_render` and `RenderCommand`.
+   - Margin, border and padding are cells in the element's own style.
+   - `draw_content(Canvas& inner)` is the widget's single hook.
+   - `AbsoluteLayout` sorts its children by z and draws each into
+     `canvas.sub(child rect)`.
+
+**Terminal output.** Rows are still diffed against the previous frame. While a row
+is written, an escape is emitted only where a cell's style differs from the
+previous cell's. Every cell states its full style, so a row can later be
+repainted in part.
+
+**Widgets.**
+- **`ChatWindow`:**
+  - Each message becomes `StyledText`: sender and time in the separator style,
+    then the body in the message style.
+  - Only the messages that reach the window are laid out. It walks back from the
+    newest until the window is full, so the work is bounded by its height and
+    the result is exact (no byte-stride guess). Those layouts are kept until the
+    model, the size or a style changes.
+  - The `...` marker is drawn as glyphs over the top row, in the style of what
+    it covers. It appears whenever anything is hidden above: part of a message,
+    or older messages.
+- **`InputBox`** lays out its content once per change and finds the cursor through
+  the glyphs' source offsets.
+- **Style setters.** `set_main_color(std::string_view)` and `set_separator_color`
+  are replaced by `ChatWindow::set_message_style(Style)` and
+  `set_separator_style(Style)`. `Element::set_style` covers the element's own
+  cells (background, border, padding; for `InputBox` also its text). That also
+  ends the risk of a `string_view` pointing into a string the caller owns.
+- **`ChatModel::add_message`** stores text unchanged; display safety comes from
+  `next_glyph`.
+
+**Out of scope:** emoji joined by ZWJ, and variation selectors. They stay
+approximate; supporting them later changes only `next_glyph` and the width table.
+
+**Cost:** a `Cell` goes from about 40 bytes plus a possible heap string to about
+28 bytes, with no heap. A 200×60 frame is about 340 KB, and two frames are kept
+for the diff. Comparing rows becomes a plain byte comparison.
+
+### 13.3 Steps
+
+| Step | Change | Tests |
+|---|---|---|
+| 0 ✅ | `tests/test_terminal_ui.cpp`: current behaviour as `check`s, bugs 1–9 as `known_bug`s | 33 checks, 9 known bugs |
+| 1 ✅ | `Unicode.hpp` (decode, `Glyph`, `next_glyph`, `sanitize`, the width table, which `Utils.hpp` now uses), `Style`/`Color` with `append_sgr`/`apply_sgr`, the new `Cell`. `FrameBuffer::put` keeps wide glyphs whole, and `row_text` emits SGR only on style changes. The transitional `write_text` turns colour codes into a running style, drops other escapes, and draws glyphs through `put` | `tests/test_cells.cpp` (62 checks: decoding including malformed input, widths, glyphs, cleaning, SGR both ways, `put`, `row_text`). `test_terminal_ui`: 36 checks; bugs 2, 8, 9 fixed |
+| 2 ✅ | `StyledText` + `TextLayout` (`TextLayout.hpp/.cpp`): `wrap(text, width)` shapes glyphs once, each with its style, source offset and length, then wraps them. `locate(offset)` gives `(line, column)` | `tests/test_layout.cpp` (40 checks: words, hard breaks, newlines, wide glyphs, styles across breaks, marks across runs, controls, `locate`). Checked against the old `line_split` on 171,467 random texts: identical lines, except the two intended changes (a trailing `'\n'` leaves an empty last line, and empty text is one empty line) |
+| 3 ✅ | `Canvas` (`Canvas.hpp/.cpp`): a clipped, offset view over `FrameBuffer::put` with `sub`, `put`, `text`, `fill`, `set_cursor`. `Element::draw(Canvas&)` clears the box in the element's style, draws the border, then calls `draw_content(inner)`. `AbsoluteLayout` draws children by z, each into `inner.sub(child rect)`. `ChatWindow` and `InputBox` still produce strings, so they run on a temporary `LegacyElement` (the old hooks over `Canvas::write_legacy`) | `test_cells`: 78 checks (Canvas: clipping, nested clips, wide glyphs at both clip edges, fill, cursor clamping). `test_terminal_ui`: 45 checks; bugs 4, 6, 7, 10 fixed |
+| 4 ✅ | `ChatWindow` and `InputBox` moved onto `draw_content` with `TextLayout`; style setters. Removed: `LegacyElement`, `RenderCommand`, `Canvas::write_legacy`, `apply_sgr`, `Element::set_main_color`, `line_split` / `line_split_tail`, and every display helper in `Utils.hpp` (it now holds only the byte-boundary helpers editing uses). Net −402 lines | all 33 step 0 checks still pass; bugs 1, 2b, 3, 5 fixed. New checks: chat styles, multi-line messages, the marker for hidden older messages and over wide glyphs, the input cursor after a trailing newline and after a control character, the input box's style. `test_terminal_ui`: 59 checks, no known bugs |
+| 5 | `unicode::sanitize` where text leaves the UI's display path, e.g. text written to logs. Display needs no cleaning, since `next_glyph` already guarantees it | the remaining uses, if any |
+
+When a known bug is fixed, its `known_bug` reports XPASS and is turned into a
+`check`.
+
+---
+
+## 14. Frontends: command layer and agent CLI
+
+### 14.1 Split (D10)
+
+| Part | TUI | CLI (`--cli`) |
+|---|---|---|
+| Input thread → `frontend_q` | `KeyboardWorker`: bytes → `Key` | `LineReader`: `poll(stdin, WakeupEvent)` → `InputLine{line_no, text}`, then `InputClosed` on EOF |
+| Command layer (shared, no I/O) | `CommandProcessor`, given the line on Enter | `CommandProcessor`, given each `InputLine` |
+| View (main thread) | `TuiView`: `ChatModel`, layout, `TerminalUI::render` | `JsonlWriter`: one JSON object per line on stdout, flushed per line |
+
+In CLI mode:
+- there is no keyboard listener and nothing is rendered;
+- `TerminalUI` is never constructed (its constructor changes termios), so a node runs without a TTY;
+- stdout carries only events, logs go to the log file, and stderr carries only fatal startup errors.
+
+### 14.2 Command layer
+
+```cpp
+// Frontend/Commands.hpp: pure, unit-tested without threads
+using Command = std::variant<SendText, DialReq, ReconnectReq, CloseReq, ListReq,
+                             Subscribe, QuitReq,
+                             OpenConv, Help>;            // the last two are handled locally
+struct CommandError { std::string text; };
+std::expected<Command, CommandError> parse_command(std::string_view line, ConvId active);
+
+// Frontend/CommandProcessor.hpp: session state + dispatch, still no I/O of its own
+class CommandProcessor {
+public:
+    explicit CommandProcessor(ThreadQueue<StoreMsg>& store);
+    // Parses `line`, stamps `req` into the request and pushes it to the Store.
+    // Local commands (OpenConv, Help) are returned for the view to act on.
+    std::expected<Submitted, CommandError> submit(std::string_view line, ReqId req);
+    ConvId active() const;
+};
+```
+
+| Command | Request | Notes |
+|---|---|---|
+| `/dial <ip> <port>` | `DialReq` | `Reply.conv` = the new conversation |
+| `/send <conv> <text>` | `SendText` | explicit target, so no hidden state; the form an agent should use |
+| plain text | `SendText` to the active conv | error when no conv is active |
+| `/open <conv>` | `Subscribe` the new conv for content, the old one to Notify | TUI: also Tab. CLI: only changes the target of plain text |
+| `/list` | `ListReq` | answered with `ConvList` |
+| `/reconnect [<conv>]` | `ReconnectReq` | default: the active conv |
+| `/close [<conv>]` | `CloseReq` | the Store sends `ClosePeer` per member |
+| `/echo on\|off [<conv>]` | `Subscribe` | |
+| `/help` | local | |
+| `/quit`, Ctrl+C, CLI stdin EOF | `QuitReq` | |
+
+`<conv>` is the hex id from `/list`, `Reply` or any event. The TUI may later allow
+short prefixes; the CLI requires the full id, so a match is never ambiguous.
+
+### 14.3 Request ids
+
+- **CLI:** `req` is the input line's 1-based number (blank lines count). An agent
+  needs no tagging syntax, and two requests can never share an id.
+- **TUI:** the `CommandProcessor` assigns a counter.
+- **Store contract:** every request with `req != 0` gets **exactly one `Reply`**,
+  sent before any event that request causes. For example, `Reply{conv}` for a
+  `/dial` arrives before that conv's first `conv_state`.
+  - Success: `ok = true`; `conv` is set where the request concerns a conv.
+  - Failure: `ok = false` with `error` (unknown conversation, not connected, bad endpoint, …).
+  - A send that the transport later rejects is not a failed request. It shows up as
+    `msg_status` = `failed`.
+- A parse error never reaches the Store. The frontend reports it as a `Reply`
+  with `ok = false` for the same `req`.
+
+### 14.4 CLI output (JSONL)
+
+One object per line, with the event name in `ev`. Ids are lowercase hex strings,
+because 64-bit values lose precision as JSON numbers. Strings are JSON-escaped,
+so control characters and escape sequences in peer text can never reach a terminal.
+Invalid UTF-8 becomes U+FFFD.
+
+```
+{"ev":"ready","listen":"127.0.0.1:40123","pts":2}
+{"ev":"reply","req":1,"ok":true,"conv":"9f3a1c0d2e4b5a60"}
+{"ev":"conv_state","conv":"9f3a1c0d2e4b5a60","status":"dialing"}
+{"ev":"conv_state","conv":"9f3a1c0d2e4b5a60","status":"connected"}
+{"ev":"reply","req":2,"ok":true,"conv":"9f3a1c0d2e4b5a60"}
+{"ev":"msg","conv":"9f3a1c0d2e4b5a60","id":0,"from":"me","body":"hi","state":"pending","at":"2026-11-24T10:00:00.123Z"}
+{"ev":"msg_status","conv":"9f3a1c0d2e4b5a60","id":0,"state":"sent"}
+{"ev":"msg","conv":"9f3a1c0d2e4b5a60","id":1,"from":"peer","body":"hello back","state":"received","at":"…"}
+{"ev":"reply","req":3,"ok":false,"error":"unknown conversation"}
+{"ev":"convs","convs":[{"conv":"9f3a1c0d2e4b5a60","status":"connected","remote":"127.0.0.1:40200","unread":0}]}
+{"ev":"notice","text":"…"}
+{"ev":"shutdown_done"}
+```
+
+| `FrontendMsg` | `ev` |
+|---|---|
+| (listener bound) | `ready` (always the first line; `listen` holds the real port when bound to port 0) |
+| `Reply` | `reply` |
+| `ConvSnapshot` | `snapshot` (`msgs` array) |
+| `MsgAppended` | `msg` |
+| `MsgStatus` | `msg_status` |
+| `ConvState` | `conv_state` (`detail` when present) |
+| `ConvNotify` | not emitted: the CLI forwards every conv (§14.5) |
+| `ConvList` | `convs` |
+| `SystemNotice` | `notice` |
+| `ShutdownDone` | `shutdown_done` (always the last line) |
+| startup failure | `fatal` with `error`, then exit code 1 |
+
+Adding a field to an event is a compatible change; renaming or removing one is
+not.
+
+### 14.5 CLI behaviour
+
+- **Everything is forwarded.** At startup the CLI sends
+  `SetDefaultSubscription{Forward, Notify, Notify}`, so every conversation's
+  messages and status changes are printed. There is no unread state to poll.
+  `/echo` still works per conv.
+- **Listening:** `--listen 127.0.0.1:0` binds a free port and `ready` reports it.
+  Tests then never need to pick ports at random.
+- **Exit:** stdin EOF → `InputClosed` → `QuitReq` → the normal shutdown (§7.8) →
+  `shutdown_done` → exit 0. With `--stay`, EOF is ignored and the node runs until
+  SIGTERM, which also takes the normal shutdown path. That suits a node started
+  in the background with `</dev/null`.
+- **Echoing input:** none. An agent correlates through `req`.
+- **Stopping `LineReader`:** it blocks in `poll` on stdin plus a `WakeupEvent`, so
+  `stop()` wakes it even while stdin is open (the same rule as `TcpListener::stop`).
+  It splits on `'\n'` and strips one trailing `'\r'`.
+
+### 14.6 Threads per mode
+
+| Thread | TUI | CLI |
+|---|---|---|
+| main | frontend loop: `TuiView` + `CommandProcessor` | frontend loop: `JsonlWriter` + `CommandProcessor` |
+| input | Keyboard | LineReader |
+| Store, Router, Pt-0..n, Balancer, Listener, Logger | §2 | §2 (identical) |
