@@ -219,7 +219,9 @@ struct Adopt {
 struct Dial { LinkId link = kNoId; PeerId peer = kNoId; std::vector<wire::Endpoint> endpoints; wire::ConnectInfo hello; };
 struct Bind { LinkId link = kNoId; PeerId peer = kNoId; wire::ConnectInfoAck ack; };
 struct Release { LinkId link = kNoId; };
-struct Close { LinkId link = kNoId; bool graceful = true; };
+// graceful: flush queued data first. `why` is what the IO worker reports in its
+// LinkDown (the pool reports nothing for a removal it was asked to make).
+struct Close { LinkId link = kNoId; bool graceful = true; LinkDownReason why = LinkDownReason::PeerClosed; };
 struct Probe { std::uint64_t seq = 0; };
 struct Stop { Clock::time_point deadline{}; };
 

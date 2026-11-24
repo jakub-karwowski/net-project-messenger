@@ -1,11 +1,13 @@
-// test_pool.cpp - EpollConnectionPool: the additions the worker design needs
-// (design.md §8.1) plus a few regressions of the existing behaviour.
+// test_pool.cpp - EpollConnectionPool: interrupt, non-blocking dial, connection
+// hand-over, timeouts, stats, receive with a deadline and connection_count,
+// plus a few regressions of the existing behaviour.
 //
 // Plain assertions, no framework. Every receive() is guarded by a watchdog that
 // stops the pool, so a hang turns into a failed check instead of a stuck test.
 
 #include "TcpSocket.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -19,6 +21,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -493,6 +496,75 @@ void test_stop_still_wins() {
 
 }  // namespace
 
+void test_receive_deadline() {
+    Pool pool;
+    std::array<std::byte, 64> buf{};
+    Watchdog dog(pool, 3s);
+
+    auto start = Clock::now();
+    auto r = pool.receive(buf, start + 60ms);
+    auto waited = Clock::now() - start;
+    check(is_error(r, 0, SocketError::WouldBlock), "nothing to report: WouldBlock at the deadline, got " + describe(r));
+    check(waited >= 55ms && waited < 1s, "receive(deadline) waits until the deadline");
+
+    start = Clock::now();
+    r = pool.receive(buf, start - 1ms);
+    check(is_error(r, 0, SocketError::WouldBlock) && Clock::now() - start < 50ms, "a past deadline returns at once");
+
+    pool.interrupt();
+    r = pool.receive(buf, Clock::now() + 1s);
+    check(is_error(r, 0, SocketError::Interrupted), "an interrupt is still reported before the deadline, got " + describe(r));
+
+    auto pair = make_pair();
+    const auto id = pool.connection_add(std::move(pair.pooled));
+    check(pair.peer.send(as_bytes("x")).has_value(), "peer send");
+    r = pool.receive(buf, Clock::now() + 2s);
+    check(r && id && r->connection_id == *id && r->bytes_read == 1, "data before the deadline is reported, got " + describe(r));
+}
+
+void test_connection_count() {
+    Pool pool(Pool::Timeouts{0ms, 5s}, 64 * 1024);
+    check(pool.connection_count() == 0, "an empty pool holds no connections");
+    auto a = make_pair();
+    auto b = make_pair();
+    const auto ida = pool.connection_add(std::move(a.pooled));
+    const auto idb = pool.connection_add(std::move(b.pooled));
+    check(ida && idb && pool.connection_count() == 2, "two added");
+    pool.connection_drop(*ida);
+    check(pool.connection_count() == 1, "drop removes at once");
+
+    // Queue more than the kernel takes while the peer does not read, then remove:
+    // the connection stays counted until its buffer has been flushed.
+    const std::vector<std::byte> chunk(16 * 1024, std::byte{'x'});
+    bool queued = false;
+    for (int i = 0; i < 10000 && !queued; ++i) {
+        const auto sent = pool.send(*idb, chunk);
+        if (!sent && sent.error() == SocketError::BufferFull) { queued = true; }
+    }
+    check(queued, "the TX buffer filled up");
+    pool.connection_remove(*idb);
+    check(pool.connection_count() == 1, "a removed connection that is still flushing is counted");
+
+    std::atomic<size_t> drained{0};
+    std::thread reader([&] {
+        std::array<std::byte, 64 * 1024> sink{};
+        for (;;) {
+            const auto n = b.peer.receive(sink);
+            if (!n || *n == 0) { return; }
+            drained += *n;
+        }
+    });
+    std::array<std::byte, 64> buf{};
+    Watchdog dog(pool, 5s);
+    const auto until = Clock::now() + 4s;
+    while (pool.connection_count() > 0 && Clock::now() < until) {
+        std::ignore = pool.receive(buf, Clock::now() + 20ms);   // flushing happens inside receive()
+    }
+    check(pool.connection_count() == 0, "the count drops to 0 once the flush is done");
+    reader.join();
+    check(drained > 0, "the peer received the flushed data");
+}
+
 int main() {
     run("interrupt wakes a blocked receive", test_interrupt_wakes_blocked_receive);
     run("interrupts coalesce", test_interrupts_coalesce);
@@ -509,6 +581,8 @@ int main() {
     run("TcpConnection: connect_start + connect_status", test_connect_start_and_status);
     run("peer close (regression)", test_peer_close_still_reported);
     run("stop beats interrupt (regression)", test_stop_still_wins);
+    run("receive with a deadline", test_receive_deadline);
+    run("connection_count", test_connection_count);
 
     std::cout << (g_checks - g_failures) << '/' << g_checks << " checks passed\n";
     return g_failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

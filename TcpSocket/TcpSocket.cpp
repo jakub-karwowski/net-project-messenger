@@ -833,6 +833,21 @@ std::expected<void, SocketError> EpollConnectionPool::send(uint64_t connection_i
 }
 
 EpollConnectionPool::ReceiveOutcome EpollConnectionPool::receive(std::span<std::byte> rx_buffer) noexcept {
+    return receive_until(rx_buffer, std::nullopt);
+}
+
+EpollConnectionPool::ReceiveOutcome EpollConnectionPool::receive(std::span<std::byte> rx_buffer,
+                                                                 Clock::time_point deadline) noexcept {
+    return receive_until(rx_buffer, deadline);
+}
+
+size_t EpollConnectionPool::connection_count() const noexcept {
+    std::lock_guard<std::mutex> lock(connections_mutex_);
+    return connections_.size();
+}
+
+EpollConnectionPool::ReceiveOutcome EpollConnectionPool::receive_until(std::span<std::byte> rx_buffer,
+                                                                       std::optional<Clock::time_point> deadline) noexcept {
     // A 0-byte recv() would be indistinguishable from the peer closing.
     if (rx_buffer.empty()) { return std::unexpected(ReceiveError{0, SocketError::Unknown}); }
 
@@ -866,6 +881,13 @@ EpollConnectionPool::ReceiveOutcome EpollConnectionPool::receive(std::span<std::
             }
 
             timeout = epoll_timeout_locked(now);
+            if (deadline) {
+                // Nothing to report: either the deadline has passed, or it bounds the wait.
+                if (now >= *deadline) { return std::unexpected(ReceiveError{0, SocketError::WouldBlock}); }
+                const auto left = std::chrono::ceil<std::chrono::milliseconds>(*deadline - now);
+                const int left_ms = static_cast<int>(std::clamp<std::chrono::milliseconds::rep>(left.count(), 0, INT_MAX));
+                timeout = timeout < 0 ? left_ms : std::min(timeout, left_ms);
+            }
         }
 
         // Never hold the lock while waiting: senders must be able to get in.

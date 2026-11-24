@@ -348,6 +348,15 @@ class EpollConnectionPool {
         // one thread only.
         ReceiveOutcome receive(std::span<std::byte> rx_buffer) noexcept;
 
+        // Like receive(), but gives up at `deadline`: returns
+        // ReceiveError{0, WouldBlock} when there was nothing to report by then.
+        // Everything that receive() reports still comes first, in the same order.
+        ReceiveOutcome receive(std::span<std::byte> rx_buffer, std::chrono::steady_clock::time_point deadline) noexcept;
+
+        // How many connections the pool holds, including dials in progress and
+        // connections still flushing after connection_remove().
+        size_t connection_count() const noexcept;
+
         // Queues the whole of tx_buffer or nothing: fails with BufferFull when it does
         // not fit in the connection's free buffer space, ConnectionNotFound for an
         // unknown id, ConnectionClosed when the connection is being removed. A
@@ -477,7 +486,7 @@ class EpollConnectionPool {
         // Outcomes the pool produced without a read (removals it made itself,
         // completed dials), reported before any data.
         std::deque<ReceiveOutcome> notices_;
-        std::mutex connections_mutex_;
+        mutable std::mutex connections_mutex_;
         std::atomic<bool> stopping_{false};
         std::atomic<bool> interrupt_pending_{false};
         // Wakes receive() out of epoll_wait(). Why it woke is told by stopping_,
@@ -489,6 +498,10 @@ class EpollConnectionPool {
         size_t max_tx_buffer_;
 
         static constexpr uint64_t wakeToken_ = 0;   // connection ids start at 1
+
+        // receive() with an optional deadline (WouldBlock once it has passed).
+        ReceiveOutcome receive_until(std::span<std::byte> rx_buffer,
+                                     std::optional<Clock::time_point> deadline) noexcept;
 
         // All *_locked helpers require connections_mutex_ to be held.
 

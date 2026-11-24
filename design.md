@@ -213,7 +213,7 @@ struct Adopt   { LinkId link; PeerId peer; Role role; TcpConnection conn;
 struct Dial    { LinkId link; PeerId peer; std::vector<wire::Endpoint> endpoints; wire::ConnectInfo hello; };
 struct Bind    { LinkId link; PeerId peer; wire::ConnectInfoAck ack; };
 struct Release { LinkId link; };
-struct Close   { LinkId link; bool graceful; };
+struct Close   { LinkId link; bool graceful; LinkDownReason why; };   // why: what Pt-i reports in its LinkDown
 struct Probe   { uint64_t seq; };
 struct Stop    { std::chrono::steady_clock::time_point deadline; };
 using PtCommand = std::variant<Adopt, Dial, Bind, Release, Close, Probe, Stop>;
@@ -357,13 +357,15 @@ Router decides.
 ```cpp
 struct LinkState {
     LinkId link; PeerId peer; Role role;
-    enum class Hs { Connecting, AwaitConnect, AwaitAck, Established } hs;
+    enum class Hs { Connecting, AwaitConnect, AwaitBind, AwaitAck, Established } hs;
     wire::Decoder dec;
     wire::ConnectInfo hello;                  // outbound: encoded and sent once connected
     std::vector<wire::Endpoint> to_try;       // outbound: endpoints not attempted yet
     wire::Endpoint dialing;                   // outbound: the endpoint being attempted
-    uint64_t rx_bytes, tx_bytes, rx_frames, tx_frames;   // since the last report
+    uint64_t rx_frames, tx_frames;   // since the last report; bytes come from pool.take_stats()
+    int bad_frames;                  // malformed frames so far
 };
+std::vector<LinkSample> departed_;   // final counters of links gone since the last report
 std::unordered_map<uint64_t /*pool_conn_id*/, LinkState> by_conn_;
 std::unordered_map<LinkId, uint64_t> by_link_;
 ```
@@ -386,10 +388,12 @@ for (;;) {
 
 | hs | frame | action |
 |---|---|---|
-| AwaitConnect | `ConnectInfo` | `LinkHello` → Router. hs stays put until `Bind` arrives. |
+| AwaitConnect | `ConnectInfo` | `LinkHello` → Router, hs = AwaitBind (a second hello is a protocol error). |
 | AwaitAck | `ConnectInfoAck` | `LinkAcked` → Router, hs = Established, then `set_timeouts(established)`. |
 | Established | `ChatMessage` | `ChatIn{peer, link, msg}` → **Store** (D3). |
-| any | anything else / `WireError` | protocol error: `connection_drop`, `LinkDown{ProtocolError}`. Tolerate N resyncs before dropping. |
+| any | anything else (including chat before the handshake is complete) | protocol error: `connection_drop`, `LinkDown{ProtocolError}`. |
+| any | `WireError::UnknownType` | skipped, not counted (invariant 5). |
+| any | any other `WireError` | counted; the decoder resyncs. More than `max_bad_frames` (3) → protocol error. |
 
 **Ordering argument for D3.** A link's peer_id is set when Pt-i handles `Bind` (or
 the Ack). The Store created that peer before it sent `BindLink` or `RouteDial`. So
@@ -401,7 +405,8 @@ the peer is set, so no reply can arrive before the peer is known.
 
 **Commands**
 - `Adopt`: `pool.connection_add(conn, timeouts_for(hs), pending_tx)`, record the
-  state, send `LinkAdopted` → Router.
+  state, send `LinkAdopted` → Router, then run the decoder once (a decoder handed
+  over by another worker is handled at once, not after the next read).
 - `Dial`: keep `hello` and the endpoint list, then
   `pool.connection_dial(endpoints[0], connect_timeout)`. A failed attempt moves to
   the next endpoint under the same `link_id` (a new pool connection id each
@@ -412,10 +417,26 @@ the peer is set, so no reply can arrive before the peer is known.
   `set_timeouts(established)`.
 - `Release`: `pool.connection_release(id)` returns the `TcpConnection` and unsent
   TX. Move the decoder out and send `LinkReleased` → Router. This runs on the Pt-i
-  thread, so no `receive()` is in flight.
-- `Probe`: build a `PtReport` from the counters, reset them, push it to the
-  Balancer.
-- `Stop`: §7.8.
+  thread, so no `receive()` is in flight. Only an established link can move. The
+  counters so far go into this worker's next report; the new owner starts at
+  zero. A link this worker no longer has gets `LinkDown{ConnectionNotFound}`.
+- `Close{graceful, why}`: `connection_remove` (established and graceful: flush
+  first) or `connection_drop`, then `LinkDown{why}` → Router. The pool reports
+  nothing for a removal it was asked to make, so Pt-i reports it itself.
+- `Probe`: build a `PtReport`: per link `take_stats()` bytes plus the frame
+  counters, plus the final counters of links gone since the last report; reset
+  them, push it to the Balancer. `tx_frames` counts only the frames this worker
+  writes (hello, Ack): chat is sent by the Router.
+- `Stop{deadline}`: every link: established → `connection_remove` (flush),
+  otherwise `connection_drop`, each with `LinkDown{Shutdown}`. Then the loop
+  calls `receive(deadline)` (a wait bounded by `shutdown_poll`, 20 ms) until
+  `connection_count() == 0` or the deadline passes, then `pool.stop()` and
+  `PtStopped`. After `Stop`, `Adopt` and `Dial` are answered with
+  `LinkDown{Shutdown}`.
+- `pool.stop()` from outside (the Supervisor's emergency path): `receive()`
+  returns `Stopped`, Pt-i sends `PtStopped` and returns at once.
+- A `Bind` or `Close` for a link that is already down is ignored: its `LinkDown`
+  has been sent.
 
 **Timeouts per handshake state**
 
@@ -775,8 +796,8 @@ yet known to be dead). The Router learns that one peer has two live links.
 
 ### 7.6 Balancer-initiated disconnect
 1. Balancer → Router: `EvictLink` [`Closing`]
-2. Router → Pt-i: `Close{graceful}` [`connection_remove`: flush then close]
-3. The pool reports the close → Pt-i → Router: `LinkDown{BalancerEvicted}` → Store / Balancer as in §7.5
+2. Router → Pt-i: `Close{graceful, why = BalancerEvicted}` [`connection_remove`: flush then close]
+3. Pt-i → Router: `LinkDown{BalancerEvicted}` (Pt-i reports it right after removing the link; the flush continues inside the pool) → Store / Balancer as in §7.5
 
 ### 7.7 Rebalance (move a link)
 1. Balancer → Router: `MoveLink{link, to=j}` [`Moving`, sends are parked from now on]
@@ -800,9 +821,10 @@ Router then fails the parked sends.
    - `listener.stop()` and join it
    - Balancer: `StopBalancer`
    - every Pt-i: `Stop{deadline = now + grace}`
-4. Pt-i: `connection_remove` on every link (graceful flush). It keeps running
-   `receive()` until the pool is empty or the deadline passes, then calls
-   `pool.stop()`, and sends `PtStopped` → Router.
+4. Pt-i: `connection_remove` on every established link (graceful flush),
+   `connection_drop` on the rest. It keeps calling `receive(deadline)` until
+   `connection_count()` is 0 or the deadline passes, then calls `pool.stop()`, and
+   sends `PtStopped` → Router.
 5. Router: join every Pt-i, then → Store: `RouterStopped`
 6. Store: `persistence.flush()` (a no-op today), then → Frontend: `ShutdownDone`
 7. The frontend exits its loop. main stops the input thread, closes every queue
@@ -825,6 +847,8 @@ does not forward them to the Store.
 | `connection_add(TcpConnection, Timeouts, initial_tx)` | Adopt after a move |
 | `set_timeouts(id, Timeouts)` (read timers carry a generation, so the old one is retired) | Handshake → established |
 | `take_stats(id)` → `{bytes_received, bytes_sent}` since the last call | Balancer reports |
+| `receive(rx, deadline)`: as `receive()`, but returns `ReceiveError{0, WouldBlock}` once the deadline passes with nothing to report (added in step 4) | Pt-i shutdown: bounded wait for flushing links |
+| `connection_count()`: connections held, including dials in progress and removals still flushing (added in step 4) | Pt-i shutdown: knowing when everything has flushed |
 
 The pool wakes `receive()` through a `WakeupEvent` (§8.2).
 
@@ -1160,7 +1184,7 @@ sleep inside `_exit` otherwise breaks the timing checks of the hard-exit cases.
 | 1 ✅ | Pool extensions (§8.1); `WakeupEvent`, `TcpListener::stop`, `remote_endpoint` (§8.2); `ThreadQueue` timers (§8.3) | `test_pool`: interrupt coalescing, dial ok/refused/timeout, release then add on a second pool with no byte loss, `set_timeouts`, stats. `test_listener`: stop (blocked, permanent, beats a queued client), `TooManyOpenFiles`, remote address on both sides and across moves. `test_queue`: FIFO/shutdown, tick timing, ticks first, no burst, several timers, cancel, move-only inbox |
 | 2 ✅ | `Common/`: `ThreadQueue.hpp` (moved), `WakeupEvent` (moved out of TcpSocket into its own target), `Ids.hpp` (`IdMinter`), `Logger`, `Worker.hpp`, `Supervisor`. `Messages/Messages.hpp` (every inbox of §4, in namespace `msg`, size budget as `static_assert`s) | `test_ids` 19 checks (id uniqueness, `reserve`, messages through a queue, budget); `test_logger` 24 (level filter skips formatting, escaping incl. UTF-8 C1, line format, 4 threads × 2000 records in per-thread order, drain on graceful shutdown); `test_worker` 21 (dispatch, `done()`, `drain`, ticks, naming, stop once with 8 callers, exception → `fatal`, stop for inbox / pool / listener / poll); `test_supervisor` 27 (every row of the §9.2 table, each scenario in its own child process). Clean under TSan and ASan+UBSan |
 | 3 ✅ | Store, single-threaded and fed by its inbox, with `NullPersistence` and a recording fake | `test_store` 90 checks: dial (hello contents, Reply before events, known endpoint reuses its conv and goes first), dial failure → Failed with the socket error and no retry, reconnect re-presents names and sends every dialable endpoint in one `RouteDial` (port 0 left out), size limit at `wire::kMaxChatBodySize`, inbound hello (new / known / unknown assigned id / garbage → `RejectLink`), stale `PeerDown` of a superseded link ignored, send (frame contents, pending → sent / failed, refusals not stored), outbound Ignore, receive with Notify / Forward / Ignore, snapshot marks read, drops (sender mismatch, unknown peer, unknown group), chat overtaking `PeerUp`, echo, default subscription, close, quit (refusals, `RejectLink`, flush, `ShutdownDone`), exactly one `Reply` per `ReqId`, load from persistence (pending → failed, names re-presented, no id collisions). Clean under ASan+UBSan |
-| 4 | Pt-i alone, driven by a fake Router queue | inbound and outbound handshake (hello and Ack encoded by Pt-i), a dial over several endpoints (first refused, second answers: one link id, `LinkAcked.remote` = the second; all refused: one `LinkDown` with the last error), protocol errors, handshake timeout, release/adopt of a decoder holding half a frame |
+| 4 ✅ | Pt-i (`IoWorker/`), plus `receive(deadline)` and `connection_count()` in the pool | `test_io_worker` 68 checks, over loopback with the test as Router and as remote peer: inbound handshake (hello up, Ack encoded and sent, chat straight to the Store), outbound dial (hello encoded and sent, `LinkAcked.remote`), a dial over an invalid, a refused and a good endpoint under one link id, all refused → one `LinkDown` with the last error, no endpoints, handshake timeout, chat before hello / before `Bind` → `ProtocolError`, 10 unknown-type frames skipped, malformed frames over the limit → `ProtocolError`, release on A + adopt on B with half a frame in the decoder (message arrives whole on B), probe counters and reset, close with a reason, peer close, stop with nothing to flush, stop that flushes 1 MiB before the deadline, stop that hits the deadline, `pool.stop()`. `test_pool` +2 tests (97 checks). 20 repeated runs without a failure; clean under TSan and ASan+UBSan |
 | 5 | Router with N Pt-i, without the Balancer (static round-robin policy) | two in-process nodes over loopback: dial, chat, disconnect, reconnect keeps the conv, simultaneous dial converges on one link on both sides |
 | 6 | Command layer and agent CLI (§14): `Commands`, `CommandProcessor`, `LineReader`, `JsonlWriter`, `App/main --cli` | `test_commands` (every command, bad arguments, active conv vs explicit `/send`, `ReqId` = line number); `test_jsonl` (escaping of controls and invalid UTF-8, hex ids, one object per line); `test_cli_e2e`: two `node --cli` processes over loopback, driven through pipes: `ready` with the bound port, dial, chat, `/close`, reconnect keeps the conv, stdin EOF → `shutdown_done` and exit 0 |
 | 7 | Balancer `decide()` as a pure function | policy weights, stall detection, move hysteresis, scale in/out |

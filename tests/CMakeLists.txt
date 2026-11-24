@@ -40,3 +40,7 @@ add_test(NAME test_worker COMMAND test_worker)
 add_executable(test_store test_store.cpp)
 target_link_libraries(test_store PRIVATE StoreWorker)
 add_test(NAME test_store COMMAND test_store)
+
+add_executable(test_io_worker test_io_worker.cpp)
+target_link_libraries(test_io_worker PRIVATE IoWorker)
+add_test(NAME test_io_worker COMMAND test_io_worker)
