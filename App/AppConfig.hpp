@@ -27,6 +27,7 @@ struct AppConfig {
     std::chrono::milliseconds shutdown_grace{1000};
     std::chrono::milliseconds handshake_timeout{5000};
     std::chrono::milliseconds connect_timeout{5000};
+    std::chrono::milliseconds balance_period{500};
     bool help = false;
 };
 

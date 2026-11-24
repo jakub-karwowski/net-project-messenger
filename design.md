@@ -221,7 +221,8 @@ using PtCommand = std::variant<Adopt, Dial, Bind, Release, Close, Probe, Stop>;
 
 // ---- Balancer inbox
 struct PtReport { PtId pt; uint64_t seq; Clock::time_point at; size_t cmd_backlog;
-                  std::vector<LinkSample> links; };   // LinkSample: link, peer, rx/tx bytes, rx/tx frames since last
+                  std::vector<LinkSample> links; };   // LinkSample: link, peer, rx/tx bytes, rx/tx frames since last,
+                                                      // gone (left this worker since the last report: final counters)
 struct TopologyChanged { PtId pt; bool added; };        // Router → Balancer
 struct LinkGone  { LinkId link; };
 struct StopBalancer {};
@@ -638,6 +639,32 @@ Logic and decisions live in a pure function,
 `Decisions decide(const State&, Config, now)`, so they can be unit-tested without
 threads.
 
+**As built (steps 7 and 8)** (`BalancerWorker/`)
+- `BalancerPolicy` folds facts into the state (`on_report`, `on_topology`,
+  `on_link_gone`, and `end_tick`, which turns the bytes of the past tick into
+  EWMA rates and counts missed probes), `decide()` reads it, and `commit()`
+  records what was sent: policy and epoch, a pending spawn or retire, and
+  `last_moved` together with the assumed new pt.
+- **Where a link is:** after a move, the old pt's next report still carries the
+  link's final counters. Those samples are marked `gone`. Their bytes count, but
+  only a live sample places the link (and sets `last_moved` when the pt
+  changed).
+- **Stall detection:** a pt's first tick is free (it has not been probed yet), so
+  it is stalled after `k_missed` unanswered probes after that.
+- **Rebalance guard:** a link moves only if its load is below the current gap, so
+  the move narrows the gap rather than swapping which pt is busy. One hot link on
+  its own therefore never ping-pongs.
+- **Scaling:** at most one pending spawn and one pending retire at a time. The
+  `TopologyChanged` that answers clears it. A retiring pt gets no new links and
+  is neither a source nor a target of moves.
+- **Defaults:** period 500 ms (`--balance-period`), alpha 0.3, `byte_cost` 1 MB/s
+  per unit of load, `link_cost` 0.002, capacity 1, watermarks 0.75 / 0.25,
+  `k_missed` 3, `policy_len` 64, policy sent when a share moves by more than 0.1,
+  `scale_in_ticks` 10, imbalance 0.2, cooldown 10 s, 2 moves per tick, no
+  eviction.
+- **Metric log**, one line per pt per tick:
+  `pt=<id> links=<n> load=<x> stalled=<bool> backlog=<n>`.
+
 ### 5.5 Listener (`ListenerWorker/`)
 
 ```
@@ -972,7 +999,7 @@ Frontend/      Commands.hpp/.cpp (pure parser)  CommandProcessor.hpp/.cpp
                Cli: CliFrontend.hpp/.cpp  CliFormat.hpp/.cpp (the events)  LineReader.hpp/.cpp
                     JsonlWriter.hpp/.cpp  Json.hpp (escaping, hex ids)
 App/           main.cpp (wiring, start/stop order)  AppConfig.hpp/.cpp (argv)   → the `node` executable
-tests/         one test_*.cpp per module (CTest)
+tests/         one test_*.cpp per module (CTest); NodeHarness.hpp: complete nodes in one process
 ```
 
 Each worker exposes `run()` (the thread body) and is constructed with references to
@@ -1212,8 +1239,8 @@ sleep inside `_exit` otherwise breaks the timing checks of the hard-exit cases.
 | 4 ✅ | Pt-i (`IoWorker/`), plus `receive(deadline)` and `connection_count()` in the pool | `test_io_worker` 68 checks, over loopback with the test as Router and as remote peer: inbound handshake (hello up, Ack encoded and sent, chat straight to the Store), outbound dial (hello encoded and sent, `LinkAcked.remote`), a dial over an invalid, a refused and a good endpoint under one link id, all refused → one `LinkDown` with the last error, no endpoints, handshake timeout, chat before hello / before `Bind` → `ProtocolError`, 10 unknown-type frames skipped, malformed frames over the limit → `ProtocolError`, release on A + adopt on B with half a frame in the decoder (message arrives whole on B), probe counters and reset, close with a reason, peer close, stop with nothing to flush, stop that flushes 1 MiB before the deadline, stop that hits the deadline, `pool.stop()`. `test_pool` +2 tests (97 checks). 20 repeated runs without a failure; clean under TSan and ASan+UBSan |
 | 5 ✅ | Router with N Pt-i, without the Balancer (own placement), and the Listener | `test_router` 34 checks, two complete nodes in one process (Store, Router + IO workers, Listener on their own threads) over loopback: dial and chat both ways, close and reconnect from either side keep the conversations, simultaneous reconnect converges on one link on both sides (10 rounds), a refused dial, retiring the worker that holds the link while 50 messages flow (all arrive in order, worker stops, traffic continues), quit (`ShutdownDone`, the other side sees it go). `test_store` +3 (peer-level contract), `test_io_worker` +2 (`pool_conn_id`). 20 runs stable; clean under TSan and ASan+UBSan |
 | 6 ✅ | Command layer and agent CLI (§14): `Commands`, `CommandProcessor`, `CliFrontend`, `CliFormat`, `LineReader`, `JsonlWriter`, `Json.hpp`, `App/` (`node --cli`) | `test_commands` 49 checks (every command and its errors, `//`, ids in either case, the processor: request ids, blank/help/quit, `/open` with and without restoring the previous conv, `/echo`, a closed Store queue); `test_jsonl` 45 (escaping: controls, DEL, C1, U+2028, invalid / overlong / surrogate / truncated UTF-8, NUL; ids; every event's exact text; the writer: EPIPE closes it, `try_write` on a full pipe returns at once; the reader: CRLF, blank lines numbered, a line split across reads, no final newline, `stop()` with input open); `test_cli_e2e` 33, real processes over pipes: `ready` with the bound port, dial, chat both ways with text that must be escaped (no raw ESC reaches the output), `/open` with its snapshot, `/list`, `/close` + `/reconnect` keep both convs, errors with line numbers, blank lines counted, end of input → `shutdown_done` + exit 0, `/quit`, `--stay` + SIGTERM, stdout closed, port in use → `fatal` + exit 1. 15 runs stable; clean under TSan and ASan+UBSan, the spawned nodes included |
-| 7 | Balancer `decide()` as a pure function | policy weights, stall detection, move hysteresis, scale in/out |
-| 8 | Balancer thread wired in | forced imbalance → moves happen and traffic is uninterrupted (scripted through the CLI), a stalled pt (blocked by a test hook) gets excluded |
+| 7 ✅ | Balancer `decide()` as a pure function (`BalancerPolicy`) | `test_balancer` 57 checks: smooth weighted round robin (shares, spread, deterministic), EWMA and loads, `gone` samples do not move a link back, policy shares and no resend when unchanged, stall after `k_missed` (first tick free) and recovery, a stalled pt gets no links and no moves, scale out (once until answered, never above `max_pts`), scale in (after `scale_in_ticks`, least loaded, never below `min_pts`, the retiring pt gets no links), rebalance (busiest link to the idlest pt, cooldown, a lone hot link never moves, `max_moves_per_tick`), eviction, the worker driven by hand-pushed ticks |
+| 8 ✅ | Balancer thread wired in (Router, `node`) | `test_balancer_e2e` 9 checks: one pt, two peers streaming ~1 MB/s into it: the Balancer starts a second pt and moves a link while 2 × 1500 messages arrive complete and in order, then scales back in once idle, and traffic still flows. 15 runs stable; clean under TSan and ASan+UBSan. A real stalled pt is not tested end to end (nothing can block an IO worker on purpose); stall handling is covered by `test_balancer` |
 | 9 | TUI frontend: `TuiView`, `KeyboardWorker`, on the same `CommandProcessor` | headless view test (feed `FrontendMsg`, compare FrameBuffer); key → line → same `StoreMsg` as the CLI produces |
 | 10 | Shutdown | quit with buffered TX, all threads join within grace + ε, no lost log lines, in both frontends |
 
@@ -1585,8 +1612,8 @@ not.
   (default: no log), `--log-level`, `--min-pts` / `--max-pts`, `--shutdown-grace MS`,
   `--handshake-timeout MS`, `--connect-timeout MS`. A bad option prints the usage to
   stderr (with `--cli` also a `fatal` event) and exits 1.
-- **Until step 8** the Balancer's queue is emptied by a stub thread that stops on
-  `StopBalancer`. Without `--cli` the node exits 1: the TUI comes in step 9.
+- **`--balance-period MS`** sets the Balancer's tick (default 500). Without
+  `--cli` the node exits 1: the TUI comes in step 9.
 - **Stopping `LineReader`:** it blocks in `poll` on stdin plus a `WakeupEvent`, so
   `stop()` wakes it even while stdin is open (the same rule as `TcpListener::stop`).
   It splits on `'\n'` and strips one trailing `'\r'`.

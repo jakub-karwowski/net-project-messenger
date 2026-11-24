@@ -120,7 +120,7 @@ private:
     void close_link(std::uint64_t id, Removal how, msg::LinkDownReason why, SocketError err);
     void add(std::uint64_t id, LinkState st);
     std::optional<std::uint64_t> conn_of(LinkId link) const;
-    msg::LinkSample sample(const LinkState& st, const Pool::ConnectionStats& stats) const;
+    msg::LinkSample sample(const LinkState& st, const Pool::ConnectionStats& stats, bool gone = false) const;
     void finish();
 
     Pool::Timeouts handshake_timeouts() const noexcept { return {config_.handshake_timeout, config_.write_timeout}; }

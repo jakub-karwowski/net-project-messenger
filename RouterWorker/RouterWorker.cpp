@@ -206,6 +206,7 @@ void RouterWorker::on(msg::LinkAdopted& m) {
     }
     // Back in service, parked sends first, in order.
     link.status = Link::Status::Connected;
+    moves_completed_.fetch_add(1, std::memory_order_relaxed);
     log_.debug("link {} moved to pt-{}; flushing {} parked sends", link.id, link.pt, link.parked.size());
     auto parked = std::exchange(link.parked, {});
     for (auto& send : parked) { send_now(link, send); }

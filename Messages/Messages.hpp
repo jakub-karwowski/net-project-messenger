@@ -74,11 +74,14 @@ enum class LinkDownReason : std::uint8_t {
 enum class Role : std::uint8_t { Inbound, Outbound };
 enum class HandshakeState : std::uint8_t { Connecting, AwaitConnect, AwaitAck, Established };
 
-// Per-link counters since the previous report (Pt-i → Balancer).
+// Per-link counters since the previous report (IO worker → Balancer).
+// gone: the link left this worker since the last report (moved away or
+// closed); these are its final counters here, and it is no longer on this worker.
 struct LinkSample {
     LinkId link = kNoId;
     PeerId peer = kNoId;
     std::uint64_t rx_bytes = 0, tx_bytes = 0, rx_frames = 0, tx_frames = 0;
+    bool gone = false;
 };
 
 using ReleasedConnection = EpollConnectionPool::ReleasedConnection;

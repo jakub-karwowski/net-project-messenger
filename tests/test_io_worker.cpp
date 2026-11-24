@@ -370,6 +370,12 @@ void test_release_and_adopt_keep_half_a_frame() {
     check(chat && chat->link == 10 && chat->peer == 9 && chat->msg.body == "a message split across the move",
           "the message arrives whole on B");
     check(!next_of(a.store, 50ms), "and not on A");
+    a.command(msg::Probe{1});
+    auto m = next_of(a.balancer, 2s);
+    auto* report = m ? std::get_if<msg::PtReport>(&*m) : nullptr;
+    check(report && report->links.size() == 1 && report->links[0].link == 10 && report->links[0].gone
+              && report->links[0].rx_bytes > 0,
+          "A's next report has the moved link's final counters, marked gone");
     check(a.io->link_count() == 0 && b.io->link_count() == 1, "A no longer holds the link, B does");
 
     a.command(msg::Release{10});

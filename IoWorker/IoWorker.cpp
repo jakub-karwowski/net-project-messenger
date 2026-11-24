@@ -294,7 +294,7 @@ void IoWorker::on(msg::Release& m) {
     by_conn_.erase(*id);
     by_link_.erase(m.link);
     // The counters so far belong to this worker's report; the next owner starts at zero.
-    departed_.push_back(sample(st, released->stats));
+    departed_.push_back(sample(st, released->stats, true));
     released->stats = {};
     send_router(msg::LinkReleased{m.link, std::move(*released), std::move(st.dec)});
 }
@@ -380,7 +380,7 @@ void IoWorker::close_link(std::uint64_t id, Removal how, msg::LinkDownReason why
     if (it == by_conn_.end()) { return; }
     if (how != Removal::AlreadyGone) {
         const auto stats = pool_.take_stats(id);
-        departed_.push_back(sample(it->second, stats.value_or(Pool::ConnectionStats{})));
+        departed_.push_back(sample(it->second, stats.value_or(Pool::ConnectionStats{}), true));
         if (how == Removal::Flush) {
             pool_.connection_remove(id);
         } else {
@@ -404,8 +404,8 @@ std::optional<std::uint64_t> IoWorker::conn_of(LinkId link) const {
     return it->second;
 }
 
-msg::LinkSample IoWorker::sample(const LinkState& st, const Pool::ConnectionStats& stats) const {
-    return msg::LinkSample{st.link, st.peer, stats.bytes_received, stats.bytes_sent, st.rx_frames, st.tx_frames};
+msg::LinkSample IoWorker::sample(const LinkState& st, const Pool::ConnectionStats& stats, bool gone) const {
+    return msg::LinkSample{st.link, st.peer, stats.bytes_received, stats.bytes_sent, st.rx_frames, st.tx_frames, gone};
 }
 
 void IoWorker::send_router(msg::RouterMsg m) {

@@ -1,0 +1,4 @@
+add_library(BalancerWorker BalancerPolicy.cpp BalancerWorker.cpp)
+target_include_directories(BalancerWorker PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(BalancerWorker PUBLIC Messages Common)
+target_compile_features(BalancerWorker PUBLIC cxx_std_23)

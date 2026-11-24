@@ -43,7 +43,7 @@ std::expected<AppConfig, std::string> parse_args(std::span<const std::string_vie
 
         constexpr std::string_view kWithValue[] = {"--listen", "--advertise", "--log", "--log-level", "--min-pts",
                                                    "--max-pts", "--shutdown-grace", "--handshake-timeout",
-                                                   "--connect-timeout"};
+                                                   "--connect-timeout", "--balance-period"};
         if (!std::ranges::contains(kWithValue, opt)) { return std::unexpected(std::format("unknown option {}", opt)); }
         const auto v = value();
         if (!v) { return std::unexpected(v.error()); }
@@ -62,13 +62,15 @@ std::expected<AppConfig, std::string> parse_args(std::span<const std::string_vie
             const auto n = number<std::size_t>(*v);
             if (!n || *n == 0 || *n > 256) { return bad(*v); }
             (opt == "--min-pts" ? c.min_pts : c.max_pts) = *n;
-        } else if (opt == "--shutdown-grace" || opt == "--handshake-timeout" || opt == "--connect-timeout") {
+        } else if (opt == "--shutdown-grace" || opt == "--handshake-timeout" || opt == "--connect-timeout"
+                   || opt == "--balance-period") {
             const auto ms = number<unsigned>(*v);
-            if (!ms) { return bad(*v); }
+            if (!ms || (opt == "--balance-period" && *ms == 0)) { return bad(*v); }
             const std::chrono::milliseconds d{*ms};
             if (opt == "--shutdown-grace") { c.shutdown_grace = d; }
             else if (opt == "--handshake-timeout") { c.handshake_timeout = d; }
-            else { c.connect_timeout = d; }
+            else if (opt == "--connect-timeout") { c.connect_timeout = d; }
+            else { c.balance_period = d; }
         } else {
             return std::unexpected(std::format("unknown option {}", opt));
         }
@@ -90,5 +92,6 @@ std::string_view usage() noexcept {
            "  --shutdown-grace MS      time to flush links on quit (default 1000)\n"
            "  --handshake-timeout MS   (default 5000)\n"
            "  --connect-timeout MS     per dial attempt (default 5000)\n"
+           "  --balance-period MS      how often the Balancer probes and decides (default 500)\n"
            "  --help\n";
 }

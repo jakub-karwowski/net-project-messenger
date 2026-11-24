@@ -46,7 +46,7 @@ target_link_libraries(test_io_worker PRIVATE IoWorker)
 add_test(NAME test_io_worker COMMAND test_io_worker)
 
 add_executable(test_router test_router.cpp)
-target_link_libraries(test_router PRIVATE RouterWorker StoreWorker ListenerWorker)
+target_link_libraries(test_router PRIVATE RouterWorker StoreWorker ListenerWorker BalancerWorker)
 add_test(NAME test_router COMMAND test_router)
 
 foreach(t test_commands test_jsonl)
@@ -60,3 +60,11 @@ add_executable(test_cli_e2e test_cli_e2e.cpp)
 target_compile_definitions(test_cli_e2e PRIVATE NODE_BINARY="$<TARGET_FILE:node>")
 add_dependencies(test_cli_e2e node)
 add_test(NAME test_cli_e2e COMMAND test_cli_e2e)
+
+add_executable(test_balancer test_balancer.cpp)
+target_link_libraries(test_balancer PRIVATE BalancerWorker)
+add_test(NAME test_balancer COMMAND test_balancer)
+
+add_executable(test_balancer_e2e test_balancer_e2e.cpp)
+target_link_libraries(test_balancer_e2e PRIVATE RouterWorker StoreWorker ListenerWorker BalancerWorker)
+add_test(NAME test_balancer_e2e COMMAND test_balancer_e2e)

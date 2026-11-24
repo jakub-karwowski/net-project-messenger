@@ -9,6 +9,7 @@
 // workers and queues they use go away.
 
 #include "AppConfig.hpp"
+#include "BalancerWorker.hpp"
 #include "CliFormat.hpp"
 #include "CliFrontend.hpp"
 #include "JsonlWriter.hpp"
@@ -33,14 +34,6 @@
 #include <vector>
 
 namespace {
-
-// Until the Balancer exists: take its messages off the queue so it does not
-// grow, and stop when told to.
-void discard_balancer_messages(ThreadQueue<msg::BalancerMsg>& q) {
-    while (auto m = q.pop()) {
-        if (std::holds_alternative<msg::StopBalancer>(*m)) { return; }
-    }
-}
 
 std::vector<wire::Endpoint> advertised(const AppConfig& cfg, std::uint16_t bound_port) {
     if (cfg.advertise.empty()) {
@@ -100,6 +93,11 @@ int run_cli(const AppConfig& cfg) {
     router_cfg.io.connect_timeout = cfg.connect_timeout;
     RouterWorker router(router_cfg, router_q, store_q, balancer_q, &supervisor, Logger(core, "router"),
                         [&] { listener->stop(); });
+    balance::Config balancer_cfg;
+    balancer_cfg.period = cfg.balance_period;
+    balancer_cfg.min_pts = cfg.min_pts;
+    balancer_cfg.max_pts = cfg.max_pts;
+    BalancerWorker balancer(balancer_cfg, balancer_q, router_q, Logger(core, "balancer"));
     ListenerWorker accept(*listener, router_q, Logger(core, "listener"));
     LineReader input(STDIN_FILENO, frontend_q, Logger(core, "input"));
     CliFrontend frontend(CliOptions{cfg.stay}, frontend_q, store_q, out, Logger(core, "cli"),
@@ -108,7 +106,7 @@ int run_cli(const AppConfig& cfg) {
     WorkerThread store_thread("store", [&] { worker::run_inbox(store, store_q); },
                               [&] { store_q.graceful_shutdown(); }, &supervisor);
     WorkerThread router_thread("router", [&] { router.run(); }, [&] { router_q.graceful_shutdown(); }, &supervisor);
-    WorkerThread balancer_thread("balancer", [&] { discard_balancer_messages(balancer_q); },
+    WorkerThread balancer_thread("balancer", [&] { worker::run_inbox(balancer, balancer_q); },
                                  [&] { balancer_q.graceful_shutdown(); }, &supervisor);
     WorkerThread listener_thread("listener", [&] { accept.run(); }, [&] { listener->stop(); }, &supervisor);
     WorkerThread input_thread("input", [&] { input.run(); }, [&] { input.stop(); }, &supervisor);

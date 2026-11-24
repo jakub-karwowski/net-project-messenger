@@ -89,6 +89,7 @@ public:
     // Safe from any thread; for tests and diagnostics.
     std::size_t link_count() const noexcept { return link_count_.load(std::memory_order_relaxed); }
     std::size_t pt_count() const noexcept { return pt_count_.load(std::memory_order_relaxed); }
+    std::size_t moves_completed() const noexcept { return moves_completed_.load(std::memory_order_relaxed); }
 
 private:
     using Clock = std::chrono::steady_clock;
@@ -170,4 +171,5 @@ private:
     bool done_ = false;
     std::atomic<std::size_t> link_count_{0};
     std::atomic<std::size_t> pt_count_{0};
+    std::atomic<std::size_t> moves_completed_{0};
 };
