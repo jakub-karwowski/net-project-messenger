@@ -25,6 +25,7 @@ add_subdirectory(ListenerWorker)
 add_subdirectory(BalancerWorker)
 add_subdirectory(Frontend)
 add_subdirectory(App)
+add_subdirectory(Tools)
 add_subdirectory(TerminalUI)
 
 add_subdirectory(tests)

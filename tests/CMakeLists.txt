@@ -86,3 +86,10 @@ target_compile_definitions(test_shutdown PRIVATE NODE_BINARY="$<TARGET_FILE:node
 target_link_libraries(test_shutdown PRIVATE Messages util)
 add_dependencies(test_shutdown node)
 add_test(NAME test_shutdown COMMAND test_shutdown)
+
+# The load generator, in-process, against a real echo node.
+add_executable(test_loadgen test_loadgen.cpp)
+target_compile_definitions(test_loadgen PRIVATE NODE_BINARY="$<TARGET_FILE:node>")
+target_link_libraries(test_loadgen PRIVATE LoadGen)
+add_dependencies(test_loadgen node)
+add_test(NAME test_loadgen COMMAND test_loadgen)

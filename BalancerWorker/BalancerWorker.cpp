@@ -23,7 +23,7 @@ void BalancerWorker::on(msg::PtReport& m) {
 
 void BalancerWorker::on(msg::TopologyChanged& m) {
     balance::on_topology(state_, m, Clock::now());
-    log_.info("pt-{} {}", m.pt, m.added ? "started" : "stopped");
+    log_.metric("topology={} pt={}", m.added ? "added" : "removed", m.pt);
 }
 
 void BalancerWorker::on(msg::LinkGone& m) {
@@ -53,25 +53,22 @@ void BalancerWorker::on(msg::BalancerTick&) {
     }
 
     auto decisions = balance::decide(state_, config_, now);
+    // Decisions are measurement data: Metric lines, key=value, logged before
+    // commit() so a move still names the pt it leaves.
+    if (decisions.spawn) { log_.metric("decision=spawn pts={}", state_.pts.size()); }
+    if (decisions.retire) { log_.metric("decision=retire pt={}", *decisions.retire); }
+    for (const auto& move : decisions.moves) {
+        const auto it = state_.links.find(move.link);
+        log_.metric("decision=move link={} from={} to={}", move.link, it == state_.links.end() ? 0 : it->second.pt, move.to);
+    }
+    for (const LinkId link : decisions.evict) { log_.metric("decision=evict link={}", link); }
     balance::commit(state_, decisions, now);
 
     if (decisions.policy) { send_router(std::move(*decisions.policy)); }
-    if (decisions.spawn) {
-        log_.info("mean load above {:.2f}: starting a worker", config_.hi_watermark * config_.capacity);
-        send_router(msg::SpawnPt{});
-    }
-    if (decisions.retire) {
-        log_.info("mean load below {:.2f}: retiring pt-{}", config_.lo_watermark * config_.capacity, *decisions.retire);
-        send_router(msg::RetirePt{*decisions.retire});
-    }
-    for (const auto& move : decisions.moves) {
-        log_.info("moving link {} to pt-{}", move.link, move.to);
-        send_router(move);
-    }
-    for (const LinkId link : decisions.evict) {
-        log_.info("evicting idle link {}", link);
-        send_router(msg::EvictLink{link});
-    }
+    if (decisions.spawn) { send_router(msg::SpawnPt{}); }
+    if (decisions.retire) { send_router(msg::RetirePt{*decisions.retire}); }
+    for (const auto& move : decisions.moves) { send_router(move); }
+    for (const LinkId link : decisions.evict) { send_router(msg::EvictLink{link}); }
     log_metrics();
 }
 

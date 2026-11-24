@@ -18,16 +18,21 @@ struct AppConfig {
 
     Frontend frontend = Frontend::Tui;
     bool stay = false;                       // CLI: keep running after end of input
+    bool echo = false;                       // CLI: load-test target, echoes every message
+    bool balancer = true;                    // false: fixed workers, own placement only
     wire::Endpoint listen{"0.0.0.0", 7000};  // port 0: any free port
     std::vector<wire::Endpoint> advertise;   // empty: derived from listen (port 0 = the bound port)
     std::string log_path;                    // empty: no log
     LogLevel log_level = LogLevel::Info;
     std::size_t min_pts = 1;
     std::size_t max_pts = 4;
+    std::size_t max_links = 1024;
+    std::size_t max_links_per_pt = 0;        // 0: max_links
     std::chrono::milliseconds shutdown_grace{1000};
     std::chrono::milliseconds handshake_timeout{5000};
     std::chrono::milliseconds connect_timeout{5000};
     std::chrono::milliseconds balance_period{500};
+    std::size_t balance_max_moves = 2;       // links the Balancer may move per tick
     bool help = false;
 };
 

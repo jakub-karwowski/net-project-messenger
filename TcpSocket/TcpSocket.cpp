@@ -342,6 +342,11 @@ std::expected<void, SocketError> TcpConnection::apply_options() noexcept {
         return std::unexpected(get_last_socket_error());
     }
 
+    if (options_.receive_buffer > 0
+        && setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &options_.receive_buffer, sizeof(options_.receive_buffer)) < 0) {
+        return std::unexpected(get_last_socket_error());
+    }
+
     const int flags = fcntl(fd_, F_GETFL, 0);
     if (flags < 0) { return std::unexpected(get_last_socket_error()); }
     const int updated_flags = options_.non_blocking ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);

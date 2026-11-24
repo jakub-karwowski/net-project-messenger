@@ -12,6 +12,8 @@ using Sub = msg::Subscription;
 
 // Every conversation, all the time: there is no "active" view to save work for.
 constexpr Sub kForwardAll{Sub::Inbound::Forward, Sub::Outbound::Notify, Sub::Lifecycle::Notify};
+// --echo: bounce, and keep the output quiet whatever the load.
+constexpr Sub kEchoQuietly{Sub::Inbound::Ignore, Sub::Outbound::Echo, Sub::Lifecycle::Ignore};
 
 }  // namespace
 
@@ -28,7 +30,8 @@ CliFrontend::CliFrontend(CliOptions options, ThreadQueue<msg::FrontendMsg>& inbo
       processor_(store, ProcessorMode{kForwardAll, std::nullopt}) {}
 
 void CliFrontend::start(const wire::Endpoint& listening, std::size_t pts) {
-    std::ignore = store_.push(msg::SetDefaultSubscription{kForwardAll});   // false: already shutting down
+    // false: already shutting down
+    std::ignore = store_.push(msg::SetDefaultSubscription{options_.echo ? kEchoQuietly : kForwardAll});
     write(cli::ready(listening, pts));
 }
 

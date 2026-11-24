@@ -1310,9 +1310,7 @@ stack works but nothing outside a test binary can drive it. The CLI makes real
 nodes scriptable, so later steps are checked end to end by tests, scripts and
 agents through the same interface.
 
-A load generator (as `stressgen` was before the rewrite) comes after step 8. It is
-a script that drives N `node --cli` peers × M msg/s against one node, so the
-Balancer's effect can be measured for the report.
+The load generator and the runner are described in §15.
 
 ---
 
@@ -1690,3 +1688,102 @@ not.
 | main | frontend loop: `TuiView` + `CommandProcessor` | frontend loop: `JsonlWriter` + `CommandProcessor` |
 | input | Keyboard | LineReader |
 | Store, Router, Pt-0..n, Balancer, Listener, Logger | §2 | §2 (identical) |
+
+---
+
+## 15. Load generator and runner
+
+### 15.1 Choice
+
+The generator is a C++ tool that speaks the wire protocol itself (`Tools/loadgen/`),
+as `stressgen` did before the rewrite. It is not a script that drives `node --cli`
+peers.
+- One process simulates hundreds to thousands of peers on one thread, so the
+  sizes of the earlier S1 and S7 runs (1024 peers) are reachable.
+- What is measured is the target node, not the overhead of peer nodes.
+
+### 15.2 How it works
+
+- **Target:** `node --cli --echo` sets the default subscription to
+  `{Ignore, Echo, Ignore}`. Every chat message goes straight back to its sender;
+  nothing is stored, and nothing is printed per message or per peer (an echo
+  node writes only `ready` and `shutdown_done`).
+- **Peers:** each dials the target and completes the real handshake: a hello
+  with a random name of ours, and an Ack whose `peer_id` becomes the chat
+  `sender_id`. There is one connection per peer.
+- **Messages:** the body starts with the send time (8 bytes) and a sequence
+  number (8 bytes), padded to `--size`. The echo gives the round-trip time; the
+  sequence number makes each message count once.
+- **Kinds of peers:**
+  - active: sends at `--rate`, or keeps `--window` messages in flight with
+    `--rate 0` (closed loop);
+  - idle: handshake only;
+  - slow: sends but never reads. After the handshake it leaves the pool
+    (`connection_release`), keeps its own send buffer so frames stay whole, and
+    has a small `SO_RCVBUF` (new `TcpConnection::Options::receive_buffer`).
+- **Churn:** every `1/--churn` s a random active peer's connection is dropped and
+  redialled, re-presenting the name the node gave it, so the node takes its
+  reconnect path.
+- **Phases:** ramp (all handshakes, at most 64 dials in flight), warm-up,
+  measurement, grace (no new sends; late echoes of measured messages still
+  count).
+- **Accounting** of the messages sent in the measurement window: echoed,
+  refused by our own buffer (`send_failed`), abandoned (in flight on a
+  connection that churn dropped), or lost. Throughput and RTT percentiles
+  (log-bucketed histogram, about 3% resolution) are reported, plus a per-second
+  series. The output is one JSON object.
+- **The node, for load:** `--echo`, `--no-balancer` (`min_pts` workers, the
+  Router's own placement), `--max-links`, `--max-links-per-pt` (default: no cap
+  below `--max-links`; the old 256 per pt silently capped a one-pt node),
+  `--balance-max-moves`. It also raises `RLIMIT_NOFILE` to its hard limit and
+  uses a listen backlog of 4096.
+- **Balancer decisions are Metric log lines:** `decision=spawn|retire|move|evict`
+  and `topology=added|removed`, key=value, so a `--log-level metric` log has
+  them.
+
+### 15.3 Runner (`scripts/run_load.py`)
+
+`run_load.py --out DIR [node options] -- [loadgen options]` runs one load test:
+1. starts `node --cli --echo` with a metric log;
+2. runs `loadgen` against it, sampling the node from `/proc` every 0.5 s (CPU
+   per thread, RSS, threads, open descriptors);
+3. ends the node through end of input, and records its exit code and shutdown
+   time;
+4. parses the metric log: per tick and per pt the links and load, and the
+   Balancer's moves, spawns and retirements.
+
+Output: `DIR/node.log`, `DIR/loadgen.json` and `DIR/result.json`, plus a one-line
+summary. It needs only the Python standard library and uses `build-release/`.
+
+### 15.4 First measurements (Release build, WSL2, 22 cores; indicative only)
+
+| Load | Result |
+|---|---|
+| 8 × 200 msg/s, 64 B | everything echoed, RTT p50 0.7 ms |
+| 256 × 100 msg/s | 25.6k msg/s, nothing lost, p50 0.4 ms |
+| 512 × 100 msg/s, Balancer on or off | 51k msg/s, nothing lost, p50 0.7–1.1 ms, p99 9–24 ms |
+| 1024 × 100 msg/s | the node caps at about 43–58k msg/s; RTT grows to seconds (queues build up); the shutdown still exits 0 |
+| 8 active + 300 idle + 4 slow peers | the slow peers cost the active ones nothing |
+| 64 × 50 msg/s with 20 reconnects/s | nothing lost; reconnect handshake about 1.2 ms |
+| closed loop 8 × window 16, 4 KB | about 31k msg/s |
+
+**Findings for the experiments**
+1. **At the 1024-peer cap no thread is saturated** (pt-0 about 66%, Router
+   about 62%, Store about 44%, the generator 79%). The limit is in the hand-offs,
+   not in one busy thread. Candidates to measure:
+   - contention on a pool's mutex between its IO worker's `receive()` and the
+     Router's `send()`;
+   - a condition-variable wake-up per message on the Pt-i → Store → Router →
+     pool path.
+2. **Mass arrival lands on one pt.** During the ramp there is no traffic, so the
+   Balancer sees no load and starts no worker: all links are placed on pt-0. The
+   Balancer then spawns workers once traffic starts, and drains pt-0 at
+   `max_moves_per_tick` per tick. At the default 2 moves per tick, 512 links
+   would take minutes. `--balance-max-moves 32` spreads them over 4 pts in a few
+   seconds (96/128/160/128).
+3. **There is no backpressure on inbound traffic** (a scope decision at the top
+   of this document). When the node is overloaded its queues grow without bound,
+   latency follows, and memory with it.
+
+Not yet done: the scenario matrix (the old S1–S7) and plotting.
+

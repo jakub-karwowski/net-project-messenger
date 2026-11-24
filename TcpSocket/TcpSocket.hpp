@@ -108,6 +108,8 @@ class TcpConnection {
             bool non_blocking = false;                      // O_NONBLOCK
             bool tcp_nodelay = false;                       // TCP_NODELAY
             bool keep_alive = false;                        // SO_KEEPALIVE
+            int receive_buffer = 0;                         // SO_RCVBUF in bytes; 0 keeps the kernel's default.
+                                                            // For a dial it takes effect before connecting.
         };
 
         // Builder-style configuration: each call mutates the stored options and

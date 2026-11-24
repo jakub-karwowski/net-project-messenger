@@ -24,6 +24,9 @@
 
 struct CliOptions {
     bool stay = false;   // keep running after end of input (until /quit or a signal)
+    // Load-test target: every received message goes straight back to its
+    // sender, nothing is stored or printed per message or per peer.
+    bool echo = false;
 };
 
 class CliFrontend {

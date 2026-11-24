@@ -28,6 +28,7 @@
 #include "Worker.hpp"
 
 #include <cstdio>
+#include <sys/resource.h>
 #include <exception>
 #include <format>
 #include <optional>
@@ -51,7 +52,25 @@ std::vector<wire::Endpoint> advertised(const AppConfig& cfg, std::uint16_t bound
     return out;
 }
 
+// Many peers need many descriptors: use as many as the hard limit allows.
+void raise_open_file_limit() {
+    rlimit limit{};
+    if (::getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur < limit.rlim_max) {
+        limit.rlim_cur = limit.rlim_max;
+        std::ignore = ::setrlimit(RLIMIT_NOFILE, &limit);
+    }
+}
+
+// Until a Balancer decides anything, or with --no-balancer: take its messages
+// off the queue so it does not grow, and stop when told to.
+void discard_balancer_messages(ThreadQueue<msg::BalancerMsg>& q) {
+    while (auto m = q.pop()) {
+        if (std::holds_alternative<msg::StopBalancer>(*m)) { return; }
+    }
+}
+
 int run_node(const AppConfig& cfg) {
+    raise_open_file_limit();
     const bool tui = cfg.frontend == AppConfig::Frontend::Tui;
     // stdout belongs to the frontend: the CLI's events, or the TUI's screen.
     JsonlWriter out(STDOUT_FILENO);
@@ -79,7 +98,7 @@ int run_node(const AppConfig& cfg) {
 
     std::optional<TcpListener> listener;
     try {
-        listener.emplace(cfg.listen.address, cfg.listen.port, 128);
+        listener.emplace(cfg.listen.address, cfg.listen.port, 4096);   // the kernel caps it at somaxconn
     } catch (const std::exception& e) {
         return fatal(std::format("cannot listen on {}:{}: {}", cfg.listen.address, cfg.listen.port, e.what()));
     }
@@ -107,7 +126,9 @@ int run_node(const AppConfig& cfg) {
 
     RouterConfig router_cfg;
     router_cfg.min_pts = cfg.min_pts;
-    router_cfg.max_pts = cfg.max_pts;
+    router_cfg.max_pts = cfg.balancer ? cfg.max_pts : cfg.min_pts;
+    router_cfg.max_links = cfg.max_links;
+    router_cfg.max_links_per_pt = cfg.max_links_per_pt == 0 ? cfg.max_links : cfg.max_links_per_pt;
     router_cfg.io.handshake_timeout = cfg.handshake_timeout;
     router_cfg.io.connect_timeout = cfg.connect_timeout;
     RouterWorker router(router_cfg, router_q, store_q, balancer_q, &supervisor, Logger(core, "router"),
@@ -116,7 +137,8 @@ int run_node(const AppConfig& cfg) {
     balancer_cfg.period = cfg.balance_period;
     balancer_cfg.min_pts = cfg.min_pts;
     balancer_cfg.max_pts = cfg.max_pts;
-    BalancerWorker balancer(balancer_cfg, balancer_q, router_q, Logger(core, "balancer"));
+    balancer_cfg.max_moves_per_tick = cfg.balance_max_moves;
+    BalancerWorker balancer(balancer_cfg, balancer_q, router_q, Logger(core, "balancer"), /*timer=*/cfg.balancer);
     ListenerWorker accept(*listener, router_q, Logger(core, "listener"));
 
     const auto begin_shutdown = [&](std::string_view reason) { supervisor.begin_shutdown(reason); };
@@ -131,13 +153,15 @@ int run_node(const AppConfig& cfg) {
                              Logger(core, "tui"), begin_shutdown, progress);
     } else {
         lines.emplace(STDIN_FILENO, frontend_q, Logger(core, "input"));
-        cli_frontend.emplace(CliOptions{cfg.stay}, frontend_q, store_q, out, Logger(core, "cli"), begin_shutdown, progress);
+        cli_frontend.emplace(CliOptions{cfg.stay, cfg.echo}, frontend_q, store_q, out, Logger(core, "cli"), begin_shutdown, progress);
     }
 
     WorkerThread store_thread("store", [&] { worker::run_inbox(store, store_q); },
                               [&] { store_q.graceful_shutdown(); }, &supervisor);
     WorkerThread router_thread("router", [&] { router.run(); }, [&] { router_q.graceful_shutdown(); }, &supervisor);
-    WorkerThread balancer_thread("balancer", [&] { worker::run_inbox(balancer, balancer_q); },
+    WorkerThread balancer_thread("balancer", [&] {
+            if (cfg.balancer) { worker::run_inbox(balancer, balancer_q); } else { discard_balancer_messages(balancer_q); }
+        },
                                  [&] { balancer_q.graceful_shutdown(); }, &supervisor);
     WorkerThread listener_thread("listener", [&] { accept.run(); }, [&] { listener->stop(); }, &supervisor);
     WorkerThread input_thread("input", [&] { if (tui) { keyboard->run(); } else { lines->run(); } },
