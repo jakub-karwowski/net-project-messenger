@@ -1,5 +1,6 @@
 #include "Supervisor.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
@@ -115,16 +116,31 @@ ShutdownPhase Supervisor::phase() const noexcept {
     return phase_;
 }
 
+int Supervisor::exit_code() const noexcept {
+    std::scoped_lock lock(mutex_);
+    return exit_code_;
+}
+
 void Supervisor::begin_shutdown(std::string_view reason) {
     {
         std::scoped_lock lock(mutex_);
         if (phase_ != ShutdownPhase::Running) { return; }
         phase_ = ShutdownPhase::Graceful;
-        deadline_ = Clock::now() + timings_.graceful;
+        const auto now = Clock::now();
+        deadline_ = now + timings_.graceful;
+        graceful_cap_ = now + std::max(timings_.graceful_cap, timings_.graceful);
         reason_ = reason;
     }
     log_.info("shutdown phase=graceful reason={} deadline_ms={}", reason, timings_.graceful.count());
     wakeup_.signal();
+}
+
+void Supervisor::progress() noexcept {
+    std::scoped_lock lock(mutex_);
+    if (phase_ != ShutdownPhase::Graceful) { return; }
+    // Only ever later, and never past the cap. The supervisor thread notices the
+    // new deadline when its current wait ends (handle_deadline re-checks).
+    deadline_ = std::max(deadline_, std::min(graceful_cap_, Clock::now() + timings_.progress_margin));
 }
 
 void Supervisor::fatal(std::string_view thread, std::string_view what) noexcept {
@@ -225,6 +241,8 @@ void Supervisor::handle_deadline() {
     {
         std::scoped_lock lock(mutex_);
         phase = phase_;
+        // progress() may have moved the deadline while we waited.
+        if (Clock::now() < deadline_) { return; }
     }
     if (phase == ShutdownPhase::Graceful) {
         enter_emergency("graceful_timeout", kExitShutdownForced);

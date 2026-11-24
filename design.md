@@ -913,8 +913,15 @@ Router then fails the parked sends.
    sends `PtStopped` → Router.
 5. Router: join every Pt-i, then → Store: `RouterStopped`
 6. Store: `persistence.flush()` (a no-op today), then → Frontend: `ShutdownDone`
-7. The frontend exits its loop. main stops the input thread, closes every queue
-   (`graceful_shutdown`), joins the Store, Router and Balancer, then the Logger.
+7. The frontend writes out every event it still has (CLI: `shutdown_done` last)
+   and exits its loop. main stops the input thread, closes every queue
+   (`graceful_shutdown`), and joins the Store, Router and Balancer. It then logs
+   `all workers stopped; exit code N`, the last line of every complete log, and
+   joins the Logger, which drains its queue first.
+
+The Router logs `all IO workers stopped` when the network part is done. The
+time from the Supervisor's `shutdown phase=graceful` line to it is the network
+shutdown; the rest is the frontend writing out its backlog and the joins.
 
 The per-link `LinkDown{Shutdown}` messages reach the Router while it waits. It
 does not forward them to the Store.
@@ -1158,7 +1165,7 @@ Running ──quit / SIGTERM / EOF──► Graceful ──deadline──► Eme
 
 | Phase | What happens | Deadline (default) | Exit code if it ends here |
 |---|---|---|---|
-| Graceful | §7.8 runs as messages: Pt-i flush, `ShutdownDone`, main joins everything | `grace + 1 s` = 2 s | 0 |
+| Graceful | §7.8 runs as messages: Pt-i flush, `ShutdownDone`, main joins everything | `grace + 1 s` = 2 s, extended by progress (below) up to `grace + 30 s` | 0 |
 | Emergency | `force_shutdown()` on every queue except `log_q`, `request_stop()` on every `WorkerThread`, main joins | 1 s | 3 if graceful timed out, 2 after a worker exception |
 | Hard exit | restore the terminal, write one log line with raw `write(2)`, `_exit` | — | 4 |
 
@@ -1167,6 +1174,21 @@ forward, and moving between them is one atomic compare-and-swap, so every trigge
 is safe from any thread and safe to fire more than once. `--shutdown-grace` sets
 `grace`. The graceful deadline is `grace + 1 s`, and the emergency deadline is
 1 s.
+
+**Slow is not stuck (step 10).** The fixed graceful deadline also had to cover
+the frontend writing out its backlog. A CLI that had echoed 18 MB of events was
+forced into Emergency with `stuck=[]`: every worker had finished, and the
+frontend was still writing to a slowly read stdout. Now:
+- `Supervisor::progress()` (any thread, cheap) pushes the graceful deadline to
+  at least now + `progress_margin` (1 s), never past `graceful_cap` (`grace + 30 s`)
+  after the shutdown began. Outside the graceful phase it does nothing.
+- The frontends call it after every event delivered (a CLI line written, a TUI
+  frame drawn). That covers shutdowns started by a signal, which the frontend
+  does not see.
+- What still escalates: a stuck worker (no events, so no progress), a frontend
+  blocked in `write()` (no progress), and endless progress (the cap).
+- `handle_deadline()` re-checks the deadline, since it may have moved while the
+  Supervisor was waiting.
 
 **It runs on its own thread, not as a timer on `frontend_q`.** The main thread is
 one of the things that can get stuck:
@@ -1258,6 +1280,8 @@ are closed.
 | SIGTERM, then a second SIGTERM | the first starts Graceful, the second escalates at once |
 | CLI: the agent stops reading stdout, then sends SIGTERM | exit within the deadlines, even though main is stuck in `write` |
 | CLI: stdout is closed (EPIPE) | normal quit, exit 0 |
+| Progress past the graceful deadline, below the cap | not forced, exit 0 |
+| Progress that never stops | forced at the cap, exit 3 |
 
 The two CLI rows are tested at the Supervisor level in step 2 (main blocked in
 `write` on a full pipe) and end to end in step 6. Under ThreadSanitizer, run with
@@ -1279,7 +1303,7 @@ sleep inside `_exit` otherwise breaks the timing checks of the hard-exit cases.
 | 7 ✅ | Balancer `decide()` as a pure function (`BalancerPolicy`) | `test_balancer` 57 checks: smooth weighted round robin (shares, spread, deterministic), EWMA and loads, `gone` samples do not move a link back, policy shares and no resend when unchanged, stall after `k_missed` (first tick free) and recovery, a stalled pt gets no links and no moves, scale out (once until answered, never above `max_pts`), scale in (after `scale_in_ticks`, least loaded, never below `min_pts`, the retiring pt gets no links), rebalance (busiest link to the idlest pt, cooldown, a lone hot link never moves, `max_moves_per_tick`), eviction, the worker driven by hand-pushed ticks |
 | 8 ✅ | Balancer thread wired in (Router, `node`) | `test_balancer_e2e` 9 checks: one pt, two peers streaming ~1 MB/s into it: the Balancer starts a second pt and moves a link while 2 × 1500 messages arrive complete and in order, then scales back in once idle, and traffic still flows. 15 runs stable; clean under TSan and ASan+UBSan. A real stalled pt is not tested end to end (nothing can block an IO worker on purpose); stall handling is covered by `test_balancer` |
 | 9 ✅ | TUI frontend: `TuiScreen`, `TuiFrontend`, `KeyboardWorker`, `Keys`, `TerminalState`, on the same `CommandProcessor`; TerminalUI gained `StatusBar` and `ChatModel::set_sender` | `test_tui` 52 checks, headless (keys and events fed by hand, frames read back as text): key decoding, layout and resize, typing → the same `StoreMsg` the CLI sends, codepoint editing, a dial opens its conv, snapshot and messages with labels, sending / sent / failed, an ESC byte in a message is drawn not executed, errors as notices, the first conv opens itself, unread counts, Tab (previous conv back to counting, wraps), `/list` shown but address lookups not, Ctrl+C once, `ShutdownDone`, scrolling. `test_tui_e2e` 13 checks, the real node on a pseudo-terminal with a `--cli` peer: start, typed `/dial`, chat both ways, Ctrl+C → exit 0 with the terminal reset, no terminal → exit 1. Repeated runs stable; clean under TSan and ASan+UBSan |
-| 10 | Shutdown | quit with buffered TX, all threads join within grace + ε, no lost log lines, in both frontends |
+| 10 ✅ | Shutdown hardening: progress-extended graceful deadline (`Supervisor::progress()`, cap), the final log line, `all IO workers stopped` from the Router, `Supervisor::exit_code()` | `test_shutdown` 81 checks, real node processes. A stalled raw peer (handshake, then no reads) with 300 × 60 KB queued: the network side waits exactly the grace (500 ms → 500–502 ms) and gives up, exit 0, not forced, refused sends reported failed. A peer that starts reading only once the shutdown has begun: all 30 messages reported sent are delivered (flushed in ~41 ms), then the node stops without waiting for the deadline. SIGTERM in the middle of two-way traffic: exit 0 in ~100 ms, the other node carries on. TUI on a pseudo-terminal, Ctrl+C and SIGTERM: exit 0 in ~100 ms, cursor restored. Every log: every line well-formed, lines from every thread, the last line written after all workers stopped. `test_supervisor` +2 (progress extends; the cap holds). 10 runs stable; clean under TSan and ASan+UBSan (under TSan the CLI's backlog takes ~7 s to write out and is no longer forced) |
 
 **Why the CLI comes before the Balancer and the TUI.** After step 5 the network
 stack works but nothing outside a test binary can drive it. The CLI makes real
@@ -1637,6 +1661,10 @@ not.
   SIGTERM, which also takes the normal shutdown path. That suits a node started
   in the background with `</dev/null`.
 - **Echoing input:** none. An agent correlates through `req`.
+- **Shutdown:** writing out the remaining events counts as progress for the
+  shutdown watchdog (§9.2), so a long backlog is delivered, not cut off by a
+  forced shutdown. An agent that stops reading altogether still gets a bounded
+  exit.
 - **Order of replies:** a parse error is answered by the frontend at once, so it
   can come before the Store's reply to an earlier line. Each reply carries its
   `req`; nothing else orders them.

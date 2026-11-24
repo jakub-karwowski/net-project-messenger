@@ -79,3 +79,10 @@ target_compile_definitions(test_tui_e2e PRIVATE NODE_BINARY="$<TARGET_FILE:node>
 target_link_libraries(test_tui_e2e PRIVATE util)
 add_dependencies(test_tui_e2e node)
 add_test(NAME test_tui_e2e COMMAND test_tui_e2e)
+
+# Quitting under load: real node processes (CLI and TUI) and a raw stalled peer.
+add_executable(test_shutdown test_shutdown.cpp)
+target_compile_definitions(test_shutdown PRIVATE NODE_BINARY="$<TARGET_FILE:node>")
+target_link_libraries(test_shutdown PRIVATE Messages util)
+add_dependencies(test_shutdown node)
+add_test(NAME test_shutdown COMMAND test_shutdown)

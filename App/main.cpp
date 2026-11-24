@@ -120,6 +120,7 @@ int run_node(const AppConfig& cfg) {
     ListenerWorker accept(*listener, router_q, Logger(core, "listener"));
 
     const auto begin_shutdown = [&](std::string_view reason) { supervisor.begin_shutdown(reason); };
+    const auto progress = [&] { supervisor.progress(); };
     std::optional<LineReader> lines;
     std::optional<KeyboardWorker> keyboard;
     std::optional<CliFrontend> cli_frontend;
@@ -127,10 +128,10 @@ int run_node(const AppConfig& cfg) {
     if (tui) {
         keyboard.emplace(*terminal, frontend_q, Logger(core, "keyboard"));
         tui_frontend.emplace(frontend_q, store_q, [&](Renderable& r) { std::ignore = terminal->render(r); },
-                             Logger(core, "tui"), begin_shutdown);
+                             Logger(core, "tui"), begin_shutdown, progress);
     } else {
         lines.emplace(STDIN_FILENO, frontend_q, Logger(core, "input"));
-        cli_frontend.emplace(CliOptions{cfg.stay}, frontend_q, store_q, out, Logger(core, "cli"), begin_shutdown);
+        cli_frontend.emplace(CliOptions{cfg.stay}, frontend_q, store_q, out, Logger(core, "cli"), begin_shutdown, progress);
     }
 
     WorkerThread store_thread("store", [&] { worker::run_inbox(store, store_q); },
@@ -170,6 +171,10 @@ int run_node(const AppConfig& cfg) {
         t->request_stop();
         t->join();
     }
+    // The last line of every complete log: everything logged before it has
+    // been queued, and the Logger drains the queue before it stops. The
+    // Supervisor still guards that drain.
+    log.info("all workers stopped; exit code {}", supervisor.exit_code());
     core.queue().graceful_shutdown();
     log_thread.join();
     return supervisor.finish();

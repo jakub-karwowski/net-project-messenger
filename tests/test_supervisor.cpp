@@ -38,6 +38,8 @@ using Clock = std::chrono::steady_clock;
 
 constexpr auto kGraceful = 300ms;
 constexpr auto kEmergency = 200ms;
+constexpr auto kProgressMargin = 150ms;
+constexpr auto kGracefulCap = 700ms;
 
 // ------------------------------------------------------------------ child side
 
@@ -72,7 +74,7 @@ struct Child {
 
     explicit Child(const char* log_path)
         : writer(core, open_log_file(log_path), true),
-          supervisor(ShutdownTimings{kGraceful, kEmergency}, Logger(core, "main")) {
+          supervisor(ShutdownTimings{kGraceful, kEmergency, kProgressMargin, kGracefulCap}, Logger(core, "main")) {
         supervisor.start();   // before any other thread
         log_thread = std::make_unique<WorkerThread>(
             "logger", [this] { writer.run(); }, [this] { core.queue().graceful_shutdown(); }, &supervisor);
@@ -154,6 +156,35 @@ int scenario(const std::string& name, const char* log_path) {
             std::this_thread::sleep_for(30ms);
         }
         return c.finish();
+    }
+    if (name == "progress_extends") {
+        // The worker is slow but keeps reporting progress, past the graceful
+        // deadline (300 ms) though not past the cap (700 ms); then it finishes.
+        c.supervisor.begin_shutdown("quit");
+        const auto until = Clock::now() + kGraceful * 2;
+        while (Clock::now() < until) {
+            c.supervisor.progress();
+            std::this_thread::sleep_for(50ms);
+        }
+        c.inbox.graceful_shutdown();
+        return c.finish();
+    }
+    if (name == "progress_capped") {
+        // Progress forever is still bounded by the cap.
+        std::ignore = c.inbox.push(Block{});
+        std::this_thread::sleep_for(20ms);
+        c.supervisor.begin_shutdown("quit");
+        std::atomic<bool> stop{false};
+        std::thread ticker([&] {
+            while (!stop) {
+                c.supervisor.progress();
+                std::this_thread::sleep_for(20ms);
+            }
+        });
+        const int code = c.finish();
+        stop = true;
+        ticker.join();
+        return code;
     }
     if (name == "main_stuck_in_write") {
         // An agent that stopped reading stdout: main blocks in write() forever.
@@ -306,6 +337,20 @@ void run_all(const std::string& self) {
         check(o.exit_code == kExitHard, "third signal: hard exit");
         check(o.elapsed < kGraceful, "third signal: does not wait for any deadline");
         check(has(o.err, "reason=third_signal"), "third signal: reason on stderr");
+    }
+    {
+        auto o = run_child(self, "progress_extends");
+        report("progress_extends", o);
+        check(o.exit_code == kExitClean, "progress: a slow shutdown that keeps moving is not forced, exit 0");
+        check(o.elapsed >= kGraceful * 2 - 50ms && !has(o.log, "phase=emergency"),
+              "progress: it ran well past the graceful deadline without escalating");
+    }
+    {
+        auto o = run_child(self, "progress_capped");
+        report("progress_capped", o);
+        check(o.exit_code == kExitShutdownForced, "progress cap: endless progress is still forced, exit 3");
+        check(o.elapsed >= kGracefulCap - 50ms && o.elapsed < kGracefulCap + kEmergency + slack,
+              "progress cap: at the cap, not before");
     }
     {
         auto o = run_child(self, "main_stuck_in_write");

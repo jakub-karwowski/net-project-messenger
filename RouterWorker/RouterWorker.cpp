@@ -388,6 +388,7 @@ void RouterWorker::finish_if_stopped() {
     if (!stopping_ || done_) { return; }
     if (std::ranges::any_of(pts_, [](const auto& e) { return !e.second.stopped; })) { return; }
     done_ = true;
+    log_.info("all IO workers stopped");
     send_store(msg::RouterStopped{});
 }
 

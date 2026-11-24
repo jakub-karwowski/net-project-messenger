@@ -28,12 +28,13 @@ std::string short_id(ConvId conv) {
 }  // namespace
 
 TuiFrontend::TuiFrontend(ThreadQueue<msg::FrontendMsg>& inbox, ThreadQueue<msg::StoreMsg>& store, Render render,
-                         Logger log, std::function<void(std::string_view)> begin_shutdown)
+                         Logger log, std::function<void(std::string_view)> begin_shutdown, std::function<void()> progress)
     : inbox_(inbox),
       store_(store),
       render_(std::move(render)),
       log_(log.with_component("tui")),
       begin_shutdown_(std::move(begin_shutdown)),
+      progress_(std::move(progress)),
       screen_(chat_, input_),
       processor_(store, ProcessorMode{kActive, kBackground}) {}
 
@@ -64,6 +65,7 @@ void TuiFrontend::redraw() {
     screen_.set_status(status_text());
     screen_.set_notice(StyledText(notice_, TuiScreen::kNoticeStyle));
     if (render_) { render_(screen_); }
+    if (progress_) { progress_(); }   // ignored by the Supervisor outside a shutdown
 }
 
 void TuiFrontend::notice(std::string text) {

@@ -31,8 +31,10 @@ class TuiFrontend {
 public:
     using Render = std::function<void(Renderable&)>;
 
+    // `progress` tells the shutdown watchdog that another frame was drawn
+    // (Supervisor::progress); it matters only during a shutdown.
     TuiFrontend(ThreadQueue<msg::FrontendMsg>& inbox, ThreadQueue<msg::StoreMsg>& store, Render render, Logger log,
-                std::function<void(std::string_view)> begin_shutdown);
+                std::function<void(std::string_view)> begin_shutdown, std::function<void()> progress = {});
 
     // Shows where the node listens and draws the first frame.
     void start(const wire::Endpoint& listening, std::size_t pts);
@@ -84,6 +86,7 @@ private:
     Render render_;
     Logger log_;
     std::function<void(std::string_view)> begin_shutdown_;
+    std::function<void()> progress_;
 
     std::shared_ptr<ChatModel> chat_ = std::make_shared<ChatModel>();
     std::shared_ptr<InputModel> input_ = std::make_shared<InputModel>();

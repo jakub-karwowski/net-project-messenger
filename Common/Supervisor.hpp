@@ -32,12 +32,19 @@
 #include <thread>
 #include <vector>
 
+// The graceful phase ends at its deadline unless the shutdown is visibly
+// moving: each progress() call keeps it alive for at least `progress_margin`
+// more, but never past `graceful_cap` after it began. Slow but moving (a
+// frontend still writing out a backlog of events) is not stuck.
 struct ShutdownTimings {
-    std::chrono::milliseconds graceful{2000};    // grace + 1 s by default
+    std::chrono::milliseconds graceful{2000};        // grace + 1 s by default
     std::chrono::milliseconds emergency{1000};
+    std::chrono::milliseconds progress_margin{1000};
+    std::chrono::milliseconds graceful_cap{31000};   // grace + 30 s by default
 
     static ShutdownTimings from_grace(std::chrono::milliseconds grace) {
-        return {grace + std::chrono::seconds{1}, std::chrono::seconds{1}};
+        return {grace + std::chrono::seconds{1}, std::chrono::seconds{1}, std::chrono::seconds{1},
+                grace + std::chrono::seconds{30}};
     }
 };
 
@@ -90,6 +97,11 @@ public:
     // graceful deadline. Idempotent; ignored once shutdown is under way.
     void begin_shutdown(std::string_view reason);
 
+    // The shutdown is moving (e.g. the frontend delivered another event). In the
+    // graceful phase, pushes its deadline to at least now + progress_margin,
+    // within graceful_cap. Any thread; cheap; ignored outside the graceful phase.
+    void progress() noexcept;
+
     // A worker thread failed: skip Graceful and go straight to Emergency.
     void fatal(std::string_view thread, std::string_view what) noexcept override;
 
@@ -98,6 +110,9 @@ public:
     [[nodiscard]] int finish();
 
     ShutdownPhase phase() const noexcept;
+    // The exit code finish() would return now (it can still change while the
+    // shutdown is under way).
+    int exit_code() const noexcept;
 
 private:
     void loop();
@@ -115,6 +130,7 @@ private:
     mutable std::mutex mutex_;
     ShutdownPhase phase_ = ShutdownPhase::Running;
     std::chrono::steady_clock::time_point deadline_{};
+    std::chrono::steady_clock::time_point graceful_cap_{};   // progress() never extends past this
     std::string reason_;
     int exit_code_ = kExitClean;
     bool emergency_pending_ = false;   // actions not yet run by the supervisor thread

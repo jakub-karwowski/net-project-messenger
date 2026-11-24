@@ -28,9 +28,12 @@ struct CliOptions {
 
 class CliFrontend {
 public:
-    // `begin_shutdown` arms the shutdown watchdog (Supervisor::begin_shutdown).
+    // `begin_shutdown` arms the shutdown watchdog (Supervisor::begin_shutdown);
+    // `progress` tells it that another event went out (Supervisor::progress),
+    // so a long backlog during a shutdown is not taken for a hang.
     CliFrontend(CliOptions options, ThreadQueue<msg::FrontendMsg>& inbox, ThreadQueue<msg::StoreMsg>& store,
-                JsonlWriter& out, Logger log, std::function<void(std::string_view)> begin_shutdown);
+                JsonlWriter& out, Logger log, std::function<void(std::string_view)> begin_shutdown,
+                std::function<void()> progress = {});
 
     // Writes "ready" and makes the Store forward every conversation.
     void start(const wire::Endpoint& listening, std::size_t pts);
@@ -62,6 +65,7 @@ private:
     JsonlWriter& out_;
     Logger log_;
     std::function<void(std::string_view)> begin_shutdown_;
+    std::function<void()> progress_;
     CommandProcessor processor_;
     bool quitting_ = false;
     bool done_ = false;

@@ -16,13 +16,15 @@ constexpr Sub kForwardAll{Sub::Inbound::Forward, Sub::Outbound::Notify, Sub::Lif
 }  // namespace
 
 CliFrontend::CliFrontend(CliOptions options, ThreadQueue<msg::FrontendMsg>& inbox, ThreadQueue<msg::StoreMsg>& store,
-                         JsonlWriter& out, Logger log, std::function<void(std::string_view)> begin_shutdown)
+                         JsonlWriter& out, Logger log, std::function<void(std::string_view)> begin_shutdown,
+                         std::function<void()> progress)
     : options_(options),
       inbox_(inbox),
       store_(store),
       out_(out),
       log_(log.with_component("cli")),
       begin_shutdown_(std::move(begin_shutdown)),
+      progress_(std::move(progress)),
       processor_(store, ProcessorMode{kForwardAll, std::nullopt}) {}
 
 void CliFrontend::start(const wire::Endpoint& listening, std::size_t pts) {
@@ -35,7 +37,12 @@ void CliFrontend::run() {
 }
 
 void CliFrontend::write(const std::string& line) {
-    if (out_.write(line)) { return; }
+    if (out_.write(line)) {
+        // Also when the shutdown came from a signal, which this frontend does
+        // not see; outside a shutdown the Supervisor ignores it.
+        if (progress_) { progress_(); }
+        return;
+    }
     // Nobody reads our output any more: there is no point in carrying on.
     if (!quitting_) {
         log_.info("stdout closed; quitting");
