@@ -68,3 +68,14 @@ add_test(NAME test_balancer COMMAND test_balancer)
 add_executable(test_balancer_e2e test_balancer_e2e.cpp)
 target_link_libraries(test_balancer_e2e PRIVATE RouterWorker StoreWorker ListenerWorker BalancerWorker)
 add_test(NAME test_balancer_e2e COMMAND test_balancer_e2e)
+
+add_executable(test_tui test_tui.cpp)
+target_link_libraries(test_tui PRIVATE Frontend)
+add_test(NAME test_tui COMMAND test_tui)
+
+# Runs the node on a pseudo-terminal.
+add_executable(test_tui_e2e test_tui_e2e.cpp)
+target_compile_definitions(test_tui_e2e PRIVATE NODE_BINARY="$<TARGET_FILE:node>")
+target_link_libraries(test_tui_e2e PRIVATE util)
+add_dependencies(test_tui_e2e node)
+add_test(NAME test_tui_e2e COMMAND test_tui_e2e)

@@ -11,7 +11,7 @@
 #include <vector>
 
 // A rectangle of the screen with an optional margin, border and padding around
-// its content. Elements draw themselves into a Canvas (design.md §13.2): the
+// its content. Elements draw themselves into a Canvas: the
 // parent hands each child a canvas of the child's size at the child's position,
 // clipped to the parent, so no element can draw outside its own box.
 struct Element {

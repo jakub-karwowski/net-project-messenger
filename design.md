@@ -716,6 +716,41 @@ The TUI keeps a `ChatModel` only for the active conversation. A switch asks the
 Store for a snapshot (`Subscribe` returns `ConvSnapshot`), so the Store stays the
 single source of truth.
 
+**As built (step 9)**
+- **Screen** (`TuiScreen`, a `Renderable`):
+  - row 0: the status bar (active conv id, its state and address, "scrolled
+    back N", the other convs with their unread counts; "quitting" comes first,
+    since the bar is cut at the right);
+  - the chat;
+  - a notice row (the last command result or event);
+  - the input box (a top border, two lines).
+
+  Rows are fixed, so after every resize the children are placed exactly instead
+  of being scaled by `AbsoluteLayout`.
+- **Subscriptions:** at start `SetDefaultSubscription{Notify, Ignore, Notify}`.
+  `/open` and Tab subscribe the new conv `{Forward, Notify, Notify}` and put the
+  old one back to the default (`ProcessorMode::previous`).
+- **Automatic opening:** a successful `/dial` opens its conv. The first conv
+  that appears while none is active (an inbound peer) is opened too.
+- **Keys:** Text, Backspace, Left and Right edit the input (by codepoint);
+  Enter submits; Tab goes to the next conv; PgUp and PgDn scroll by 10 messages
+  (a new message does not move a scrolled view); Ctrl+C is `/quit`. Up and
+  Down are unused. Keys are decoded by pure functions (`Keys.hpp`) from bytes
+  read by `KeyboardWorker` (ESC sequences: 50 ms for the rest of the sequence).
+- **Labels:** my messages show as "me (sending)", then "me" or "me (failed)"
+  (`ChatModel::set_sender`). A peer's messages show its address, which comes
+  from a `ListReq{0}` sent when a conv first appears; with no request id it gets
+  no `Reply` and is not shown. An explicit `/list` is shown, recognised by the
+  `Reply` that precedes its `ConvList`.
+- **Rendering:** through a callback, so tests draw into a `FrameBuffer` without
+  a terminal. The loop handles everything already queued, then draws once.
+- **Terminal safety:** stdin's settings are saved before `TerminalUI` changes
+  them (`TerminalState`). The Supervisor's hard exit restores them with
+  `tcsetattr` and `write` only. Without a terminal on stdin the node exits 1
+  with a message.
+- **Conversation ids** are typed in full (16 hex digits, as the status bar shows
+  them). Tab covers switching; short prefixes are not supported.
+
 ### 5.7 Logger (`Common/Logger.hpp`)
 
 `Logger` is a cheap handle `{ThreadQueue<LogRecord>*, thread_name}` with
@@ -995,11 +1030,13 @@ IoWorker/      IoWorker.hpp/.cpp
 BalancerWorker/BalancerWorker.hpp/.cpp  BalancerPolicy.hpp/.cpp   (pure decide())
 ListenerWorker/ListenerWorker.hpp/.cpp
 Frontend/      Commands.hpp/.cpp (pure parser)  CommandProcessor.hpp/.cpp
-               Tui: TuiView.hpp/.cpp  KeyboardWorker.hpp/.cpp
+               Tui: TuiFrontend.hpp/.cpp  TuiScreen.hpp/.cpp  KeyboardWorker.hpp/.cpp  Keys.hpp/.cpp
+                    TerminalState.hpp/.cpp (saved termios, async-signal-safe restore)
                Cli: CliFrontend.hpp/.cpp  CliFormat.hpp/.cpp (the events)  LineReader.hpp/.cpp
                     JsonlWriter.hpp/.cpp  Json.hpp (escaping, hex ids)
 App/           main.cpp (wiring, start/stop order)  AppConfig.hpp/.cpp (argv)   → the `node` executable
-tests/         one test_*.cpp per module (CTest); NodeHarness.hpp: complete nodes in one process
+tests/         one test_*.cpp per module (CTest); NodeHarness.hpp: complete nodes in one process;
+               CliProcess.hpp: a `node --cli` process driven through pipes
 ```
 
 Each worker exposes `run()` (the thread body) and is constructed with references to
@@ -1241,7 +1278,7 @@ sleep inside `_exit` otherwise breaks the timing checks of the hard-exit cases.
 | 6 ✅ | Command layer and agent CLI (§14): `Commands`, `CommandProcessor`, `CliFrontend`, `CliFormat`, `LineReader`, `JsonlWriter`, `Json.hpp`, `App/` (`node --cli`) | `test_commands` 49 checks (every command and its errors, `//`, ids in either case, the processor: request ids, blank/help/quit, `/open` with and without restoring the previous conv, `/echo`, a closed Store queue); `test_jsonl` 45 (escaping: controls, DEL, C1, U+2028, invalid / overlong / surrogate / truncated UTF-8, NUL; ids; every event's exact text; the writer: EPIPE closes it, `try_write` on a full pipe returns at once; the reader: CRLF, blank lines numbered, a line split across reads, no final newline, `stop()` with input open); `test_cli_e2e` 33, real processes over pipes: `ready` with the bound port, dial, chat both ways with text that must be escaped (no raw ESC reaches the output), `/open` with its snapshot, `/list`, `/close` + `/reconnect` keep both convs, errors with line numbers, blank lines counted, end of input → `shutdown_done` + exit 0, `/quit`, `--stay` + SIGTERM, stdout closed, port in use → `fatal` + exit 1. 15 runs stable; clean under TSan and ASan+UBSan, the spawned nodes included |
 | 7 ✅ | Balancer `decide()` as a pure function (`BalancerPolicy`) | `test_balancer` 57 checks: smooth weighted round robin (shares, spread, deterministic), EWMA and loads, `gone` samples do not move a link back, policy shares and no resend when unchanged, stall after `k_missed` (first tick free) and recovery, a stalled pt gets no links and no moves, scale out (once until answered, never above `max_pts`), scale in (after `scale_in_ticks`, least loaded, never below `min_pts`, the retiring pt gets no links), rebalance (busiest link to the idlest pt, cooldown, a lone hot link never moves, `max_moves_per_tick`), eviction, the worker driven by hand-pushed ticks |
 | 8 ✅ | Balancer thread wired in (Router, `node`) | `test_balancer_e2e` 9 checks: one pt, two peers streaming ~1 MB/s into it: the Balancer starts a second pt and moves a link while 2 × 1500 messages arrive complete and in order, then scales back in once idle, and traffic still flows. 15 runs stable; clean under TSan and ASan+UBSan. A real stalled pt is not tested end to end (nothing can block an IO worker on purpose); stall handling is covered by `test_balancer` |
-| 9 | TUI frontend: `TuiView`, `KeyboardWorker`, on the same `CommandProcessor` | headless view test (feed `FrontendMsg`, compare FrameBuffer); key → line → same `StoreMsg` as the CLI produces |
+| 9 ✅ | TUI frontend: `TuiScreen`, `TuiFrontend`, `KeyboardWorker`, `Keys`, `TerminalState`, on the same `CommandProcessor`; TerminalUI gained `StatusBar` and `ChatModel::set_sender` | `test_tui` 52 checks, headless (keys and events fed by hand, frames read back as text): key decoding, layout and resize, typing → the same `StoreMsg` the CLI sends, codepoint editing, a dial opens its conv, snapshot and messages with labels, sending / sent / failed, an ESC byte in a message is drawn not executed, errors as notices, the first conv opens itself, unread counts, Tab (previous conv back to counting, wraps), `/list` shown but address lookups not, Ctrl+C once, `ShutdownDone`, scrolling. `test_tui_e2e` 13 checks, the real node on a pseudo-terminal with a `--cli` peer: start, typed `/dial`, chat both ways, Ctrl+C → exit 0 with the terminal reset, no terminal → exit 1. Repeated runs stable; clean under TSan and ASan+UBSan |
 | 10 | Shutdown | quit with buffered TX, all threads join within grace + ε, no lost log lines, in both frontends |
 
 **Why the CLI comes before the Balancer and the TUI.** After step 5 the network
@@ -1613,7 +1650,7 @@ not.
   `--handshake-timeout MS`, `--connect-timeout MS`. A bad option prints the usage to
   stderr (with `--cli` also a `fatal` event) and exits 1.
 - **`--balance-period MS`** sets the Balancer's tick (default 500). Without
-  `--cli` the node exits 1: the TUI comes in step 9.
+  `--cli` the node runs the terminal UI (§5.6).
 - **Stopping `LineReader`:** it blocks in `poll` on stdin plus a `WakeupEvent`, so
   `stop()` wakes it even while stdin is open (the same rule as `TcpListener::stop`).
   It splits on `'\n'` and strips one trailing `'\r'`.

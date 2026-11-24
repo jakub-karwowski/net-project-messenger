@@ -25,6 +25,9 @@ struct ChatModel {
     void add_message(std::chrono::time_point<std::chrono::system_clock> recived_time, std::string sender, std::string message);
     // Discards every message (a fresh snapshot replaces the whole history).
     void clear() noexcept;
+    // Relabels message `index` (e.g. "me (sending)" once it has been sent).
+    // No-op for an index past the end.
+    void set_sender(size_t index, std::string sender);
     void expose(size_t pos_s, size_t n_msg) noexcept;
     std::span<const ChatMsg> get_messages() const noexcept;
     size_t get_state() const noexcept;

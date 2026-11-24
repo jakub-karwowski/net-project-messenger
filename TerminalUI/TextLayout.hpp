@@ -1,6 +1,6 @@
 #pragma once
 
-// TextLayout.hpp - text is decoded and wrapped once, here (design.md §13.2).
+// TextLayout.hpp - text is decoded and wrapped once, here.
 //
 // StyledText is what widgets produce: runs of UTF-8 text, each with a Style,
 // never escape codes. TextLayout::wrap() turns it into glyphs (each knowing its

@@ -28,6 +28,12 @@ void ChatModel::clear() noexcept {
     mutate_model();
 }
 
+void ChatModel::set_sender(size_t index, std::string sender) {
+    if (index >= msg_.size() || msg_[index].sender == sender) { return; }
+    msg_[index].sender = std::move(sender);
+    mutate_model();
+}
+
 void ChatModel::expose(size_t pos_s, size_t n_msg) noexcept {
     exposed_pos_s = pos_s;
     exposed_n_msg = n_msg;

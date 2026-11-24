@@ -1,5 +1,5 @@
-// The node: wires every worker together and runs the frontend on the main
-// thread.
+// The node: wires every worker together and runs the frontend (the terminal UI,
+// or with --cli the agent CLI) on the main thread.
 //
 // Start order: Supervisor (it sets the signal mask, so it comes before every
 // other thread), Logger, Store, Router (with its IO workers), Balancer,
@@ -13,6 +13,7 @@
 #include "CliFormat.hpp"
 #include "CliFrontend.hpp"
 #include "JsonlWriter.hpp"
+#include "KeyboardWorker.hpp"
 #include "LineReader.hpp"
 #include "ListenerWorker.hpp"
 #include "Logger.hpp"
@@ -20,7 +21,10 @@
 #include "RouterWorker.hpp"
 #include "StoreWorker.hpp"
 #include "Supervisor.hpp"
+#include "TerminalState.hpp"
+#include "TerminalUI.hpp"
 #include "ThreadQueue.hpp"
+#include "TuiFrontend.hpp"
 #include "Worker.hpp"
 
 #include <cstdio>
@@ -47,15 +51,23 @@ std::vector<wire::Endpoint> advertised(const AppConfig& cfg, std::uint16_t bound
     return out;
 }
 
-int run_cli(const AppConfig& cfg) {
+int run_node(const AppConfig& cfg) {
+    const bool tui = cfg.frontend == AppConfig::Frontend::Tui;
+    // stdout belongs to the frontend: the CLI's events, or the TUI's screen.
     JsonlWriter out(STDOUT_FILENO);
+    const auto fatal = [&](const std::string& error) {
+        if (tui) {
+            std::fprintf(stderr, "node: %s\n", error.c_str());
+        } else {
+            std::ignore = out.write(cli::fatal(error));
+        }
+        return kExitStartupFailed;
+    };
 
     LogCore core(cfg.log_path.empty() ? LogLevel::Off : cfg.log_level);
     const int log_fd = cfg.log_path.empty() ? -1 : open_log_file(cfg.log_path);
-    if (!cfg.log_path.empty() && log_fd < 0) {
-        std::ignore = out.write(cli::fatal(std::format("cannot open log file {}", cfg.log_path)));
-        return kExitStartupFailed;
-    }
+    if (!cfg.log_path.empty() && log_fd < 0) { return fatal(std::format("cannot open log file {}", cfg.log_path)); }
+    if (tui && !terminal_state::save()) { return fatal("the terminal UI needs a terminal on stdin (use --cli otherwise)"); }
 
     Supervisor supervisor(ShutdownTimings::from_grace(cfg.shutdown_grace), Logger(core, "supervisor"));
     supervisor.start();
@@ -69,11 +81,18 @@ int run_cli(const AppConfig& cfg) {
     try {
         listener.emplace(cfg.listen.address, cfg.listen.port, 128);
     } catch (const std::exception& e) {
-        std::ignore = out.write(cli::fatal(std::format("cannot listen on {}:{}: {}", cfg.listen.address, cfg.listen.port, e.what())));
-        return kExitStartupFailed;
+        return fatal(std::format("cannot listen on {}:{}: {}", cfg.listen.address, cfg.listen.port, e.what()));
     }
     const std::uint16_t port = listener->local_port().value_or(cfg.listen.port);
     log.info("listening on {}:{}", cfg.listen.address, port);
+
+    // The terminal goes into raw mode here and back in ~TerminalUI(); if the
+    // process has to exit without destructors, the Supervisor restores it.
+    std::optional<TerminalUI> terminal;
+    if (tui) {
+        terminal.emplace();
+        supervisor.set_terminal_restore(&terminal_state::restore);
+    }
 
     ThreadQueue<msg::FrontendMsg> frontend_q;
     ThreadQueue<msg::StoreMsg> store_q;
@@ -99,9 +118,20 @@ int run_cli(const AppConfig& cfg) {
     balancer_cfg.max_pts = cfg.max_pts;
     BalancerWorker balancer(balancer_cfg, balancer_q, router_q, Logger(core, "balancer"));
     ListenerWorker accept(*listener, router_q, Logger(core, "listener"));
-    LineReader input(STDIN_FILENO, frontend_q, Logger(core, "input"));
-    CliFrontend frontend(CliOptions{cfg.stay}, frontend_q, store_q, out, Logger(core, "cli"),
-                         [&](std::string_view reason) { supervisor.begin_shutdown(reason); });
+
+    const auto begin_shutdown = [&](std::string_view reason) { supervisor.begin_shutdown(reason); };
+    std::optional<LineReader> lines;
+    std::optional<KeyboardWorker> keyboard;
+    std::optional<CliFrontend> cli_frontend;
+    std::optional<TuiFrontend> tui_frontend;
+    if (tui) {
+        keyboard.emplace(*terminal, frontend_q, Logger(core, "keyboard"));
+        tui_frontend.emplace(frontend_q, store_q, [&](Renderable& r) { std::ignore = terminal->render(r); },
+                             Logger(core, "tui"), begin_shutdown);
+    } else {
+        lines.emplace(STDIN_FILENO, frontend_q, Logger(core, "input"));
+        cli_frontend.emplace(CliOptions{cfg.stay}, frontend_q, store_q, out, Logger(core, "cli"), begin_shutdown);
+    }
 
     WorkerThread store_thread("store", [&] { worker::run_inbox(store, store_q); },
                               [&] { store_q.graceful_shutdown(); }, &supervisor);
@@ -109,7 +139,8 @@ int run_cli(const AppConfig& cfg) {
     WorkerThread balancer_thread("balancer", [&] { worker::run_inbox(balancer, balancer_q); },
                                  [&] { balancer_q.graceful_shutdown(); }, &supervisor);
     WorkerThread listener_thread("listener", [&] { accept.run(); }, [&] { listener->stop(); }, &supervisor);
-    WorkerThread input_thread("input", [&] { input.run(); }, [&] { input.stop(); }, &supervisor);
+    WorkerThread input_thread("input", [&] { if (tui) { keyboard->run(); } else { lines->run(); } },
+                              [&] { if (tui) { keyboard->stop(); } else { lines->stop(); } }, &supervisor);
 
     supervisor.register_queue([&] { frontend_q.force_shutdown(); });
     supervisor.register_queue([&] { store_q.force_shutdown(); });
@@ -120,10 +151,18 @@ int run_cli(const AppConfig& cfg) {
     }
     // A signal starts the same shutdown /quit does.
     supervisor.set_graceful_trigger([&] { std::ignore = store_q.push(msg::QuitReq{0}); });
-    supervisor.set_escalation_hook([&](const Escalation& e) { std::ignore = out.try_write(cli::shutdown_forced(e)); });
+    if (!tui) {
+        supervisor.set_escalation_hook([&](const Escalation& e) { std::ignore = out.try_write(cli::shutdown_forced(e)); });
+    }
 
-    frontend.start(wire::Endpoint{cfg.listen.address, port}, router.pt_count());
-    frontend.run();
+    const wire::Endpoint listening{cfg.listen.address, port};
+    if (tui) {
+        tui_frontend->start(listening, router.pt_count());
+        tui_frontend->run();
+    } else {
+        cli_frontend->start(listening, router.pt_count());
+        cli_frontend->run();
+    }
 
     // Reverse start order. The Store and Router have finished by now (their
     // loops end with the shutdown); the stops matter after an emergency.
@@ -153,16 +192,18 @@ int main(int argc, char** argv) {
         std::fputs(std::string(usage()).c_str(), stdout);
         return 0;
     }
-    if (cfg->frontend == AppConfig::Frontend::Tui) {
-        std::fputs("node: the terminal UI is not built yet; use --cli\n", stderr);
-        return kExitStartupFailed;
-    }
     try {
-        return run_cli(*cfg);
+        return run_node(*cfg);
     } catch (const std::exception& e) {
-        // Start-up failures that are not handled above (e.g. no eventfd).
-        JsonlWriter out(STDOUT_FILENO);
-        std::ignore = out.write(cli::fatal(e.what()));
+        // Start-up failures that are not handled above (no eventfd, a terminal
+        // that cannot be configured, ...).
+        terminal_state::restore();
+        if (cfg->frontend == AppConfig::Frontend::Tui) {
+            std::fprintf(stderr, "node: %s\n", e.what());
+        } else {
+            JsonlWriter out(STDOUT_FILENO);
+            std::ignore = out.write(cli::fatal(e.what()));
+        }
         return kExitStartupFailed;
     }
 }

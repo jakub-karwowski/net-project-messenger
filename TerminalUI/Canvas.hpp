@@ -1,6 +1,6 @@
 #pragma once
 
-// Canvas.hpp - where elements draw (design.md §13.2): a view of a FrameBuffer
+// Canvas.hpp - where elements draw: a view of a FrameBuffer
 // with its own origin and a clip rectangle. Coordinates are local to the canvas.
 // Nothing drawn through a canvas can land outside its clip, and sub() can only
 // shrink the clip, so an element can never paint over its neighbours.
