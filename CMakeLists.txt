@@ -15,7 +15,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 enable_testing()
 
+add_subdirectory(Common)
 add_subdirectory(TcpSocket)
+add_subdirectory(Messages)
 add_subdirectory(TerminalUI)
 
 add_subdirectory(tests)

@@ -7,8 +7,7 @@ target_link_libraries(test_listener PRIVATE TcpSocket Threads::Threads)
 add_test(NAME test_listener COMMAND test_listener)
 
 add_executable(test_queue test_queue.cpp)
-target_include_directories(test_queue PRIVATE ${PROJECT_SOURCE_DIR})
-target_link_libraries(test_queue PRIVATE Threads::Threads)
+target_link_libraries(test_queue PRIVATE Common)
 add_test(NAME test_queue COMMAND test_queue)
 
 add_executable(test_terminal_ui test_terminal_ui.cpp)
@@ -22,3 +21,18 @@ add_test(NAME test_cells COMMAND test_cells)
 add_executable(test_layout test_layout.cpp)
 target_link_libraries(test_layout PRIVATE TerminalUI)
 add_test(NAME test_layout COMMAND test_layout)
+
+foreach(t test_logger test_supervisor)
+  add_executable(${t} ${t}.cpp)
+  target_link_libraries(${t} PRIVATE Common)
+  add_test(NAME ${t} COMMAND ${t})
+endforeach()
+
+add_executable(test_ids test_ids.cpp)
+target_link_libraries(test_ids PRIVATE Messages)
+add_test(NAME test_ids COMMAND test_ids)
+
+# Stops workers blocked in the socket library's calls too.
+add_executable(test_worker test_worker.cpp)
+target_link_libraries(test_worker PRIVATE Common TcpSocket)
+add_test(NAME test_worker COMMAND test_worker)
