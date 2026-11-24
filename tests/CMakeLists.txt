@@ -36,3 +36,7 @@ add_test(NAME test_ids COMMAND test_ids)
 add_executable(test_worker test_worker.cpp)
 target_link_libraries(test_worker PRIVATE Common TcpSocket)
 add_test(NAME test_worker COMMAND test_worker)
+
+add_executable(test_store test_store.cpp)
+target_link_libraries(test_store PRIVATE StoreWorker)
+add_test(NAME test_store COMMAND test_store)

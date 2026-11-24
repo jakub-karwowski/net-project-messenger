@@ -79,6 +79,10 @@ constexpr std::size_t kFrameHeaderSize = 8;
 // corrupt length fields that would otherwise trigger huge allocations.
 constexpr std::uint32_t kMaxPayloadSize = 16u * 1024u * 1024u;  // 16 MiB
 
+// The longest ChatMessage body that still fits in one frame: the payload also
+// holds conversation_id(8), sender_id(8) and the body length(4).
+constexpr std::size_t kMaxChatBodySize = kMaxPayloadSize - 20;
+
 enum class MessageType : std::uint8_t {
     Connect = 1,
     Message = 2,

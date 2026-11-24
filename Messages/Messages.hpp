@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <variant>
 #include <vector>
@@ -82,6 +83,47 @@ struct LinkSample {
 
 using ReleasedConnection = EpollConnectionPool::ReleasedConnection;
 
+// Stable lowercase names, used in logs and in the CLI's output.
+constexpr std::string_view to_string(DeliveryState s) noexcept {
+    switch (s) {
+        case DeliveryState::PendingSend: return "pending";
+        case DeliveryState::Sent: return "sent";
+        case DeliveryState::Failed: return "failed";
+        case DeliveryState::Received: return "received";
+    }
+    return "unknown";
+}
+
+constexpr std::string_view to_string(ConvStatus s) noexcept {
+    switch (s) {
+        case ConvStatus::New: return "new";
+        case ConvStatus::Dialing: return "dialing";
+        case ConvStatus::Connected: return "connected";
+        case ConvStatus::Disconnected: return "disconnected";
+        case ConvStatus::Failed: return "failed";
+    }
+    return "unknown";
+}
+
+constexpr std::string_view to_string(LinkDownReason r) noexcept {
+    switch (r) {
+        case LinkDownReason::PeerClosed: return "peer_closed";
+        case LinkDownReason::ReadTimedOut: return "read_timed_out";
+        case LinkDownReason::WriteTimedOut: return "write_timed_out";
+        case LinkDownReason::SocketError: return "socket_error";
+        case LinkDownReason::HandshakeFailed: return "handshake_failed";
+        case LinkDownReason::ProtocolError: return "protocol_error";
+        case LinkDownReason::Superseded: return "superseded";
+        case LinkDownReason::BalancerEvicted: return "evicted";
+        case LinkDownReason::Shutdown: return "shutdown";
+    }
+    return "unknown";
+}
+
+// Everything below the Store travels as values (wire::ConnectInfo,
+// wire::ConnectInfoAck, wire::ChatMessage). Only the thread that writes to a
+// connection encodes: the IO worker for the handshake, the Router for chat.
+
 // ---------------------------------------------------------------- Frontend inbox
 
 // from the input thread
@@ -123,9 +165,9 @@ struct QuitReq { ReqId req = 0; };
 // from Pt-i / Router (peer level)
 struct ChatIn { PeerId peer = kNoId; LinkId link = kNoId; wire::ChatMessage msg; };
 struct PeerHello { LinkId link = kNoId; wire::ConnectInfo info; wire::Endpoint remote; };
-struct DialDone { LinkId link = kNoId; PeerId peer = kNoId; wire::ConnectInfoAck ack; };
+struct DialDone { LinkId link = kNoId; PeerId peer = kNoId; wire::ConnectInfoAck ack; wire::Endpoint remote; };   // remote: the endpoint that answered
 struct PeerUp { PeerId peer = kNoId; LinkId link = kNoId; };
-struct PeerDown { PeerId peer = kNoId; LinkId link = kNoId; LinkDownReason why{}; };
+struct PeerDown { PeerId peer = kNoId; LinkId link = kNoId; LinkDownReason why{}; SocketError err = SocketError::Unknown; };   // a failed dial: every endpoint was tried
 struct SendResult { PeerId peer = kNoId; SendTag tag; bool ok = false; SocketError err = SocketError::Unknown; };
 struct RouterStopped {};
 
@@ -138,15 +180,17 @@ using StoreMsg = std::variant<SendText, DialReq, ReconnectReq, CloseReq, Subscri
 // from the Listener
 struct InboundAccepted { TcpConnection conn; };
 // from the Store
-struct RouteSend { PeerId peer = kNoId; SendTag tag; Bytes frame; };
-struct RouteDial { PeerId peer = kNoId; wire::Endpoint ep; Bytes hello_frame; };
-struct BindLink { LinkId link = kNoId; PeerId peer = kNoId; Bytes ack_frame; };
+struct RouteSend { PeerId peer = kNoId; SendTag tag; wire::ChatMessage msg; };   // the Router encodes
+// Connect to `peer`: the endpoints are tried in order until one completes the
+// handshake; the outcome is one DialDone or one PeerDown.
+struct RouteDial { PeerId peer = kNoId; std::vector<wire::Endpoint> endpoints; wire::ConnectInfo hello; };
+struct BindLink { LinkId link = kNoId; PeerId peer = kNoId; wire::ConnectInfoAck ack; };
 struct RejectLink { LinkId link = kNoId; };
 struct ClosePeer { PeerId peer = kNoId; };
 struct Shutdown { std::chrono::milliseconds grace{1000}; };
 // from Pt-i
 struct LinkHello { LinkId link = kNoId; wire::ConnectInfo info; };
-struct LinkAcked { LinkId link = kNoId; wire::ConnectInfoAck ack; };
+struct LinkAcked { LinkId link = kNoId; wire::ConnectInfoAck ack; wire::Endpoint remote; };
 struct LinkDown { LinkId link = kNoId; LinkDownReason why{}; SocketError err = SocketError::Unknown; };
 struct LinkReleased { LinkId link = kNoId; ReleasedConnection rc; wire::Decoder dec; };
 struct LinkAdopted { LinkId link = kNoId; PtId pt = 0; std::uint64_t pool_conn_id = 0; };
@@ -170,8 +214,10 @@ struct Adopt {
     LinkId link = kNoId; PeerId peer = kNoId; Role role{};
     TcpConnection conn; Bytes pending_tx; wire::Decoder dec; HandshakeState hs{};
 };
-struct Dial { LinkId link = kNoId; PeerId peer = kNoId; wire::Endpoint ep; Bytes hello_frame; };
-struct Bind { LinkId link = kNoId; PeerId peer = kNoId; Bytes ack_frame; };
+// One link, several attempts: the IO worker dials each endpoint in turn and
+// reports LinkAcked, or a single LinkDown after the last one failed.
+struct Dial { LinkId link = kNoId; PeerId peer = kNoId; std::vector<wire::Endpoint> endpoints; wire::ConnectInfo hello; };
+struct Bind { LinkId link = kNoId; PeerId peer = kNoId; wire::ConnectInfoAck ack; };
 struct Release { LinkId link = kNoId; };
 struct Close { LinkId link = kNoId; bool graceful = true; };
 struct Probe { std::uint64_t seq = 0; };

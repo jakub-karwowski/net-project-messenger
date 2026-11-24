@@ -31,6 +31,7 @@ says why.
 | D8 | Each conversation is identified by `conv_id` only | Adds a **`link_id`** (one per TCP connection, assigned by the Router, unchanged when the connection moves between Pt-i) | Pool connection ids are per pool and change on a move, and a link exists before its peer is known (during the handshake). |
 | D9 | Router/Pt-i tables are keyed by `conv_id` | **Below the Store everything is keyed by `peer_id`.** Conversations exist only in the Store and Frontend | A link connects to a peer, not to a conversation. With groups, one link carries several conversations and one conversation spans several links. Keeping conversations out of the Router means groups need no Router or Pt-i changes (§12.1). |
 | D10 | Render reads keys, interprets commands and draws | **Frontend = input thread + `CommandProcessor` + view.** Two frontends share the command layer: the TUI (Keyboard + `TuiView`) and a headless **agent CLI** (`LineReader` + `JsonlWriter`) with no keyboard listener and no rendering (§14) | Command handling becomes a pure, testable layer. The CLI lets scripts and agents drive real nodes end to end, without a TTY. |
+| D12 | (first version of this design) The Store encodes every frame and walks a peer's endpoints one dial at a time | **The Store hands down values and intent only.** `RouteDial` carries the ordered endpoint list and a `wire::ConnectInfo`; `BindLink` a `wire::ConnectInfoAck`; `RouteSend` a `wire::ChatMessage`. The thread that writes to the connection encodes: Pt-i for the handshake, the Router for chat. Pt-i tries the endpoints in turn within one link and reports one outcome | The Store stays at the level of identities and conversations; byte formats and connection attempts (timeouts, ordering, retries) live with the code that owns the sockets. Ids are still decided by the Store, as values. |
 | D11 | Requests from the UI are fire-and-forget | Every frontend request carries a **`ReqId`**; the Store answers each with exactly one `Reply` | An agent has to know which `conv` its `/dial` created and whether a command failed, without guessing from later events. |
 
 Everything else (thread set, ownership of PeerTable/ConvStore/ConnTable/LoadLog,
@@ -173,9 +174,9 @@ struct QuitReq    { ReqId req; };
 // from Pt-i / Router (peer level)
 struct ChatIn     { PeerId peer; LinkId link; wire::ChatMessage msg; };  // Pt-i, D3
 struct PeerHello  { LinkId link; wire::ConnectInfo info; wire::Endpoint remote; };
-struct DialDone   { LinkId link; PeerId peer; wire::ConnectInfoAck ack; };
+struct DialDone   { LinkId link; PeerId peer; wire::ConnectInfoAck ack; wire::Endpoint remote; };  // remote: the endpoint that answered
 struct PeerUp     { PeerId peer; LinkId link; };
-struct PeerDown   { PeerId peer; LinkId link; LinkDownReason why; };
+struct PeerDown   { PeerId peer; LinkId link; LinkDownReason why; SocketError err; };  // for a dial: after every endpoint failed
 struct SendResult { PeerId peer; SendTag tag; bool ok; SocketError err; };
 struct RouterStopped {};
 using StoreMsg = std::variant<SendText, DialReq, ReconnectReq, CloseReq, Subscribe,
@@ -185,15 +186,15 @@ using StoreMsg = std::variant<SendText, DialReq, ReconnectReq, CloseReq, Subscri
 
 // ---- Router inbox (peer level only, D9)
 struct InboundAccepted { TcpConnection conn; };   // Listener; conn.remote_endpoint() holds the peer address
-struct RouteSend   { PeerId peer; SendTag tag; std::vector<std::byte> frame; }; // Store, pre-encoded
-struct RouteDial   { PeerId peer; wire::Endpoint ep; std::vector<std::byte> hello_frame; };
-struct BindLink    { LinkId link; PeerId peer; std::vector<std::byte> ack_frame; };
+struct RouteSend   { PeerId peer; SendTag tag; wire::ChatMessage msg; };   // the Router encodes
+struct RouteDial   { PeerId peer; std::vector<wire::Endpoint> endpoints; wire::ConnectInfo hello; };  // tried in order
+struct BindLink    { LinkId link; PeerId peer; wire::ConnectInfoAck ack; };
 struct RejectLink  { LinkId link; };
 struct ClosePeer   { PeerId peer; };
 struct Shutdown    { std::chrono::milliseconds grace; };
 // from Pt-i (PtEvent)
 struct LinkHello   { LinkId link; wire::ConnectInfo info; };
-struct LinkAcked   { LinkId link; wire::ConnectInfoAck ack; };
+struct LinkAcked   { LinkId link; wire::ConnectInfoAck ack; wire::Endpoint remote; };
 struct LinkDown    { LinkId link; LinkDownReason why; SocketError err; };
 struct LinkReleased{ LinkId link; ReleasedConnection rc; wire::Decoder dec; };
 struct LinkAdopted { LinkId link; PtId pt; uint64_t pool_conn_id; };
@@ -209,8 +210,8 @@ using RouterMsg = std::variant<...all of the above...>;
 // ---- Pt-i command queue
 struct Adopt   { LinkId link; PeerId peer; Role role; TcpConnection conn;
                  std::vector<std::byte> pending_tx; wire::Decoder dec; HandshakeState hs; };
-struct Dial    { LinkId link; PeerId peer; wire::Endpoint ep; std::vector<std::byte> hello_frame; };
-struct Bind    { LinkId link; PeerId peer; std::vector<std::byte> ack_frame; };
+struct Dial    { LinkId link; PeerId peer; std::vector<wire::Endpoint> endpoints; wire::ConnectInfo hello; };
+struct Bind    { LinkId link; PeerId peer; wire::ConnectInfoAck ack; };
 struct Release { LinkId link; };
 struct Close   { LinkId link; bool graceful; };
 struct Probe   { uint64_t seq; };
@@ -234,7 +235,7 @@ using BalancerMsg = std::variant<PtReport, TopologyChanged, LinkGone, StopBalanc
 |---|---|---|---|
 | `FrontendMsg` | 88 | `MsgAppended` 80 | `MsgAppended` 80, `MsgStatus` 24 |
 | `StoreMsg` | 96 | `PeerHello` 88 | `ChatIn` 64, `SendResult` 32, `SendText` 48 |
-| `RouterMsg` | 184 | `LinkReleased` 176, `InboundAccepted` 96 | `RouteSend` 48 |
+| `RouterMsg` | 184 | `LinkReleased` 176, `InboundAccepted` 96 | `RouteSend` 72 |
 | `PtCommand` | 192 | `Adopt` 184 | none (commands are rare, D2) |
 | `BalancerMsg` | 64 | `PtReport` 56 | `PtReport` |
 | `LogRecord` | 72 | – | – |
@@ -275,12 +276,18 @@ static_assert(inbox_ok<FrontendMsg> && inbox_ok<StoreMsg> && inbox_ok<RouterMsg>
   instead of `std::queue`, which removes steady-state allocations from every
   inbox. Neither is done now.
 
-**Frame encoding rules.**
-- The Store encodes every frame (`wire::encode`): chat frames for `RouteSend`, and
-  the handshake frames `hello_frame` and `ack_frame`, because the Store owns the
-  ids.
-- The Router and Pt-i only ever handle bytes. Pt-i decodes inbound frames and
-  hands the Store the decoded `wire::ChatMessage` without interpreting it.
+**Frame encoding rules (D12).**
+- The Store never handles bytes. It decides every id and puts them into values:
+  `wire::ConnectInfo` (in `RouteDial`), `wire::ConnectInfoAck` (in `BindLink`),
+  `wire::ChatMessage` (in `RouteSend`).
+- Only the thread that writes to a connection encodes:
+  - Pt-i encodes the hello (when a dial connects) and the Ack (on `Bind`);
+  - the Router encodes chat, because it calls `pool->send()` itself (D2).
+- Pt-i decodes inbound frames and hands the Store the decoded
+  `wire::ChatMessage` without interpreting it.
+- The Store refuses an over-long message before storing it, using
+  `wire::kMaxChatBodySize` (`kMaxPayloadSize` minus the 20 bytes of ids and
+  length), so an encode below it cannot fail on size.
 
 ---
 
@@ -327,11 +334,11 @@ from `{Normal, Moving, Closed}` to the five states above. The Router never sees 
 | Message | Action |
 |---|---|
 | `InboundAccepted` | Over `max_links`: drop the connection and log. Otherwise create a Link (`Handshaking`, Inbound), choose a pt, push `Adopt{role=Inbound, hs=AwaitConnect}` and call `interrupt()`. |
-| `RouteDial` | If the peer already has a live link: reply `PeerUp` (idempotent). Otherwise create a Link (`Dialing`), choose a pt, push `Dial`. |
+| `RouteDial` | If the peer already has a live link: reply `PeerUp` (idempotent). Otherwise create a Link (`Dialing`), choose a pt, push `Dial{endpoints, hello}`. A final `LinkDown` for a dialing link becomes `PeerDown{why, err}` to the Store. `ClosePeer` for a dialing peer cancels the dial. |
 | `LinkHello` | Forward to the Store as `PeerHello`. |
-| `BindLink` | If the peer already has a different live link, resolve it with the duplicate-link rule (§7.4). Set `peer_to_link_`, push `Bind{ack_frame}`, set `Connected`, send `PeerUp` to the Store. |
-| `LinkAcked` | Outbound handshake done: `Connected`, `peer_to_link_`, `DialDone` to the Store. |
-| `RouteSend` | Look up `peer_to_link_`. `Connected`: call `pool->send()` and return `SendResult` from its result. `Moving`: park the send. Missing or other states: `SendResult{ok=false, ConnectionNotFound}`. |
+| `BindLink` | If the peer already has a different live link, resolve it with the duplicate-link rule (§7.4). Set `peer_to_link_`, push `Bind{ack}`, set `Connected`, send `PeerUp` to the Store. |
+| `LinkAcked` | Outbound handshake done: `Connected`, `peer_to_link_`, `DialDone{remote}` to the Store. |
+| `RouteSend` | Look up `peer_to_link_`. `Connected`: encode `msg`, call `pool->send()` and return `SendResult` from its result. `Moving`: park the send (still as a value). Missing or other states: `SendResult{ok=false, ConnectionNotFound}`. |
 | `LinkDown` | Erase the link. If it was bound, send `PeerDown` to the Store and `LinkGone` to the Balancer. Fail parked sends. |
 | `MoveLink` | Only allowed when `Connected` and `to` is alive and not retiring. Set `Moving`, push `Release` to the source pt. |
 | `LinkReleased` | Push `Adopt{conn, pending_tx, dec, hs=Established}` to the target pt. |
@@ -352,6 +359,9 @@ struct LinkState {
     LinkId link; PeerId peer; Role role;
     enum class Hs { Connecting, AwaitConnect, AwaitAck, Established } hs;
     wire::Decoder dec;
+    wire::ConnectInfo hello;                  // outbound: encoded and sent once connected
+    std::vector<wire::Endpoint> to_try;       // outbound: endpoints not attempted yet
+    wire::Endpoint dialing;                   // outbound: the endpoint being attempted
     uint64_t rx_bytes, tx_bytes, rx_frames, tx_frames;   // since the last report
 };
 std::unordered_map<uint64_t /*pool_conn_id*/, LinkState> by_conn_;
@@ -366,7 +376,8 @@ for (;;) {
     else switch (r.error())
       {0, Interrupted}                       -> drain cmds.try_pop() until empty
       {0, Stopped}                           -> report PtStopped, return
-      {id, Connected}                        -> dial finished: send hello, hs = AwaitAck   (new event, §8.1)
+      {id, Connected}                        -> dial finished: encode + send hello, hs = AwaitAck   (new event, §8.1)
+      {id, err} while Connecting             -> next endpoint in to_try (same link_id); none left: LinkDown{SocketError, err}
       {id, err}                              -> LinkDown{link, map(err)}, erase
 }
 ```
@@ -391,9 +402,13 @@ the peer is set, so no reply can arrive before the peer is known.
 **Commands**
 - `Adopt`: `pool.connection_add(conn, timeouts_for(hs), pending_tx)`, record the
   state, send `LinkAdopted` → Router.
-- `Dial`: `pool.connection_dial(ep, connect_timeout)`. The hello is sent when
-  `Connected` arrives.
-- `Bind`: set the peer, `pool.send(ack_frame)`, hs = Established,
+- `Dial`: keep `hello` and the endpoint list, then
+  `pool.connection_dial(endpoints[0], connect_timeout)`. A failed attempt moves to
+  the next endpoint under the same `link_id` (a new pool connection id each
+  time). The hello is encoded and sent when `Connected` arrives; `LinkAcked`
+  carries the endpoint that answered. Only when every endpoint has failed does
+  the Router get `LinkDown`, with the last attempt's `SocketError`.
+- `Bind`: set the peer, encode and `pool.send()` the Ack, hs = Established,
   `set_timeouts(established)`.
 - `Release`: `pool.connection_release(id)` returns the `TcpConnection` and unsent
   TX. Move the decoder out and send `LinkReleased` → Router. This runs on the Pt-i
@@ -470,22 +485,26 @@ This replaces the sketch in [StoreWorker.hpp](StoreWorker/StoreWorker.hpp).
    reconnecting: reuse the record.
 2. Otherwise mint a `peer_id` and create the Peer and its direct conversation.
 3. Set `host_id = info.peer_id` and `endpoints = info.endpoints`.
-4. Reply `BindLink{link, peer_id, encode(Ack{peer_id, host_id})}`.
+4. Reply `BindLink{link, peer_id, ConnectInfoAck{peer_id, host_id}}`.
 5. Garbage (`info.peer_id == 0`) gets `RejectLink`.
 
 **Dial (`DialReq` / `ReconnectReq`)**
 - `DialReq` creates a Peer (fresh `peer_id`, `host_id = 0`) and its direct
   conversation. `ReconnectReq` resolves the conversation to its peer, or to its
   members for a group.
-- `hello = ConnectInfo{peer_id, host_id, my_endpoints}`, then
-  `RouteDial{peer, ep, encode(hello)}`. Try `endpoints` in order.
-- `DialDone`: `host_id = ack.peer_id`, then check `ack.ack_peer_id == peer_id`
-  (log a mismatch), then mark the peer Up.
+- `RouteDial{peer, endpoints, ConnectInfo{peer_id, host_id, my_endpoints}}`, one
+  per dial. The list is the requested endpoint first (for `DialReq`), then the
+  peer's other dialable endpoints in the order it advertised them. Port 0 is
+  never dialled. The Store does not retry: the Router answers with one
+  `DialDone` or one `PeerDown`.
+- `DialDone`: `host_id = ack.peer_id`, `remote = the endpoint that answered`,
+  then check `ack.ack_peer_id == peer_id` (log a mismatch), then mark the peer
+  Up.
 
 **Send**
 1. Append `{PendingSend}` to the conversation.
 2. For each member, send
-   `RouteSend{member, {conv, id}, encode(ChatMessage{group_id, member.host_id, body})}`.
+   `RouteSend{member, {conv, id}, ChatMessage{group_id, member.host_id, body}}`.
    Direct conversations have exactly one member.
 3. `SendResult` moves the message to `Sent` or `Failed`. With several members the
    state becomes per member; see §12.1.
@@ -499,6 +518,40 @@ This replaces the sketch in [StoreWorker.hpp](StoreWorker/StoreWorker.hpp).
 `commit_message(ConvId, const StoredMessage&)`. Each updates the in-memory table
 and then calls the `Persistence` interface (§12.2). Today that interface is a
 no-op.
+
+**Decisions made in the implementation (step 3)**
+- **`DialReq` for a known endpoint** (one a peer advertised, or the address of its
+  last link) reuses that peer and its conversation instead of creating a second
+  one. It dials only if the peer is down; the `Reply` carries the existing conv.
+- **A send that cannot leave is refused, not stored:** unknown conv, empty body,
+  a body over `wire::kMaxChatBodySize` ("message too large"), or a member not
+  `Up` ("not connected"). Only an
+  accepted send is appended as `PendingSend`.
+- **While quitting** every frontend request except `QuitReq` gets
+  `Reply{ok = false, "shutting down"}`, and inbound hellos get `RejectLink`.
+- **Status mapping** for a direct conv, from its peer: `Up` → Connected;
+  `Dialing` / `Handshaking` → Dialing; `Down` → Failed if the last attempt
+  failed, else Disconnected if it was ever up, else New. Loaded peers count as
+  "ever up".
+- **One dial, one outcome:** the Store sends every dialable endpoint in one
+  `RouteDial` and the conv stays Dialing until `DialDone` (Connected) or
+  `PeerDown` (Failed, with `why` and the socket error as detail, for example
+  `socket_error: Connection refused`). A peer without a dialable endpoint gets
+  "no known endpoint" on `ReconnectReq`.
+- **Stale link events:** a `PeerDown` whose link is not the peer's current link
+  (it was superseded by a reconnect) is ignored. While dialing the Store does not
+  know the link id yet, so any `PeerDown` for the peer counts.
+- **A `ChatIn` while `Dialing` or `Handshaking` marks the peer up.** It can
+  overtake `PeerUp` and `DialDone`, which travel through the Router.
+- **Echoed messages** are sent with an empty `SendTag` (`conv = 0`), so their
+  `SendResult` is recognised and ignored.
+- **`SetDefaultSubscription`** replaces the default and every per-conv setting.
+  With `inbound = Forward` it sends a snapshot of every existing conversation.
+- **Commits** happen only when a persisted field changes: a new peer or conv,
+  `host_id` / `endpoints` / `remote`, `read_upto`, a new message, or a delivery
+  state. Link state changes are transient and never committed.
+- **`PeerTable` has no `by_link_` index.** Every peer-level message names its
+  peer, except `PeerHello`, which creates or recognises the peer itself.
 
 **Subscriptions (§6.3)** decide what goes to Frontend. The current
 `SubscriptionManager` enums (`Ignore`/`Notify`/`Forward`/`Echo`) stay. They are
@@ -687,13 +740,13 @@ still `Sent` at that point stay `Sent`; acks (§8.4) would tighten this.
 8. Router → Balancer: `TopologyChanged`/link known at the next report
 
 ### 7.4 Dial
-1. Frontend → Store: `DialReq`/`ReconnectReq` [peer `Dialing`, build hello]
-2. Store → Router: `RouteDial` [new Link `Dialing`, choose pt]
-3. Router → Pt-i: `Dial` [`pool.connection_dial`, non-blocking]
-4. Pt-i: `Connected` → send hello, `AwaitAck`. Failure → Router: `LinkDown{SocketError: ConnectionRefused|ConnectTimedOut}`
-5. Pt-i → Router: `LinkAcked` [`Connected`]
-6. Router → Store: `DialDone` [record `host_id`, peer Up] → Frontend: `ConvState`.
-   On failure: `PeerDown` → `ConvStatus::Failed`.
+1. Frontend → Store: `DialReq`/`ReconnectReq` [peer `Dialing`; ordered endpoint list and `ConnectInfo` as values]
+2. Store → Router: `RouteDial{endpoints, hello}` [new Link `Dialing`, choose pt]
+3. Router → Pt-i: `Dial{endpoints, hello}` [`pool.connection_dial(endpoints[0])`, non-blocking]
+4. Pt-i: `Connected` → encode and send the hello, `AwaitAck`. An attempt fails (`ConnectionRefused`, `ConnectTimedOut`, ...) → dial the next endpoint, same link. All failed → Router: `LinkDown{SocketError, err}`
+5. Pt-i → Router: `LinkAcked{ack, remote}` [`Connected`]
+6. Router → Store: `DialDone{remote}` [record `host_id` and `remote`, peer Up] → Frontend: `ConvState`.
+   On failure: `PeerDown{why, err}` → `ConvStatus::Failed`.
 
 **Duplicate links** (simultaneous dial, or a reconnect while the old link is not
 yet known to be dead). The Router learns that one peer has two live links.
@@ -856,11 +909,11 @@ The pool wakes `receive()` through a `WakeupEvent` (§8.2).
 Common/        ThreadQueue.hpp  WakeupEvent.hpp/.cpp (own target; TcpSocket uses it)  Ids.hpp (IdMinter)
                Logger.hpp/.cpp  Worker.hpp/.cpp (§9.1)  Supervisor.hpp/.cpp (§9.2)  AppConfig.hpp
                No networking: Common does not depend on TcpSocket.
-Messages/      Messages.hpp (header-only; depends on Common, TcpSocket, Wire.hpp)
+Messages/      Messages.hpp (+ a one-line Messages.cpp that compiles it alone; depends on Common, TcpSocket, Wire.hpp)
 TcpSocket/     (existing) + dial/release/interrupt
 TerminalUI/    cell-based rendering (§13): Unicode, Style, TextLayout, Canvas, Element::draw; + StatusBar element
 Wire.hpp       (existing)
-StoreWorker/   StoreWorker.hpp/.cpp  PeerTable.hpp/.cpp  ConvStore.hpp/.cpp
+StoreWorker/   StoreWorker.hpp/.cpp  PeerTable.hpp  ConvStore.hpp
                Subscriptions.hpp  Persistence.hpp (interface + NullPersistence)
 RouterWorker/  RouterWorker.hpp/.cpp  AssignmentPolicy.hpp
 IoWorker/      IoWorker.hpp/.cpp
@@ -1106,8 +1159,8 @@ sleep inside `_exit` otherwise breaks the timing checks of the hard-exit cases.
 |---|---|---|
 | 1 ✅ | Pool extensions (§8.1); `WakeupEvent`, `TcpListener::stop`, `remote_endpoint` (§8.2); `ThreadQueue` timers (§8.3) | `test_pool`: interrupt coalescing, dial ok/refused/timeout, release then add on a second pool with no byte loss, `set_timeouts`, stats. `test_listener`: stop (blocked, permanent, beats a queued client), `TooManyOpenFiles`, remote address on both sides and across moves. `test_queue`: FIFO/shutdown, tick timing, ticks first, no burst, several timers, cancel, move-only inbox |
 | 2 ✅ | `Common/`: `ThreadQueue.hpp` (moved), `WakeupEvent` (moved out of TcpSocket into its own target), `Ids.hpp` (`IdMinter`), `Logger`, `Worker.hpp`, `Supervisor`. `Messages/Messages.hpp` (every inbox of §4, in namespace `msg`, size budget as `static_assert`s) | `test_ids` 19 checks (id uniqueness, `reserve`, messages through a queue, budget); `test_logger` 24 (level filter skips formatting, escaping incl. UTF-8 C1, line format, 4 threads × 2000 records in per-thread order, drain on graceful shutdown); `test_worker` 21 (dispatch, `done()`, `drain`, ticks, naming, stop once with 8 callers, exception → `fatal`, stop for inbox / pool / listener / poll); `test_supervisor` 27 (every row of the §9.2 table, each scenario in its own child process). Clean under TSan and ASan+UBSan |
-| 3 | Store, single-threaded and fed by its inbox, with `NullPersistence` and a recording fake | handshake recognition (new / reconnect / bad id), dial flow, send-status transitions, `ChatIn` resolution (direct, unknown group id, sender mismatch), subscriptions, `SetDefaultSubscription`, `CloseReq`; exactly one `Reply` per `ReqId != 0`, on success and on every failure path; the fake sees one commit per mutation |
-| 4 | Pt-i alone, driven by a fake Router queue | inbound and outbound handshake, protocol errors, handshake timeout, release/adopt of a decoder holding half a frame |
+| 3 ✅ | Store, single-threaded and fed by its inbox, with `NullPersistence` and a recording fake | `test_store` 90 checks: dial (hello contents, Reply before events, known endpoint reuses its conv and goes first), dial failure → Failed with the socket error and no retry, reconnect re-presents names and sends every dialable endpoint in one `RouteDial` (port 0 left out), size limit at `wire::kMaxChatBodySize`, inbound hello (new / known / unknown assigned id / garbage → `RejectLink`), stale `PeerDown` of a superseded link ignored, send (frame contents, pending → sent / failed, refusals not stored), outbound Ignore, receive with Notify / Forward / Ignore, snapshot marks read, drops (sender mismatch, unknown peer, unknown group), chat overtaking `PeerUp`, echo, default subscription, close, quit (refusals, `RejectLink`, flush, `ShutdownDone`), exactly one `Reply` per `ReqId`, load from persistence (pending → failed, names re-presented, no id collisions). Clean under ASan+UBSan |
+| 4 | Pt-i alone, driven by a fake Router queue | inbound and outbound handshake (hello and Ack encoded by Pt-i), a dial over several endpoints (first refused, second answers: one link id, `LinkAcked.remote` = the second; all refused: one `LinkDown` with the last error), protocol errors, handshake timeout, release/adopt of a decoder holding half a frame |
 | 5 | Router with N Pt-i, without the Balancer (static round-robin policy) | two in-process nodes over loopback: dial, chat, disconnect, reconnect keeps the conv, simultaneous dial converges on one link on both sides |
 | 6 | Command layer and agent CLI (§14): `Commands`, `CommandProcessor`, `LineReader`, `JsonlWriter`, `App/main --cli` | `test_commands` (every command, bad arguments, active conv vs explicit `/send`, `ReqId` = line number); `test_jsonl` (escaping of controls and invalid UTF-8, hex ids, one object per line); `test_cli_e2e`: two `node --cli` processes over loopback, driven through pipes: `ready` with the bound port, dial, chat, `/close`, reconnect keeps the conv, stdin EOF → `shutdown_done` and exit 0 |
 | 7 | Balancer `decide()` as a pure function | policy weights, stall detection, move hysteresis, scale in/out |

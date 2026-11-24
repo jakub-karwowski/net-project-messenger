@@ -48,29 +48,6 @@ namespace {
         }
     }
 
-    constexpr const char* to_string(SocketError err) noexcept {
-        switch (err) {
-            case SocketError::AddressInUse:      return "Address already in use";
-            case SocketError::ConnectionRefused: return "Connection refused";
-            case SocketError::ConnectionReset:   return "Connection reset by peer";
-            case SocketError::BrokenPipe:        return "Broken pipe";
-            case SocketError::WouldBlock:        return "Operation would block";
-            case SocketError::Interrupted:       return "Operation interrupted";
-            case SocketError::InvalidAddress:    return "Invalid address";
-            case SocketError::ConnectionClosed:  return "Connection closed by peer";
-            case SocketError::ConnectionNotFound: return "Connection not found in pool";
-            case SocketError::BufferFull:        return "Transmit buffer full";
-            case SocketError::ReadTimedOut:      return "Nothing received within the read timeout";
-            case SocketError::WriteTimedOut:     return "Transmit buffer not flushed within the write timeout";
-            case SocketError::ConnectTimedOut:   return "Connection not established within the connect timeout";
-            case SocketError::HostUnreachable:   return "Host or network unreachable";
-            case SocketError::NotConnected:      return "Connection is still being established";
-            case SocketError::TooManyOpenFiles:  return "Too many open files";
-            case SocketError::Stopped:           return "Stopped";
-            default:                             return "Unknown socket error";
-        }
-    }
-
     // A retryable failure means the same call may succeed if attempted again.
     constexpr bool is_retryable(SocketError err) noexcept {
         return err == SocketError::WouldBlock || err == SocketError::Interrupted;
