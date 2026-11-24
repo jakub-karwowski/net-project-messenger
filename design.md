@@ -32,6 +32,7 @@ says why.
 | D9 | Router/Pt-i tables are keyed by `conv_id` | **Below the Store everything is keyed by `peer_id`.** Conversations exist only in the Store and Frontend | A link connects to a peer, not to a conversation. With groups, one link carries several conversations and one conversation spans several links. Keeping conversations out of the Router means groups need no Router or Pt-i changes (§12.1). |
 | D10 | Render reads keys, interprets commands and draws | **Frontend = input thread + `CommandProcessor` + view.** Two frontends share the command layer: the TUI (Keyboard + `TuiView`) and a headless **agent CLI** (`LineReader` + `JsonlWriter`) with no keyboard listener and no rendering (§14) | Command handling becomes a pure, testable layer. The CLI lets scripts and agents drive real nodes end to end, without a TTY. |
 | D12 | (first version of this design) The Store encodes every frame and walks a peer's endpoints one dial at a time | **The Store hands down values and intent only.** `RouteDial` carries the ordered endpoint list and a `wire::ConnectInfo`; `BindLink` a `wire::ConnectInfoAck`; `RouteSend` a `wire::ChatMessage`. The thread that writes to the connection encodes: Pt-i for the handshake, the Router for chat. Pt-i tries the endpoints in turn within one link and reports one outcome | The Store stays at the level of identities and conversations; byte formats and connection attempts (timeouts, ordering, retries) live with the code that owns the sockets. Ids are still decided by the Store, as values. |
+| D13 | (first version of this design) The Store filters `PeerDown`s of links it no longer uses | **The Router reports peers, not links.** `PeerUp` / `DialDone` name the link now in use; `PeerDown` means the peer has no live link and no dial in progress. A link the Router drops as a duplicate (`Superseded`, `RejectLink`) is never reported | With duplicate links (reconnect, simultaneous dial) the Store cannot tell from link ids alone which one survives: keeping our dial and dropping the inbound link, then the dial failing, left it waiting forever. The Router is the one that decides, so it is the one that reports. |
 | D11 | Requests from the UI are fire-and-forget | Every frontend request carries a **`ReqId`**; the Store answers each with exactly one `Reply` | An agent has to know which `conv` its `/dial` created and whether a command failed, without guessing from later events. |
 
 Everything else (thread set, ownership of PeerTable/ConvStore/ConnTable/LoadLog,
@@ -194,7 +195,7 @@ struct ClosePeer   { PeerId peer; };
 struct Shutdown    { std::chrono::milliseconds grace; };
 // from Pt-i (PtEvent)
 struct LinkHello   { LinkId link; wire::ConnectInfo info; };
-struct LinkAcked   { LinkId link; wire::ConnectInfoAck ack; wire::Endpoint remote; };
+struct LinkAcked   { LinkId link; wire::ConnectInfoAck ack; wire::Endpoint remote; uint64_t pool_conn_id; };  // the connection the dial ended on
 struct LinkDown    { LinkId link; LinkDownReason why; SocketError err; };
 struct LinkReleased{ LinkId link; ReleasedConnection rc; wire::Decoder dec; };
 struct LinkAdopted { LinkId link; PtId pt; uint64_t pool_conn_id; };
@@ -298,21 +299,28 @@ static_assert(inbox_ok<FrontendMsg> && inbox_ok<StoreMsg> && inbox_ok<RouterMsg>
 **State**
 ```cpp
 struct Link {
-    LinkId id; PeerId peer;            // 0 while handshaking
-    PtId pt; uint64_t pool_conn_id;    // 0 while Adopt/Dial is in flight
+    LinkId id; PeerId peer;            // 0 for an inbound link until it is bound
+    PtId pt; uint64_t pool_conn_id;    // pt: the target while moving; conn: 0 until adopted / acked
     enum class Status { Dialing, Handshaking, Connected, Moving, Closing } status;
     Role role;                         // Inbound | Outbound
+    wire::Endpoint remote;             // inbound: where it came from (for PeerHello)
+    bool quiet;                        // dropped as a duplicate: never reported (D13)
+    bool ever_connected;               // LinkGone to the Balancer only for these
+    Clock::time_point since, connected_at;
     std::deque<RouteSend> parked;      // sends that arrived while Moving
-    Clock::time_point since;
+    std::optional<Close> close_after_move;   // a close requested while Moving
 };
+struct PeerLinks { LinkId current; LinkId dialing; };   // the Router's view of a peer
 struct PtHandle {
-    PtId id; std::thread thread;
+    PtId id;
     std::unique_ptr<EpollConnectionPool> pool;      // Router calls pool->send()
     std::unique_ptr<ThreadQueue<PtCommand>> cmds;   // + pool->interrupt() after push
-    std::unordered_set<LinkId> links; bool retiring = false;
+    std::unique_ptr<IoWorker> worker;
+    std::unordered_set<LinkId> links; bool retiring, stopping, stopped;
+    std::unique_ptr<WorkerThread> thread;           // last: stopped and joined first
 };
 std::unordered_map<LinkId, Link> links_;
-std::unordered_map<PeerId, LinkId> peer_to_link_;   // at most one live link per peer
+std::unordered_map<PeerId, PeerLinks> peers_;
 std::map<PtId, PtHandle> pts_;
 AssignmentPolicy policy_;                            // plain struct, no mutex (D6)
 ```
@@ -335,21 +343,27 @@ from `{Normal, Moving, Closed}` to the five states above. The Router never sees 
 |---|---|
 | `InboundAccepted` | Over `max_links`: drop the connection and log. Otherwise create a Link (`Handshaking`, Inbound), choose a pt, push `Adopt{role=Inbound, hs=AwaitConnect}` and call `interrupt()`. |
 | `RouteDial` | If the peer already has a live link: reply `PeerUp` (idempotent). Otherwise create a Link (`Dialing`), choose a pt, push `Dial{endpoints, hello}`. A final `LinkDown` for a dialing link becomes `PeerDown{why, err}` to the Store. `ClosePeer` for a dialing peer cancels the dial. |
-| `LinkHello` | Forward to the Store as `PeerHello`. |
-| `BindLink` | If the peer already has a different live link, resolve it with the duplicate-link rule (§7.4). Set `peer_to_link_`, push `Bind{ack}`, set `Connected`, send `PeerUp` to the Store. |
-| `LinkAcked` | Outbound handshake done: `Connected`, `peer_to_link_`, `DialDone{remote}` to the Store. |
+| `LinkHello` | Forward to the Store as `PeerHello{link, info, remote}`. |
+| `BindLink` | The link died meanwhile: `PeerDown{HandshakeFailed}` to the Store, unless the peer has a current link or a dial. Otherwise resolve duplicates with the rule in §7.4 (the loser is closed quietly), then `current = link`, push `Bind{ack}`, `Connected`, `PeerUp` to the Store. |
+| `RejectLink` | Close the handshaking link quietly. |
+| `LinkAcked` | Outbound handshake done: record `pool_conn_id`, `Connected`, `current = link`, `DialDone{remote}` to the Store. |
 | `RouteSend` | Look up `peer_to_link_`. `Connected`: encode `msg`, call `pool->send()` and return `SendResult` from its result. `Moving`: park the send (still as a value). Missing or other states: `SendResult{ok=false, ConnectionNotFound}`. |
-| `LinkDown` | Erase the link. If it was bound, send `PeerDown` to the Store and `LinkGone` to the Balancer. Fail parked sends. |
+| `LinkDown` | Erase the link, fail parked sends, `LinkGone` to the Balancer if it was ever connected. If it was the peer's current link or dial, and the peer has neither left, and it is not quiet, and the Router is not stopping: `PeerDown{why, err}` to the Store. |
 | `MoveLink` | Only allowed when `Connected` and `to` is alive and not retiring. Set `Moving`, push `Release` to the source pt. |
 | `LinkReleased` | Push `Adopt{conn, pending_tx, dec, hs=Established}` to the target pt. |
 | `LinkAdopted` | Update pt and `pool_conn_id`, go back to `Connected`, flush parked sends in order. |
-| `EvictLink` / `ClosePeer` | Push `Close{graceful=true}`. The final state arrives via `LinkDown`. |
-| `SpawnPt` / `RetirePt` | Spawn: create pool, queue and thread, send `TopologyChanged`. Retire: mark it retiring, `MoveLink` every link elsewhere, then `Stop`. |
+| `EvictLink` / `ClosePeer` | Push `Close{graceful=true, why}` (`ClosePeer` also closes a dial in progress). The final state arrives via `LinkDown`. `ClosePeer` for a peer with nothing open answers `PeerDown{PeerClosed}` at once. A close of a link that is moving waits until the move completes. |
+| `SpawnPt` / `RetirePt` | Spawn: create pool, queue and thread, send `TopologyChanged{added}`. Retire (refused when no other usable pt exists): mark it retiring, `MoveLink` every connected link elsewhere; once it holds no link, `Stop`; on its `PtStopped`, join, erase and `TopologyChanged{removed}`. |
+| `PtStopped` | Join the thread. Links still recorded there are gone (`Shutdown`). Outside a shutdown the pt is erased, and when none is left a new one is started. During a shutdown: `RouterStopped` once every pt has stopped. |
 | `ProbeAll` | Push `Probe{seq}` to every pt. |
 | `Shutdown` | §7.8. |
 
-**Invariant.** Only the Router changes `Link::status`. A Pt-i reports facts; the
-Router decides.
+**Invariants.**
+- Only the Router changes `Link::status`. A Pt-i reports facts; the Router
+  decides.
+- Per peer, at most one link is in use (`current`) and one dial is in progress.
+- The Store hears about peers, not links (D13).
+- `run()` ends by stopping and joining every IO worker it started (§9.1, rule 4).
 
 ### 5.2 Pt-i, the IO worker (`IoWorker/`)
 
@@ -559,9 +573,10 @@ no-op.
   `PeerDown` (Failed, with `why` and the socket error as detail, for example
   `socket_error: Connection refused`). A peer without a dialable endpoint gets
   "no known endpoint" on `ReconnectReq`.
-- **Stale link events:** a `PeerDown` whose link is not the peer's current link
-  (it was superseded by a reconnect) is ignored. While dialing the Store does not
-  know the link id yet, so any `PeerDown` for the peer counts.
+- **Peer-level reports (D13):** `PeerDown` is taken at face value; the Router never
+  reports a link it dropped as a duplicate. A hello from a peer that is already up
+  leaves it up (no status event); the Router's `PeerUp` names the link that
+  survives. A dial closed on purpose (`PeerClosed`) is not shown as Failed.
 - **A `ChatIn` while `Dialing` or `Handshaking` marks the peer up.** It can
   overtake `PeerUp` and `DialDone`, which travel through the Router.
 - **Echoed messages** are sent with an empty `SendTag` (`conv = 0`), so their
@@ -773,16 +788,24 @@ still `Sent` at that point stay `Sent`; acks (§8.4) would tighten this.
 yet known to be dead). The Router learns that one peer has two live links.
 
 - If the old link is from an earlier session (it was `Connected` before the new
-  one started its handshake): keep the **new** link and close the old one with
-  `Superseded`. The peer has evidently reconnected.
+  one started its handshake), or it is also inbound: keep the **new** link and
+  close the old one with `Superseded`. The peer has evidently reconnected.
 - If both links are in their handshakes at the same time (a simultaneous dial):
   both sides must keep the *same* TCP connection. Rule: **keep the link that the
   side with the numerically larger `(peer_id, host_id)` initiated.**
   - Each node compares the pair as it sees it: `(our name for them, their name for
     us)`. The other node sees the same two values swapped, so both nodes reach the
     same decision.
-  - This needs the `host_id`, so on an inbound link the decision waits for
-    `PeerHello`, and on an outbound link it waits for `LinkAcked`.
+  - This needs the `host_id`: the Router decides at `BindLink`, using the Ack the
+    Store built (`ack_peer_id` is the peer's name for us). The competitor is our
+    dial (still in progress), or our dial that was acked after the inbound
+    handshake started.
+  - The loser is closed quietly (D13): the Store hears only about the survivor.
+    When our dial wins, the Store, which has just bound the inbound hello, waits
+    for that dial's `DialDone` or `PeerDown`.
+  - The two pairs are equal only if both nodes picked the same 64-bit id for each
+    other; then both keep the other's link and both links close. Not handled
+    (probability 2^-64): the next reconnect resolves it.
 - A simultaneous **first** dial cannot be detected this way. Neither side has
   named the other yet (`assigned_peer_id = 0`), so each side's inbound hello
   creates a second Peer. This is accepted: the user sees two conversations with
@@ -1185,7 +1208,7 @@ sleep inside `_exit` otherwise breaks the timing checks of the hard-exit cases.
 | 2 ✅ | `Common/`: `ThreadQueue.hpp` (moved), `WakeupEvent` (moved out of TcpSocket into its own target), `Ids.hpp` (`IdMinter`), `Logger`, `Worker.hpp`, `Supervisor`. `Messages/Messages.hpp` (every inbox of §4, in namespace `msg`, size budget as `static_assert`s) | `test_ids` 19 checks (id uniqueness, `reserve`, messages through a queue, budget); `test_logger` 24 (level filter skips formatting, escaping incl. UTF-8 C1, line format, 4 threads × 2000 records in per-thread order, drain on graceful shutdown); `test_worker` 21 (dispatch, `done()`, `drain`, ticks, naming, stop once with 8 callers, exception → `fatal`, stop for inbox / pool / listener / poll); `test_supervisor` 27 (every row of the §9.2 table, each scenario in its own child process). Clean under TSan and ASan+UBSan |
 | 3 ✅ | Store, single-threaded and fed by its inbox, with `NullPersistence` and a recording fake | `test_store` 90 checks: dial (hello contents, Reply before events, known endpoint reuses its conv and goes first), dial failure → Failed with the socket error and no retry, reconnect re-presents names and sends every dialable endpoint in one `RouteDial` (port 0 left out), size limit at `wire::kMaxChatBodySize`, inbound hello (new / known / unknown assigned id / garbage → `RejectLink`), stale `PeerDown` of a superseded link ignored, send (frame contents, pending → sent / failed, refusals not stored), outbound Ignore, receive with Notify / Forward / Ignore, snapshot marks read, drops (sender mismatch, unknown peer, unknown group), chat overtaking `PeerUp`, echo, default subscription, close, quit (refusals, `RejectLink`, flush, `ShutdownDone`), exactly one `Reply` per `ReqId`, load from persistence (pending → failed, names re-presented, no id collisions). Clean under ASan+UBSan |
 | 4 ✅ | Pt-i (`IoWorker/`), plus `receive(deadline)` and `connection_count()` in the pool | `test_io_worker` 68 checks, over loopback with the test as Router and as remote peer: inbound handshake (hello up, Ack encoded and sent, chat straight to the Store), outbound dial (hello encoded and sent, `LinkAcked.remote`), a dial over an invalid, a refused and a good endpoint under one link id, all refused → one `LinkDown` with the last error, no endpoints, handshake timeout, chat before hello / before `Bind` → `ProtocolError`, 10 unknown-type frames skipped, malformed frames over the limit → `ProtocolError`, release on A + adopt on B with half a frame in the decoder (message arrives whole on B), probe counters and reset, close with a reason, peer close, stop with nothing to flush, stop that flushes 1 MiB before the deadline, stop that hits the deadline, `pool.stop()`. `test_pool` +2 tests (97 checks). 20 repeated runs without a failure; clean under TSan and ASan+UBSan |
-| 5 | Router with N Pt-i, without the Balancer (static round-robin policy) | two in-process nodes over loopback: dial, chat, disconnect, reconnect keeps the conv, simultaneous dial converges on one link on both sides |
+| 5 ✅ | Router with N Pt-i, without the Balancer (own placement), and the Listener | `test_router` 34 checks, two complete nodes in one process (Store, Router + IO workers, Listener on their own threads) over loopback: dial and chat both ways, close and reconnect from either side keep the conversations, simultaneous reconnect converges on one link on both sides (10 rounds), a refused dial, retiring the worker that holds the link while 50 messages flow (all arrive in order, worker stops, traffic continues), quit (`ShutdownDone`, the other side sees it go). `test_store` +3 (peer-level contract), `test_io_worker` +2 (`pool_conn_id`). 20 runs stable; clean under TSan and ASan+UBSan |
 | 6 | Command layer and agent CLI (§14): `Commands`, `CommandProcessor`, `LineReader`, `JsonlWriter`, `App/main --cli` | `test_commands` (every command, bad arguments, active conv vs explicit `/send`, `ReqId` = line number); `test_jsonl` (escaping of controls and invalid UTF-8, hex ids, one object per line); `test_cli_e2e`: two `node --cli` processes over loopback, driven through pipes: `ready` with the bound port, dial, chat, `/close`, reconnect keeps the conv, stdin EOF → `shutdown_done` and exit 0 |
 | 7 | Balancer `decide()` as a pure function | policy weights, stall detection, move hysteresis, scale in/out |
 | 8 | Balancer thread wired in | forced imbalance → moves happen and traffic is uninterrupted (scripted through the CLI), a stalled pt (blocked by a test hook) gets excluded |

@@ -331,20 +331,53 @@ void test_inbound_garbage() {
     check(f.events().empty() && f.db.total() == 0, "rejected hello: nothing stored or shown");
 }
 
-void test_stale_peer_down_ignored() {
+void test_reconnect_while_up() {
     Fixture f;
     auto [conv, peer] = f.connect_in(100, 1);
-    // The peer reconnects before the old link is known to be dead.
+    // The peer reconnects before its old link is known to be dead.
     f.feed(msg::PeerHello{2, wire::ConnectInfo{100, peer, {kPeerB}}, wire::Endpoint{"10.0.0.3", 50001}});
+    auto rt = f.routed();
+    check(first_of<msg::BindLink>(rt) && first_of<msg::BindLink>(rt)->link == 2, "hello on a second link: BindLink for it");
+    check(f.events().empty() && f.store->status_of(*f.store->convs().find(conv)) == ConvStatus::Connected,
+          "a hello from a peer that is up does not change its status");
     f.feed(msg::PeerUp{peer, 2});
-    f.clear();
-    f.feed(msg::PeerDown{peer, 1, msg::LinkDownReason::Superseded});
-    check(f.events().empty(), "down for a superseded link: no event");
-    check(f.store->status_of(*f.store->convs().find(conv)) == ConvStatus::Connected, "down for a superseded link: still connected");
+    check(f.events().empty() && f.store->peers().find(peer)->link == 2, "PeerUp on the new link: link updated, no event");
     f.feed(msg::PeerDown{peer, 2, msg::LinkDownReason::PeerClosed});
     auto ev = f.events();
     check(first_of<msg::ConvState>(ev) && first_of<msg::ConvState>(ev)->status == ConvStatus::Disconnected,
-          "down for the current link: disconnected");
+          "PeerDown is taken at face value: disconnected");
+}
+
+void test_dial_overlapping_inbound_hello() {
+    // We dial, and the peer's own dial reaches us first. If the Router keeps our
+    // dial and that dial then fails, its PeerDown names the dial's link, not
+    // the inbound one the hello came on: it must still end the connecting state.
+    Fixture f;
+    auto [conv, peer] = f.connect_in(100, 1);
+    f.feed(msg::PeerDown{peer, 1, msg::LinkDownReason::PeerClosed});
+    f.feed(msg::ReconnectReq{1, conv});
+    f.feed(msg::PeerHello{3, wire::ConnectInfo{100, peer, {kPeerB}}, wire::Endpoint{"10.0.0.3", 50002}});
+    f.clear();
+    f.feed(msg::PeerDown{peer, 9, msg::LinkDownReason::SocketError, SocketError::ConnectionRefused});
+    auto ev = f.events();
+    check(first_of<msg::ConvState>(ev) && first_of<msg::ConvState>(ev)->status == ConvStatus::Failed,
+          "a PeerDown for another link than the hello's still ends the attempt");
+}
+
+void test_closing_a_dial_is_not_a_failure() {
+    Fixture f;
+    f.feed(msg::DialReq{1, kPeerA});
+    auto rt = f.routed();
+    const PeerId peer = first_of<msg::RouteDial>(rt)->peer;
+    const ConvId conv = f.store->convs().order().front();
+    f.feed(msg::CloseReq{2, conv});
+    rt = f.routed();
+    check(first_of<msg::ClosePeer>(rt) != nullptr, "close while dialing: ClosePeer (cancels the dial)");
+    f.clear();
+    f.feed(msg::PeerDown{peer, 4, msg::LinkDownReason::PeerClosed});
+    auto ev = f.events();
+    check(first_of<msg::ConvState>(ev) && first_of<msg::ConvState>(ev)->status == ConvStatus::New,
+          "a dial closed on purpose is not shown as failed");
 }
 
 // ------------------------------------------------------------------ sending
@@ -633,7 +666,9 @@ int main() {
     test_inbound_new_peer();
     test_inbound_known_peer();
     test_inbound_garbage();
-    test_stale_peer_down_ignored();
+    test_reconnect_while_up();
+    test_dial_overlapping_inbound_hello();
+    test_closing_a_dial_is_not_a_failure();
     test_send();
     test_send_rejects();
     test_send_size_limit();

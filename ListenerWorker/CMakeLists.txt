@@ -1,0 +1,4 @@
+add_library(ListenerWorker ListenerWorker.cpp)
+target_include_directories(ListenerWorker PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ListenerWorker PUBLIC Messages Common)
+target_compile_features(ListenerWorker PUBLIC cxx_std_23)

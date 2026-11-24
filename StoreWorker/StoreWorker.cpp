@@ -280,13 +280,19 @@ void StoreWorker::on(msg::PeerHello& m) {
         peer = &create_peer_with_conv(std::move(proto));
     }
 
-    peer->link_state = Peer::Link::Handshaking;
-    peer->link = m.link;
+    // A peer that is already up stays up on its current link: the Router decides
+    // which link survives and says so with PeerUp. Otherwise the peer is now
+    // connecting (this can also overlap a dial of ours).
+    const bool was_up = peer->link_state == Peer::Link::Up;
+    if (!was_up) {
+        peer->link_state = Peer::Link::Handshaking;
+        peer->link = m.link;
+    }
 
     // The Ack names the peer by our id for it and echoes its name for us.
     send_router(msg::BindLink{m.link, peer->peer_id, wire::ConnectInfoAck{peer->peer_id, m.info.peer_id}});
     log_.info("inbound link {} from {} is peer {}", m.link, endpoint_text(m.remote), hex(peer->peer_id));
-    emit_state_for_peer(peer->peer_id);
+    if (!was_up) { emit_state_for_peer(peer->peer_id); }
 }
 
 void StoreWorker::on(msg::DialDone& m) {
@@ -318,19 +324,18 @@ void StoreWorker::on(msg::PeerUp& m) {
 }
 
 void StoreWorker::on(msg::PeerDown& m) {
+    // The Router reports peers, not links: PeerDown means the peer has no live
+    // link and no dial in progress. Links it dropped as duplicates are never
+    // reported, so there is no stale PeerDown to filter out here.
     Peer* peer = peers_.find(m.peer);
     if (peer == nullptr) { return; }
-    // A link this peer has already replaced (a reconnect superseded it).
-    if (peer->link != kNoId && m.link != peer->link) {
-        log_.debug("peer {}: down for old link {} ignored (current {})", hex(peer->peer_id), m.link, peer->link);
-        return;
-    }
 
     const bool was_connecting = peer->link_state == Peer::Link::Dialing
                              || peer->link_state == Peer::Link::Handshaking;
     peer->link = kNoId;
     peer->link_state = Peer::Link::Down;
-    peer->last_dial_failed = was_connecting;
+    // Closing a dial on purpose is not a failure.
+    peer->last_dial_failed = was_connecting && m.why != msg::LinkDownReason::PeerClosed;
 
     std::string detail(msg::to_string(m.why));
     if (m.err != SocketError::Unknown) { detail += std::format(": {}", to_string(m.err)); }
@@ -492,7 +497,8 @@ bool StoreWorker::start_dial(Peer& peer, const std::optional<wire::Endpoint>& fi
 }
 
 void StoreWorker::mark_up(Peer& peer, LinkId link) {
-    const bool already = peer.link_state == Peer::Link::Up && peer.link == link;
+    // Already up (possibly on a link that is now being replaced): no status change.
+    const bool already = peer.link_state == Peer::Link::Up;
     peer.link_state = Peer::Link::Up;
     peer.link = link;
     peer.ever_up = true;

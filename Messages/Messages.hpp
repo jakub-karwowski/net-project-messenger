@@ -190,7 +190,9 @@ struct ClosePeer { PeerId peer = kNoId; };
 struct Shutdown { std::chrono::milliseconds grace{1000}; };
 // from Pt-i
 struct LinkHello { LinkId link = kNoId; wire::ConnectInfo info; };
-struct LinkAcked { LinkId link = kNoId; wire::ConnectInfoAck ack; wire::Endpoint remote; };
+// pool_conn_id: the pool connection the dial ended on (each attempt gets a new
+// one), which the Router needs for pool.send().
+struct LinkAcked { LinkId link = kNoId; wire::ConnectInfoAck ack; wire::Endpoint remote; std::uint64_t pool_conn_id = 0; };
 struct LinkDown { LinkId link = kNoId; LinkDownReason why{}; SocketError err = SocketError::Unknown; };
 struct LinkReleased { LinkId link = kNoId; ReleasedConnection rc; wire::Decoder dec; };
 struct LinkAdopted { LinkId link = kNoId; PtId pt = 0; std::uint64_t pool_conn_id = 0; };

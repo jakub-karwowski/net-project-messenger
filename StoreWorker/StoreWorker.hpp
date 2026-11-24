@@ -16,6 +16,10 @@
 // to send) and hands the Router plain values. It never encodes frames, and it
 // does not run dial attempts: the endpoints of a peer go down in one RouteDial,
 // and one DialDone or PeerDown comes back.
+//
+// The Router reports peers, not links: PeerUp/DialDone name the link now in
+// use, PeerDown means the peer has no link and no dial left. Links it drops as
+// duplicates are never reported, so the Store takes these at face value.
 
 #include "ConvStore.hpp"
 #include "Ids.hpp"

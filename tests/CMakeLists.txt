@@ -44,3 +44,7 @@ add_test(NAME test_store COMMAND test_store)
 add_executable(test_io_worker test_io_worker.cpp)
 target_link_libraries(test_io_worker PRIVATE IoWorker)
 add_test(NAME test_io_worker COMMAND test_io_worker)
+
+add_executable(test_router test_router.cpp)
+target_link_libraries(test_router PRIVATE RouterWorker StoreWorker ListenerWorker)
+add_test(NAME test_router COMMAND test_router)

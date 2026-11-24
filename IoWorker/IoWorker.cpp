@@ -185,7 +185,7 @@ bool IoWorker::handle_frame(std::uint64_t id, LinkState& st, wire::Message frame
             if (auto* ack = std::get_if<wire::ConnectInfoAck>(&frame)) {
                 st.hs = Hs::Established;
                 std::ignore = pool_.set_timeouts(id, established_timeouts());   // fails only for an unknown id
-                send_router(msg::LinkAcked{st.link, *ack, st.dialing});
+                send_router(msg::LinkAcked{st.link, *ack, st.dialing, id});
                 return true;
             }
             break;

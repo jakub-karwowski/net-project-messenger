@@ -229,8 +229,12 @@ void test_outbound_dial_and_chat() {
 
     check(write_frame(*accepted, wire::ConnectInfoAck{70, 7}), "peer acks");
     auto acked = h.to_router<msg::LinkAcked>();
-    check(acked && acked->link == 2 && acked->ack.peer_id == 70 && acked->remote == l.endpoint(),
-          "ack: LinkAcked with the Ack and the endpoint that answered");
+    check(acked && acked->link == 2 && acked->ack.peer_id == 70 && acked->remote == l.endpoint() && acked->pool_conn_id != 0,
+          "ack: LinkAcked with the Ack, the endpoint that answered and the pool connection");
+    check(acked && h.pool.send(acked->pool_conn_id, frame_bytes(wire::ChatMessage{0, 70, "from the router"})).has_value(),
+          "the Router can send on that pool connection");
+    auto routed = read_frame(*accepted, dec);
+    check(routed && std::holds_alternative<wire::ChatMessage>(*routed), "the peer receives it");
 
     check(write_frame(*accepted, wire::ChatMessage{0, 7, "yo"}), "peer sends chat");
     auto chat = h.to_store();
