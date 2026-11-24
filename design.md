@@ -693,7 +693,8 @@ single source of truth.
 
 `Logger` is a cheap handle `{ThreadQueue<LogRecord>*, thread_name}` with
 `log(level, fmt, args...)`. `LogRecord{steady ts, wall ts, thread, level,
-component, text}`. The worker writes one line per record to a file, since stdout
+component, text}`. `Logger::for_thread(name)` gives a worker that another thread
+starts its own thread name (the Router does this for each IO worker). The worker writes one line per record to a file, since stdout
 belongs to the TUI.
 
 A `Metric` level writes key=value lines (`pt=2 links=14 rx_bps=...`) that the
@@ -954,7 +955,7 @@ The pool wakes `receive()` through a `WakeupEvent` (§8.2).
 
 ```
 Common/        ThreadQueue.hpp  WakeupEvent.hpp/.cpp (own target; TcpSocket uses it)  Ids.hpp (IdMinter)
-               Logger.hpp/.cpp  Worker.hpp/.cpp (§9.1)  Supervisor.hpp/.cpp (§9.2)  AppConfig.hpp
+               Logger.hpp/.cpp  Worker.hpp/.cpp (§9.1)  Supervisor.hpp/.cpp (§9.2)
                No networking: Common does not depend on TcpSocket.
 Messages/      Messages.hpp (+ a one-line Messages.cpp that compiles it alone; depends on Common, TcpSocket, Wire.hpp)
 TcpSocket/     (existing) + dial/release/interrupt
@@ -968,8 +969,9 @@ BalancerWorker/BalancerWorker.hpp/.cpp  BalancerPolicy.hpp/.cpp   (pure decide()
 ListenerWorker/ListenerWorker.hpp/.cpp
 Frontend/      Commands.hpp/.cpp (pure parser)  CommandProcessor.hpp/.cpp
                Tui: TuiView.hpp/.cpp  KeyboardWorker.hpp/.cpp
-               Cli: LineReader.hpp/.cpp  JsonlWriter.hpp/.cpp  Json.hpp (escaping, hex ids)
-App/           main.cpp
+               Cli: CliFrontend.hpp/.cpp  CliFormat.hpp/.cpp (the events)  LineReader.hpp/.cpp
+                    JsonlWriter.hpp/.cpp  Json.hpp (escaping, hex ids)
+App/           main.cpp (wiring, start/stop order)  AppConfig.hpp/.cpp (argv)   → the `node` executable
 tests/         one test_*.cpp per module (CTest)
 ```
 
@@ -1209,7 +1211,7 @@ sleep inside `_exit` otherwise breaks the timing checks of the hard-exit cases.
 | 3 ✅ | Store, single-threaded and fed by its inbox, with `NullPersistence` and a recording fake | `test_store` 90 checks: dial (hello contents, Reply before events, known endpoint reuses its conv and goes first), dial failure → Failed with the socket error and no retry, reconnect re-presents names and sends every dialable endpoint in one `RouteDial` (port 0 left out), size limit at `wire::kMaxChatBodySize`, inbound hello (new / known / unknown assigned id / garbage → `RejectLink`), stale `PeerDown` of a superseded link ignored, send (frame contents, pending → sent / failed, refusals not stored), outbound Ignore, receive with Notify / Forward / Ignore, snapshot marks read, drops (sender mismatch, unknown peer, unknown group), chat overtaking `PeerUp`, echo, default subscription, close, quit (refusals, `RejectLink`, flush, `ShutdownDone`), exactly one `Reply` per `ReqId`, load from persistence (pending → failed, names re-presented, no id collisions). Clean under ASan+UBSan |
 | 4 ✅ | Pt-i (`IoWorker/`), plus `receive(deadline)` and `connection_count()` in the pool | `test_io_worker` 68 checks, over loopback with the test as Router and as remote peer: inbound handshake (hello up, Ack encoded and sent, chat straight to the Store), outbound dial (hello encoded and sent, `LinkAcked.remote`), a dial over an invalid, a refused and a good endpoint under one link id, all refused → one `LinkDown` with the last error, no endpoints, handshake timeout, chat before hello / before `Bind` → `ProtocolError`, 10 unknown-type frames skipped, malformed frames over the limit → `ProtocolError`, release on A + adopt on B with half a frame in the decoder (message arrives whole on B), probe counters and reset, close with a reason, peer close, stop with nothing to flush, stop that flushes 1 MiB before the deadline, stop that hits the deadline, `pool.stop()`. `test_pool` +2 tests (97 checks). 20 repeated runs without a failure; clean under TSan and ASan+UBSan |
 | 5 ✅ | Router with N Pt-i, without the Balancer (own placement), and the Listener | `test_router` 34 checks, two complete nodes in one process (Store, Router + IO workers, Listener on their own threads) over loopback: dial and chat both ways, close and reconnect from either side keep the conversations, simultaneous reconnect converges on one link on both sides (10 rounds), a refused dial, retiring the worker that holds the link while 50 messages flow (all arrive in order, worker stops, traffic continues), quit (`ShutdownDone`, the other side sees it go). `test_store` +3 (peer-level contract), `test_io_worker` +2 (`pool_conn_id`). 20 runs stable; clean under TSan and ASan+UBSan |
-| 6 | Command layer and agent CLI (§14): `Commands`, `CommandProcessor`, `LineReader`, `JsonlWriter`, `App/main --cli` | `test_commands` (every command, bad arguments, active conv vs explicit `/send`, `ReqId` = line number); `test_jsonl` (escaping of controls and invalid UTF-8, hex ids, one object per line); `test_cli_e2e`: two `node --cli` processes over loopback, driven through pipes: `ready` with the bound port, dial, chat, `/close`, reconnect keeps the conv, stdin EOF → `shutdown_done` and exit 0 |
+| 6 ✅ | Command layer and agent CLI (§14): `Commands`, `CommandProcessor`, `CliFrontend`, `CliFormat`, `LineReader`, `JsonlWriter`, `Json.hpp`, `App/` (`node --cli`) | `test_commands` 49 checks (every command and its errors, `//`, ids in either case, the processor: request ids, blank/help/quit, `/open` with and without restoring the previous conv, `/echo`, a closed Store queue); `test_jsonl` 45 (escaping: controls, DEL, C1, U+2028, invalid / overlong / surrogate / truncated UTF-8, NUL; ids; every event's exact text; the writer: EPIPE closes it, `try_write` on a full pipe returns at once; the reader: CRLF, blank lines numbered, a line split across reads, no final newline, `stop()` with input open); `test_cli_e2e` 33, real processes over pipes: `ready` with the bound port, dial, chat both ways with text that must be escaped (no raw ESC reaches the output), `/open` with its snapshot, `/list`, `/close` + `/reconnect` keep both convs, errors with line numbers, blank lines counted, end of input → `shutdown_done` + exit 0, `/quit`, `--stay` + SIGTERM, stdout closed, port in use → `fatal` + exit 1. 15 runs stable; clean under TSan and ASan+UBSan, the spawned nodes included |
 | 7 | Balancer `decide()` as a pure function | policy weights, stall detection, move hysteresis, scale in/out |
 | 8 | Balancer thread wired in | forced imbalance → moves happen and traffic is uninterrupted (scripted through the CLI), a stalled pt (blocked by a test hook) gets excluded |
 | 9 | TUI frontend: `TuiView`, `KeyboardWorker`, on the same `CommandProcessor` | headless view test (feed `FrontendMsg`, compare FrameBuffer); key → line → same `StoreMsg` as the CLI produces |
@@ -1465,34 +1467,40 @@ In CLI mode:
 
 ```cpp
 // Frontend/Commands.hpp: pure, unit-tested without threads
-using Command = std::variant<SendText, DialReq, ReconnectReq, CloseReq, ListReq,
-                             Subscribe, QuitReq,
-                             OpenConv, Help>;            // the last two are handled locally
+using Command = std::variant<Blank, SendText, DialReq, ReconnectReq, CloseReq, ListReq, QuitReq,
+                             OpenConv, EchoMode, Help>;   // Store requests carry req = 0 here
 struct CommandError { std::string text; };
 std::expected<Command, CommandError> parse_command(std::string_view line, ConvId active);
 
 // Frontend/CommandProcessor.hpp: session state + dispatch, still no I/O of its own
+struct ProcessorMode {
+    Subscription active;                    // what /open subscribes the new conv to
+    std::optional<Subscription> previous;   // TUI: the old conv goes back to this; CLI: none
+};
 class CommandProcessor {
 public:
-    explicit CommandProcessor(ThreadQueue<StoreMsg>& store);
-    // Parses `line`, stamps `req` into the request and pushes it to the Store.
-    // Local commands (OpenConv, Help) are returned for the view to act on.
-    std::expected<Submitted, CommandError> submit(std::string_view line, ReqId req);
+    enum class Local { None, Blank, Help, Quit };   // what the frontend still has to do
+    CommandProcessor(ThreadQueue<StoreMsg>& store, ProcessorMode mode = {});
+    // Parses `line`, stamps `req` and pushes the Store request(s).
+    std::expected<Local, CommandError> submit(std::string_view line, ReqId req);
     ConvId active() const;
 };
 ```
+A blank line is its own command (`Blank`) rather than an empty optional, so the
+result is one plain `expected`.
 
 | Command | Request | Notes |
 |---|---|---|
 | `/dial <ip> <port>` | `DialReq` | `Reply.conv` = the new conversation |
 | `/send <conv> <text>` | `SendText` | explicit target, so no hidden state; the form an agent should use |
 | plain text | `SendText` to the active conv | error when no conv is active |
-| `/open <conv>` | `Subscribe` the new conv for content, the old one to Notify | TUI: also Tab. CLI: only changes the target of plain text |
+| `//<text>` | `SendText` of `/<text>` to the active conv | to send text that starts with `/` |
+| `/open <conv>` | `Subscribe{req, conv, mode.active}`; TUI: also `Subscribe{0, old, mode.previous}` | makes `conv` active. The Store's `Reply` checks the conv exists, and a `ConvSnapshot` (the history) follows. TUI: also Tab |
 | `/list` | `ListReq` | answered with `ConvList` |
 | `/reconnect [<conv>]` | `ReconnectReq` | default: the active conv |
 | `/close [<conv>]` | `CloseReq` | the Store sends `ClosePeer` per member |
-| `/echo on\|off [<conv>]` | `Subscribe` | |
-| `/help` | local | |
+| `/echo on\|off [<conv>]` | `Subscribe` with outbound `Echo` (or back to the mode's outbound) | |
+| `/help` | local | the frontend replies ok itself, then a `notice` with the command list |
 | `/quit`, Ctrl+C, CLI stdin EOF | `QuitReq` | |
 
 `<conv>` is the hex id from `/list`, `Reply` or any event. The TUI may later allow
@@ -1565,6 +1573,20 @@ not.
   SIGTERM, which also takes the normal shutdown path. That suits a node started
   in the background with `</dev/null`.
 - **Echoing input:** none. An agent correlates through `req`.
+- **Order of replies:** a parse error is answered by the frontend at once, so it
+  can come before the Store's reply to an earlier line. Each reply carries its
+  `req`; nothing else orders them.
+- **Blank lines** get no reply but still count toward the line numbers.
+- **stdout closed** (EPIPE): the writer stays closed and the node quits through
+  the normal shutdown, exit 0.
+- **Options** (`node --help`): `--cli`, `--stay`, `--listen HOST:PORT` (default
+  `0.0.0.0:7000`, port 0 = any), `--advertise HOST:PORT` (repeatable; default the
+  listen address, `127.0.0.1` for `0.0.0.0`, port 0 = the bound port), `--log PATH`
+  (default: no log), `--log-level`, `--min-pts` / `--max-pts`, `--shutdown-grace MS`,
+  `--handshake-timeout MS`, `--connect-timeout MS`. A bad option prints the usage to
+  stderr (with `--cli` also a `fatal` event) and exits 1.
+- **Until step 8** the Balancer's queue is emptied by a stub thread that stops on
+  `StopBalancer`. Without `--cli` the node exits 1: the TUI comes in step 9.
 - **Stopping `LineReader`:** it blocks in `poll` on stdin plus a `WakeupEvent`, so
   `stop()` wakes it even while stdin is open (the same rule as `TcpListener::stop`).
   It splits on `'\n'` and strips one trailing `'\r'`.

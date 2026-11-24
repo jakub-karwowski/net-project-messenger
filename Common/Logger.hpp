@@ -80,6 +80,14 @@ public:
     Logger(LogCore& core, std::string_view thread, std::string_view component = {}) noexcept
         : core_(&core), thread_(thread), component_(component.empty() ? thread : component) {}
 
+    // The same sink and level for another thread (e.g. a worker this thread starts).
+    Logger for_thread(std::string_view thread) const noexcept {
+        Logger copy = *this;
+        copy.thread_ = ShortName(thread);
+        copy.component_ = ShortName(thread);
+        return copy;
+    }
+
     Logger with_component(std::string_view component) const noexcept {
         Logger copy = *this;
         copy.component_ = ShortName(component);

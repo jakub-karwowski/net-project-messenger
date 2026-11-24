@@ -400,7 +400,8 @@ PtId RouterWorker::spawn_pt() {
     handle.commands = std::make_unique<ThreadQueue<msg::PtCommand>>();
     IoConfig io = config_.io;
     io.pt = id;
-    handle.worker = std::make_unique<IoWorker>(io, *handle.pool, *handle.commands, inbox_, store_, balancer_, base_log_);
+    handle.worker = std::make_unique<IoWorker>(io, *handle.pool, *handle.commands, inbox_, store_, balancer_,
+                                               base_log_.for_thread(std::format("pt-{}", id)));
     PtHandle& pt = pts_.emplace(id, std::move(handle)).first->second;
     pt.thread = std::make_unique<WorkerThread>(std::format("pt-{}", id), [w = pt.worker.get()] { w->run(); },
                                                [p = pt.pool.get()] { p->stop(); }, fatal_);

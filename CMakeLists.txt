@@ -22,6 +22,8 @@ add_subdirectory(StoreWorker)
 add_subdirectory(IoWorker)
 add_subdirectory(RouterWorker)
 add_subdirectory(ListenerWorker)
+add_subdirectory(Frontend)
+add_subdirectory(App)
 add_subdirectory(TerminalUI)
 
 add_subdirectory(tests)
