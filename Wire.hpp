@@ -46,9 +46,11 @@
 //       for (;;) {
 //           auto chunk = conn.receive(scratch);
 //           decoder.feed(*chunk);
-//           while (auto item = decoder.next()) {
-//               if (!*item) break;               // need more bytes
-//               handle(**item);
+//           for (;;) {
+//               wire::Decoded next = decoder.next();
+//               if (std::holds_alternative<wire::NeedMore>(next)) break;
+//               if (auto* err = std::get_if<wire::WireError>(&next)) { report(*err); continue; }
+//               handle(std::get<wire::Message>(next));
 //           }
 //       }
 
@@ -442,6 +444,15 @@ inline std::expected<Message, WireError> decode(std::span<const std::byte> frame
 // Streaming decoder
 // ---------------------------------------------------------------------------
 
+// Decoder::next() has not got a complete frame yet: feed it more bytes.
+struct NeedMore {
+    friend bool operator==(const NeedMore&, const NeedMore&) = default;
+};
+
+// One step of decoding: a complete message, a request for more bytes, or a
+// malformed frame (already skipped; the decoder carries on with what follows).
+using Decoded = std::variant<Message, NeedMore, WireError>;
+
 // Resumable parser for a received byte stream. Feed it whatever `receive()`
 // returned (a partial frame, several frames, or a frame split across calls) and
 // pull completed messages out with `next()`.
@@ -452,35 +463,35 @@ class Decoder {
             buffer_.insert(buffer_.end(), chunk.begin(), chunk.end());
         }
 
-        // Returns the next complete message, `std::nullopt` when more bytes are
-        // needed, or an error for a malformed frame. After an error the decoder
-        // stays usable: it resynchronizes on the next magic marker.
-        [[nodiscard]] std::expected<std::optional<Message>, WireError> next() {
+        // Returns the next complete message, NeedMore when more bytes are
+        // needed, or the WireError of a malformed frame. After an error the
+        // decoder stays usable: it resynchronizes on the next magic marker.
+        [[nodiscard]] Decoded next() {
             for (;;) {
                 compact();
                 if (available() < kFrameHeaderSize) {
-                    return std::optional<Message>{};
+                    return NeedMore{};
                 }
 
                 const std::byte* base = buffer_.data() + offset_;
                 if (detail::load_u16(base) != kMagic) {
                     if (!resync_magic()) {
-                        return std::unexpected(WireError::BadMagic);
+                        return WireError::BadMagic;
                     }
                     continue;
                 }
                 if (detail::to_u8(base[2]) != kVersion) {
                     drop_to(offset_ + 2);  // skip this magic, resync on the next
-                    return std::unexpected(WireError::UnsupportedVersion);
+                    return WireError::UnsupportedVersion;
                 }
 
                 const std::uint32_t length = detail::load_u32(base + 4);
                 if (length > kMaxPayloadSize) {
                     drop_to(offset_ + kFrameHeaderSize);
-                    return std::unexpected(WireError::FrameTooLarge);
+                    return WireError::FrameTooLarge;
                 }
                 if (available() < kFrameHeaderSize + length) {
-                    return std::optional<Message>{};  // wait for the rest
+                    return NeedMore{};  // wait for the rest
                 }
 
                 const auto type = static_cast<MessageType>(detail::to_u8(base[3]));
@@ -490,9 +501,9 @@ class Decoder {
                 auto msg = detail::decode_payload(type, payload);
                 drop_to(offset_ + kFrameHeaderSize + length);
                 if (!msg) {
-                    return std::unexpected(msg.error());
+                    return msg.error();
                 }
-                return std::optional<Message>{std::move(*msg)};
+                return Decoded{std::move(*msg)};
             }
         }
 
