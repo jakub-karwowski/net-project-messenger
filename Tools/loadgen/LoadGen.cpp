@@ -120,6 +120,8 @@ public:
         traffic();
         pool_.stop();
         r_.measured_seconds = c_.duration;
+        r_.measure_begin_ns = measure_begin_;
+        r_.measure_end_ns = measure_end_;
         return std::move(r_);
     }
 
@@ -513,6 +515,8 @@ std::string to_json(const Config& c, const Result& r) {
         .num("window_blocked", r.window_blocked)
         .num("disconnects", r.disconnects)
         .num("protocol_errors", r.protocol_errors)
+        .num("measure_begin_ns", static_cast<std::uint64_t>(r.measure_begin_ns))
+        .num("measure_end_ns", static_cast<std::uint64_t>(r.measure_end_ns))
         .raw("echoed_per_s", std::format("{:.1f}", static_cast<double>(r.echoed) / std::max(r.measured_seconds, 1e-9)))
         .raw("rtt", histogram_json(r.rtt))
         .raw("seconds", seconds.done())

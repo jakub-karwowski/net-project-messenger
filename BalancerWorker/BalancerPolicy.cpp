@@ -69,11 +69,17 @@ void on_report(State& s, const msg::PtReport& r) {
         l.pending_tx += sample.tx_bytes;
         l.pending_frames += sample.rx_frames + sample.tx_frames;
         // A "gone" sample is the old worker's last word on a link that has left
-        // it; only a live sample says where the link is now.
+        // it; only a live sample says where the link is now. A report built
+        // before our last move of the link (it answered an earlier probe) is
+        // stale on that point and cannot undo the move.
         if (!sample.gone) {
-            if (l.placed && l.pt != r.pt) { l.last_moved = r.at; }
-            l.pt = r.pt;
-            l.placed = true;
+            if (!l.placed) {
+                l.pt = r.pt;
+                l.placed = true;
+            } else if (l.pt != r.pt && r.at > l.last_moved) {
+                l.pt = r.pt;
+                l.last_moved = r.at;
+            }
         }
         if (sample.rx_bytes + sample.tx_bytes > 0) { l.last_active = r.at; }
     }

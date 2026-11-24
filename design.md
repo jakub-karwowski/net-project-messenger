@@ -651,6 +651,16 @@ threads.
   changed).
 - **Stall detection:** a pt's first tick is free (it has not been probed yet), so
   it is stalled after `k_missed` unanswered probes after that.
+- **Probe after deciding, and stale reports cannot undo a move** (found by the
+  first matrix run). The tick used to send `ProbeAll` before its `MoveLink`s. The
+  old pt then answered the probe before handling `Release`, so its report still
+  listed the moved links live there, and the Balancer moved them back in its
+  model, marked them as just moved, and at the next tick moved as many again:
+  64 moves for a 32-link imbalance. Now:
+  - the probe goes out after the decisions;
+  - a live sample places a link elsewhere only if its report was built after
+    the Balancer's last move of that link (`PtReport.at > last_moved`, both on
+    the steady clock).
 - **Rebalance guard:** a link moves only if its load is below the current gap, so
   the move narrows the gap rather than swapping which pt is busy. One hot link on
   its own therefore never ping-pongs.
@@ -1785,5 +1795,75 @@ summary. It needs only the Python standard library and uses `build-release/`.
    of this document). When the node is overloaded its queues grow without bound,
    latency follows, and memory with it.
 
-Not yet done: the scenario matrix (the old S1–S7) and plotting.
+### 15.5 Scenario matrix (`scripts/run_matrix.py`, `scripts/analyze.py`)
+
+**Variants.** The old matrix compared I/O variants, which the rewrite no longer
+has. These compare node configurations instead:
+
+| Variant | Node options |
+|---|---|
+| `fixed-1` | `--no-balancer --min-pts 1` |
+| `fixed-4` | `--no-balancer --min-pts 4` (the Router's least-loaded placement) |
+| `balancer` | `--max-pts 4` (default 2 moves per tick) |
+| `balancer-fast` | `--max-pts 4 --balance-max-moves 32` |
+
+**Scenarios** (as before the rewrite; 20 s measured after 5 s of warm-up, 3
+repetitions):
+
+| | Swept | Other load |
+|---|---|---|
+| S1 fan-in | active peers 1, 8, 64, 256, 1024 | 100 msg/s, 64 B |
+| S2 idle-heavy | idle peers 0, 100, 300, 1000 | 8 × 500 msg/s |
+| S3 slow consumers | slow peers 0, 1, 4 | 16 × 200 msg/s |
+| S4 churn | reconnects/s 0, 10, 50 | 64 × 50 msg/s |
+| S5 throughput ceiling | size 32, 4096, 65536 B | 8 peers, closed loop, window 16 |
+| S7 capped fan-in | node `--max-links` 64, 128, 256, 1040 | 1024 × 100 msg/s |
+
+S6 (WAN: netem in a namespace) is not ported yet. The full matrix is 264 cells,
+about 2.2 hours.
+
+**Runner.** Per cell, `run_load.run_cell()`:
+- the node is pinned to `--node-cpus` (default 0-3) and loadgen to
+  `--loadgen-cpus` (8-9);
+- CPU is measured over loadgen's measurement window only (it reports the window
+  on the monotonic clock);
+- outside S7, the node's link cap is set above the load, so it never refuses a
+  peer.
+
+The rest is as before the rewrite:
+- the layout `<out>/<scenario>/<x>=<value>/<variant>/rep<N>/`;
+- `meta.json` with status (`ok`, `dirty`, `failed`), validity and a build stamp
+  (commit, uncommitted files, binary hashes, build type);
+- resume skips `ok` and `dirty` cells; adding cells from another build is
+  refused unless `--force-mixed`;
+- a seeded shuffle of the variant order per (scenario, value, rep);
+- `--quick` is a smoke run, about 2.5 minutes for all 48 cells;
+- `--dry-run` lists the cells and estimates the time.
+
+**Validity** (`analyze.validity`, also stored in `meta.json`). A completed cell
+does not count when:
+- the node exited non-zero or was forced;
+- fewer than 95% of the expected peers connected (in S7, of `min(peers, cap)`);
+- loadgen fell behind (then the generator, not the node, set the pace);
+- there were protocol errors;
+- CPU was sampled over less than half of the measurement.
+
+**Analysis.** `analyze.py RESULTS` writes:
+- `summary.csv`: per (scenario, value, variant) the median, Q1 and Q3 of
+  throughput, delivered %, RTT p50/p99, refused sends, handshake and reconnect
+  times, node CPU and its busiest thread, threads, RSS, descriptors, IO workers
+  (counted from the node's `pt-N` threads) and moves;
+- `report.html`: per scenario three charts (throughput, RTT p99 on a log axis
+  when it spans more than 50×, node CPU; one measure per chart), with IQR
+  whiskers, a legend plus direct labels, hover tooltips, the full table, and
+  the problems list. It is self-contained, in light and dark, with the variants
+  in fixed categorical slots 1–4.
+
+`scripts/test_analyze.py` (in CTest) checks the statistics, the validity rules,
+aggregation over a synthetic results directory, the plan (shuffle, reproducible,
+caps), and the charts: well-formed SVG, labels inside the chart and apart,
+colours fixed per variant.
+
+Not yet done: S6, and figures for the LaTeX report (`summary.csv` is the input
+for them).
 

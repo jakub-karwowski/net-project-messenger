@@ -101,6 +101,17 @@ void test_gone_samples_and_moves() {
     check(s.links.at(7).pt == 1, "a gone sample from the old worker does not move it back");
     check(s.links.at(7).last_moved == t0 + 1s, "the move is noticed and timed");
     check(s.links.at(7).pending_rx == 20, "the bytes of every sample count");
+
+    // Our own move, then a report that answered an earlier probe: still lists
+    // the link live on the worker it left. It must not undo the move.
+    balance::Decisions moved;
+    moved.moves = {msg::MoveLink{7, 0}};
+    balance::commit(s, moved, t0 + 2s);
+    check(s.links.at(7).pt == 0, "commit assumes the move");
+    balance::on_report(s, msg::PtReport{1, 3, t0 + 1500ms, 0, {msg::LinkSample{7, 70, 5, 0, 1, 0, false}}});
+    check(s.links.at(7).pt == 0 && s.links.at(7).last_moved == t0 + 2s, "a report older than the move is stale about it");
+    balance::on_report(s, msg::PtReport{1, 4, t0 + 3s, 0, {msg::LinkSample{7, 70, 5, 0, 1, 0, false}}});
+    check(s.links.at(7).pt == 1, "a newer report wins (the Router may have refused the move)");
     balance::on_link_gone(s, 7);
     check(!s.links.contains(7), "LinkGone forgets the link");
 }
@@ -245,10 +256,24 @@ void test_worker_with_manual_ticks() {
     worker::drain(b, inbox);
     std::vector<msg::RouterMsg> out;
     while (auto m = router.try_pop()) { out.push_back(std::move(*m)); }
-    check(!out.empty() && std::holds_alternative<msg::ProbeAll>(out[0]) && std::get<msg::ProbeAll>(out[0]).seq == 1,
-          "a tick probes every worker (seq 1)");
+    check(!out.empty() && std::holds_alternative<msg::ProbeAll>(out.back()) && std::get<msg::ProbeAll>(out.back()).seq == 1,
+          "a tick probes every worker (seq 1), after its decisions");
     check(std::ranges::any_of(out, [](const auto& m) { return std::holds_alternative<msg::SetPolicy>(m); }),
           "and sends the first policy");
+    // An imbalance: the moves leave before the probe, so the old worker handles
+    // its Release before it answers.
+    msg::PtReport busy{0, 1, Clock::now(), 0, {}};
+    for (LinkId l = 1; l <= 4; ++l) { busy.links.push_back(msg::LinkSample{l, l, 200'000, 0, 10, 0, false}); }
+    std::ignore = inbox.push(busy);
+    std::ignore = inbox.push(msg::PtReport{1, 1, Clock::now(), 0, {}});
+    std::ignore = inbox.push(msg::BalancerTick{});
+    worker::drain(b, inbox);
+    out.clear();
+    while (auto m = router.try_pop()) { out.push_back(std::move(*m)); }
+    const auto first_move = std::ranges::find_if(out, [](const auto& m) { return std::holds_alternative<msg::MoveLink>(m); });
+    const auto probe = std::ranges::find_if(out, [](const auto& m) { return std::holds_alternative<msg::ProbeAll>(m); });
+    check(first_move != out.end() && probe != out.end() && first_move < probe, "moves are sent before the tick's probe");
+
     std::ignore = inbox.push(msg::StopBalancer{});
     worker::drain(b, inbox);
     check(b.done(), "StopBalancer ends it");

@@ -93,6 +93,10 @@ struct Result {
     std::uint64_t protocol_errors = 0;
     Histogram rtt;
     double measured_seconds = 0.0;
+    // The measurement window on the monotonic clock (CLOCK_MONOTONIC, ns), so
+    // a harness can line its own samples up with it.
+    std::int64_t measure_begin_ns = 0;
+    std::int64_t measure_end_ns = 0;
     std::vector<SecondSample> seconds;
 };
 

@@ -40,11 +40,11 @@ void BalancerWorker::on(msg::StopBalancer&) {
 
 void BalancerWorker::on(msg::BalancerTick&) {
     const auto now = Clock::now();
-    // Fold in the reports answering the previous probe, then probe again: the
-    // answers to this probe arrive before the next tick.
+    // Fold in the reports answering the previous probe. The next probe goes
+    // out after this tick's decisions: a worker then handles a Release before
+    // it answers, so its report does not still show a link it has just given up.
     balance::end_tick(state_, config_, now - last_tick_, now);
     last_tick_ = now;
-    send_router(msg::ProbeAll{++probe_seq_});
 
     for (const auto& [pt, load] : state_.pts) {
         if (load.stalled && load.missed == config_.k_missed) {
@@ -69,6 +69,7 @@ void BalancerWorker::on(msg::BalancerTick&) {
     if (decisions.retire) { send_router(msg::RetirePt{*decisions.retire}); }
     for (const auto& move : decisions.moves) { send_router(move); }
     for (const LinkId link : decisions.evict) { send_router(msg::EvictLink{link}); }
+    send_router(msg::ProbeAll{++probe_seq_});
     log_metrics();
 }
 

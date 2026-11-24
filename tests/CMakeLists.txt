@@ -93,3 +93,9 @@ target_compile_definitions(test_loadgen PRIVATE NODE_BINARY="$<TARGET_FILE:node>
 target_link_libraries(test_loadgen PRIVATE LoadGen)
 add_dependencies(test_loadgen node)
 add_test(NAME test_loadgen COMMAND test_loadgen)
+
+# The experiment scripts: statistics, validity, the report's charts, the plan.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME test_analyze COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/test_analyze.py)
+endif()
