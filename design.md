@@ -2098,5 +2098,45 @@ Frontend receives nothing.
 | 3 ✅ | IO worker: `pause_reads()` / `resume_reads()` on the Store's and Router's `congested()`, checked after every read; links established while paused (outbound Ack, inbound `Bind`, adopted) are paused at once; `receive` polls every `resume_poll` (1 ms) while paused; `PtReport::paused_ms`; `reads=paused` / `reads=resumed` Metric lines | `test_io_worker` +5 tests (96 checks): 3000 messages against `high` 64: reads stop, the Store's queue stays put while nobody drains it, `paused_ms` reported; draining resumes, every message once and in order, no paused time afterwards; the sender is blocked by TCP while the Store holds under 5000 (over a million without backpressure); a congested Router queue stops reads too; a new link's handshake completes while paused, its chat waits, an adopted established link is paused at once; a light link's message gets through a flood on another link. Breaking it (never pause, never resume, new links not paused) fails checks. Clean under TSan |
 | 4 ✅ | `--inbox-high N` (default 16384, 0 = off) and `--inbox-low N` (default half; must be below high); `main` sets both watermarks on the Store's and Router's inboxes; `NodeHarness::Node(rc, bc, inbox_high)` | `test_router` +1 (38 checks): two in-process nodes, B congests at 2 messages, 2000 messages arrive complete and in order through repeated pauses, B's report shows it paused, the link works both ways after. `test_loadgen` +1 (30 checks): a real `node --echo` flooded by 32 peers: deepest inbox about 2000 with `--inbox-high 2000` (bound 2 × high + one read) and over 5 × high without; no peer dropped; the node with backpressure exits 0. Clean under TSan |
 | 5 ✅ | `PtLoad::paused_ms` (per tick), `Decisions::hold`; `decide()` skips scaling and rebalancing while held; the hold Metric line | `test_balancer` +1 test (69 checks): a paused worker stops a scale out, a rebalance and a retire; the streak is frozen and the next quiet tick completes it; the policy and eviction still apply; the next tick without pauses decides normally. Breaking it (no hold on scaling, no hold on moves, a hold that resets the streak) fails checks. Clean under TSan |
-| 6 | Measurement and analysis; a node option capping `SO_RCVBUF` on accepted sockets | the 1024-peer cells, then S1 and S7, with and without backpressure and with a capped receive buffer: memory flat, clean shutdowns, and the round trip with the kernel's share of the queueing removed. loadgen's refused sends (`send_failed`) are the expected result, not a degraded cell: `analyze.py` reports them separately |
+| 6 ✅ | Measurement and analysis (§16.9); `--rcvbuf BYTES` on every accepted and dialled peer connection; `run_load` reads inbox maxima, pauses and holds from the node's log; `run_matrix --set backpressure`, `--values`; `analyze.py`: colours in the run's own variant order, a node memory chart, inbox / pauses / holds columns | the 1024-peer cells, then S1 and S7, with and without backpressure and with a capped receive buffer: memory flat, clean shutdowns, and the round trip with the kernel's share of the queueing removed. loadgen's refused sends (`send_failed`) are the expected result, not a degraded cell: `analyze.py` reports them separately |
 | 7 | Store → Frontend coalescing (§16.6) | its own step |
+
+### 16.9 Results (commit `8f3dcce`, Release, WSL2, node on CPUs 0–3)
+
+`run_matrix.py --set backpressure --scenarios S1,S7`: 108 cells, 3
+repetitions, all valid. Variants: `bp-off` (one IO worker, `--inbox-high 0`),
+`bp-on` (one IO worker, default 16384), `bp-rcvbuf` (as `bp-on` with
+`--rcvbuf 65536`), `balancer-rcvbuf` (the Balancer, up to 4 workers, with the
+same receive buffer). Medians:
+
+| 1024 × 100 msg/s (S1; S7 uncapped alike) | Echoed | RTT p50 / p99 | Memory | Deepest inbox | Shutdown |
+|---|---|---|---|---|---|
+| `bp-off` | 40k msg/s, 1.2M lost | 13.4 s / 15.1 s | 767 MB | 1.5M | about 800 ms |
+| `bp-on` | 102.4k msg/s (all offered), none lost | 172 ms / 294 ms | 17 MB | 16.6k | about 20 ms |
+| `bp-rcvbuf` | 102.4k msg/s | 172 ms / 277 ms | 17 MB | 16.7k | about 15 ms |
+| `balancer-rcvbuf` | 102.4k msg/s | 172 ms / 268 ms | 16 MB | 16.7k | about 17 ms |
+
+- **Backpressure raised the ceiling, not just bounded the backlog.** One IO
+  worker moves 2.5 times as much with it: without it the Router works through
+  1.5M queued messages spread over 700+ MB; with the inboxes held near the
+  watermark it keeps up with the whole offered load at about 76% of a core. The
+  earlier "1024-peer ceiling" (§15.4, and `fixed-4` behind `fixed-1`) was the
+  backlog's own cost.
+- **The remaining latency is the watermark.** The Router's inbox sits at its
+  high mark: about 16k messages at 100k msg/s is about 160 ms of queueing, the
+  measured p50. A lower `--inbox-high` should lower it; not yet swept.
+- **TCP absorbs the pauses.** About 10 pauses per second, no refused send and no
+  lost message in any backpressure cell.
+- **The receive buffer cap changes nothing here**: the node keeps up, so nothing
+  waits in the kernel. It matters only beyond the node's capacity.
+- **Below saturation nothing changes.** 1–256 peers and every S7 cap: the same
+  throughput, round trips within noise (0.8–1.5 ms p99), 4–5 MB, no pause.
+- **The Balancer rebalances where it can and holds where it cannot help.**
+  `balancer-rcvbuf`: 2 workers and 28 moves at 64 peers, 4 and 90 at 128, 4 and
+  96 at 256, as in the earlier matrix, with no hold. At 1024 peers it held on
+  every tick (49) and stayed at one worker, which reached the full load: the
+  Router is the bottleneck, and more workers would not have helped. A hold
+  triggered by any pause freezes a whole tick; a threshold (hold only when
+  workers were paused for a real share of the tick) is the refinement if a
+  helpful scale-out is ever blocked. In echo mode the Router saturates first; in
+  normal use it receives no inbound traffic, so holds come only from the Store.
