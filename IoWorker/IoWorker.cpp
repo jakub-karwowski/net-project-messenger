@@ -28,11 +28,12 @@ std::string endpoint_text(const wire::Endpoint& ep) {
 
 // Every dialled socket: non-blocking (the pool needs it), no Nagle delay for
 // chat, and keepalive, which is how an idle established link notices a dead peer.
-TcpConnection::Options dial_options() {
+TcpConnection::Options dial_options(int receive_buffer) {
     TcpConnection::Options o;
     o.non_blocking = true;
     o.tcp_nodelay = true;
     o.keep_alive = true;
+    o.receive_buffer = receive_buffer;
     return o;
 }
 
@@ -362,7 +363,7 @@ void IoWorker::dial_next(LinkState st, SocketError last_error) {
     while (!st.to_try.empty()) {
         wire::Endpoint ep = std::move(st.to_try.front());
         st.to_try.erase(st.to_try.begin());
-        const auto id = pool_.connection_dial(ep.address, ep.port, dial_options(), handshake_timeouts(),
+        const auto id = pool_.connection_dial(ep.address, ep.port, dial_options(config_.receive_buffer), handshake_timeouts(),
                                               config_.connect_timeout);
         if (!id) {
             log_.info("link {}: cannot dial {}: invalid address", st.link, endpoint_text(ep));

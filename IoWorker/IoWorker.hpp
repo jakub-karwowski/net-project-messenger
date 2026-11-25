@@ -50,6 +50,8 @@ struct IoConfig {
     // While reading is paused for backpressure, how often to check whether
     // the downstream queues have drained.
     std::chrono::milliseconds resume_poll{1};
+    // SO_RCVBUF of every dialled connection (0: the kernel's default).
+    int receive_buffer = 0;
 };
 
 class IoWorker {

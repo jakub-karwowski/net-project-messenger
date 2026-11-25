@@ -8,8 +8,8 @@ as median and interquartile range. A completed cell is invalid when one of
 validity()'s reasons applies; invalid and failed cells are left out of the
 medians and listed under "Problems" in the report.
 
-The report has, per scenario, three charts (throughput, round-trip p99, node
-CPU; one measure each, never two axes) and the full table. It is one
+The report has, per scenario, four charts (throughput, round-trip p99, node
+CPU, node memory; one measure each, never two axes) and the full table. It is one
 self-contained HTML file: no network, light and dark mode.
 """
 
@@ -21,8 +21,16 @@ import statistics
 import sys
 from pathlib import Path
 
-# Fixed order: a variant keeps its colour whichever subset is shown.
+# Fixed order: a variant keeps its colour whichever subset is shown. A run's
+# own variant set (run.json) replaces it; see use_variant_order().
 VARIANT_ORDER = ["fixed-1", "fixed-4", "balancer", "balancer-fast"]
+
+
+def use_variant_order(run_info):
+    """Colours follow the order of the variants the run compared."""
+    variants = list((run_info or {}).get("variants") or [])
+    if variants:
+        VARIANT_ORDER[:] = variants
 # Categorical slots 1-4 of the reference palette (adjacent pairs validated in
 # both modes); dark steps are the same hues stepped for the dark surface.
 LIGHT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
@@ -94,12 +102,16 @@ def metrics(result):
         "fds": node.get("max_fds"),
         "pts_max": node.get("max_pt_threads", bal.get("max_pts")),
         "moves": bal.get("moves"),
+        # Backpressure: the deepest Store or Router inbox, pauses and holds.
+        "inbox_max": max((bal.get("inbox_max") or {}).get(q, 0) for q in ("store", "router")) if bal.get("inbox_max") else None,
+        "pauses": bal.get("pauses"),
+        "holds": bal.get("holds"),
     }
 
 
 NUMERIC = ["active_ready", "offered_per_s", "echoed_per_s", "delivered_pct", "rtt_p50_ms", "rtt_p99_ms", "lost",
            "send_failed", "handshake_p99_ms", "reconnect_p50_ms", "node_cpu_pct", "busiest_cpu_pct", "threads",
-           "rss_mb", "fds", "pts_max", "moves"]
+           "rss_mb", "fds", "pts_max", "moves", "inbox_max", "pauses", "holds"]
 
 
 def quartiles(values):
@@ -327,7 +339,8 @@ document.addEventListener('pointerout', e => { if (e.target.closest('[data-tip]'
 TABLE_COLUMNS = [("echoed_per_s", "echoed/s"), ("delivered_pct", "delivered %"), ("rtt_p50_ms", "RTT p50 ms"),
                  ("rtt_p99_ms", "RTT p99 ms"), ("send_failed", "refused"), ("node_cpu_pct", "node CPU %"),
                  ("busiest_cpu_pct", "busiest %"), ("threads", "threads"), ("rss_mb", "RSS MB"), ("fds", "fds"),
-                 ("pts_max", "pts"), ("moves", "moves"), ("handshake_p99_ms", "handshake p99 ms"),
+                 ("pts_max", "pts"), ("moves", "moves"), ("inbox_max", "inbox max"), ("pauses", "pauses"),
+                 ("holds", "holds"), ("handshake_p99_ms", "handshake p99 ms"),
                  ("reconnect_p50_ms", "reconnect p50 ms"), ("active_ready", "peers up")]
 
 
@@ -371,6 +384,7 @@ Points are medians over valid repetitions; whiskers and brackets are the interqu
         parts.append(line_chart(s, d["x"], values, variants, summary, "echoed_per_s", "Throughput", "msg/s"))
         parts.append(line_chart(s, d["x"], values, variants, summary, "rtt_p99_ms", "Round trip, p99", "ms", log=True))
         parts.append(line_chart(s, d["x"], values, variants, summary, "node_cpu_pct", "Node CPU", "% of one core"))
+        parts.append(line_chart(s, d["x"], values, variants, summary, "rss_mb", "Node memory", "MB", log=True))
         parts.append("</div>")
         rows = []
         for value in values:
@@ -406,6 +420,7 @@ def main(argv):
         run_info = json.loads((root / "run.json").read_text())
     except (OSError, json.JSONDecodeError):
         run_info = {}
+    use_variant_order(run_info)
     summary, problems = aggregate(cells)
     write_csv(summary, root / "summary.csv")
     write_report(summary, problems, run_info, root / "report.html")

@@ -12,7 +12,7 @@ void ListenerWorker::run() {
         auto conn = listener_.accept_client();
         if (conn) {
             // Applied when the IO worker's pool adopts it.
-            conn->with_non_blocking().with_tcp_nodelay().with_keep_alive();
+            conn->with_non_blocking().with_tcp_nodelay().with_keep_alive().with_receive_buffer(config_.receive_buffer);
             const auto& from = conn->remote_endpoint();
             log_.debug("accepted {}:{}", from.address, from.port);
             std::ignore = router_.push(msg::InboundAccepted{std::move(*conn)});   // false: shutting down

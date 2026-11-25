@@ -104,7 +104,7 @@ def test_aggregate_and_report():
 
 def check_report(text):
     svgs = re.findall(r"<svg .*?</svg>", text, flags=re.S)
-    check(len(svgs) == 3, f"three charts for one scenario ({len(svgs)})")
+    check(len(svgs) == 4, f"four charts for one scenario ({len(svgs)})")
     for svg in svgs:
         try:
             root = ET.fromstring(svg)
@@ -146,12 +146,42 @@ def test_plan():
           "elsewhere the cap never refuses anybody")
 
 
+def test_backpressure_set():
+    saved = list(analyze.VARIANT_ORDER)
+    analyze.use_variant_order(dict(variants=run_matrix.BACKPRESSURE_VARIANTS))
+    check(analyze.variant_rank("bp-off") == 0 and analyze.variant_rank("balancer-rcvbuf") == 3,
+          "colours follow the run's own variant order")
+    analyze.use_variant_order({})
+    check(analyze.variant_rank("bp-off") == 0, "a run without variants keeps the order it had")
+    analyze.VARIANT_ORDER[:] = saved
+
+    r = fake_result()
+    r["node"]["balancer"] = dict(max_pts=1, moves=0, inbox_max=dict(store=120, router=16500, frontend=3), pauses=7, holds=2)
+    m = analyze.metrics(r)
+    check(m["inbox_max"] == 16500 and m["pauses"] == 7 and m["holds"] == 2, "the deepest Store or Router inbox, pauses, holds")
+    r["node"]["balancer"] = dict(max_pts=1, moves=0)
+    check(analyze.metrics(r)["inbox_max"] is None, "an old result without inbox depths")
+
+    class A:
+        scenarios = ["S1"]
+        variants = list(run_matrix.BACKPRESSURE_VARIANTS)
+        reps = 1
+        quick = False
+        seed = 1
+        values = ["1024"]
+        set = "backpressure"
+    cells = run_matrix.plan(A)
+    check(len(cells) == 4 and all(c["value"] == 1024 for c in cells), "--values keeps only the swept values asked for")
+    check(run_matrix.VARIANT_SETS["backpressure"]["bp-off"][-2:] == ["--inbox-high", "0"], "bp-off turns backpressure off")
+
+
 def main():
     print("test_analyze")
     test_quartiles()
     test_validity()
     test_aggregate_and_report()
     test_plan()
+    test_backpressure_set()
     print(f"{checks - failures}/{checks} checks passed")
     return 0 if failures == 0 else 1
 

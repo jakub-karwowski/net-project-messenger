@@ -300,6 +300,12 @@ TcpConnection& TcpConnection::with_keep_alive(bool enable) noexcept {
     return *this;
 }
 
+TcpConnection& TcpConnection::with_receive_buffer(int bytes) noexcept {
+    options_.receive_buffer = bytes;
+    options_applied_ = false;
+    return *this;
+}
+
 TcpConnection& TcpConnection::with_options(Options options) noexcept {
     options_ = options;
     options_applied_ = false;
@@ -308,6 +314,13 @@ TcpConnection& TcpConnection::with_options(Options options) noexcept {
 
 const TcpConnection::Options& TcpConnection::options() const noexcept {
     return options_;
+}
+
+std::expected<int, SocketError> TcpConnection::receive_buffer_size() const noexcept {
+    int value = 0;
+    socklen_t len = sizeof(value);
+    if (::getsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &value, &len) < 0) { return std::unexpected(get_last_socket_error()); }
+    return value;
 }
 
 int TcpConnection::native_handle() const noexcept {

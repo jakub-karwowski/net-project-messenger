@@ -690,6 +690,22 @@ void test_release_while_paused() {
           "B reads it, data intact, got " + describe(r));
 }
 
+int rcvbuf_of(const TcpConnection& c) {
+    return c.receive_buffer_size().value_or(-1);
+}
+
+void test_receive_buffer_option() {
+    auto pair = make_pair();
+    const int before = rcvbuf_of(pair.pooled);
+    pair.pooled.with_receive_buffer(16 * 1024);
+    check(pair.pooled.options().receive_buffer == 16 * 1024, "the builder records the size");
+    check(pair.pooled.apply_options_now().has_value(), "and applies it");
+    // Linux doubles the value it is given, for its own bookkeeping.
+    const int after = rcvbuf_of(pair.pooled);
+    check(after >= 16 * 1024 && after <= 2 * 16 * 1024 && after != before,
+          "SO_RCVBUF is set (" + std::to_string(before) + " -> " + std::to_string(after) + ")");
+}
+
 void test_connection_count() {
     Pool pool(Pool::Timeouts{0ms, 5s}, 64 * 1024);
     check(pool.connection_count() == 0, "an empty pool holds no connections");
@@ -751,6 +767,7 @@ int main() {
     run("stop beats interrupt (regression)", test_stop_still_wins);
     run("receive with a deadline", test_receive_deadline);
     run("connection_count", test_connection_count);
+    run("receive buffer option", test_receive_buffer_option);
     run("pause: data stays in the kernel", test_pause_keeps_data_in_the_kernel);
     run("pause: writes still flow", test_pause_lets_writes_flow);
     run("pause: no read timeout while paused", test_pause_freezes_the_read_timeout);

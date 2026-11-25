@@ -122,9 +122,15 @@ class TcpConnection {
         TcpConnection& with_non_blocking(bool enable = true) noexcept;
         TcpConnection& with_tcp_nodelay(bool enable = true) noexcept;
         TcpConnection& with_keep_alive(bool enable = true) noexcept;
+        // SO_RCVBUF in bytes (0: the kernel's default, which autotunes). A
+        // smaller buffer makes TCP slow a sender down sooner once nothing reads.
+        TcpConnection& with_receive_buffer(int bytes) noexcept;
         TcpConnection& with_options(Options options) noexcept;
 
         const Options& options() const noexcept;
+        // The socket's SO_RCVBUF as the kernel reports it (Linux doubles the
+        // value it is given, for its own bookkeeping).
+        std::expected<int, SocketError> receive_buffer_size() const noexcept;
 
         // Applies the stored options to the fd right now instead of lazily on the
         // first I/O call. Once it has succeeded, send_once()/receive_once() only READ

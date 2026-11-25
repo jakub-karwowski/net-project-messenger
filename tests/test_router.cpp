@@ -187,6 +187,23 @@ void test_backpressure_keeps_the_stream() {
     check(chat(b, cb, a, ca, "and back"), "the link still works both ways");
 }
 
+void test_listener_sets_the_receive_buffer() {
+    TcpListener listener("127.0.0.1", 0, 4);
+    ThreadQueue<msg::RouterMsg> router;
+    ListenerConfig lc;
+    lc.receive_buffer = 16 * 1024;
+    ListenerWorker accept(listener, router, Logger{}, lc);
+    WorkerThread t("listener", [&] { accept.run(); }, [&] { listener.stop(); });
+    auto client = TcpConnection::connect("127.0.0.1", listener.local_port().value_or(0));
+    auto m = wait_for<msg::InboundAccepted>(router, [](const msg::InboundAccepted&) { return true; });
+    check(client.has_value() && m.has_value(), "a connection is accepted");
+    if (!m) { return; }
+    check(m->conn.options().receive_buffer == 16 * 1024 && m->conn.apply_options_now().has_value(),
+          "with the configured receive buffer");
+    const int value = m->conn.receive_buffer_size().value_or(-1);
+    check(value >= 16 * 1024 && value <= 32 * 1024, "applied once the pool adopts it (" + std::to_string(value) + ")");
+}
+
 void test_quit() {
     // A's listening socket stays open until its Node is destroyed (in the app,
     // until the process exits), so B's connection is still accepted by the
@@ -223,6 +240,7 @@ int main() {
     test_dial_refused();
     test_move_keeps_the_stream();
     test_backpressure_keeps_the_stream();
+    test_listener_sets_the_receive_buffer();
     test_quit();
     std::cout << g_checks - g_failures << "/" << g_checks << " checks passed\n";
     return g_failures == 0 ? 0 : 1;

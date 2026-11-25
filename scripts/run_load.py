@@ -42,10 +42,13 @@ CLK_TCK = os.sysconf("SC_CLK_TCK")
 
 NODE_FLAGS = {"--no-balancer"}
 NODE_VALUES = {"--min-pts", "--max-pts", "--balance-period", "--balance-max-moves", "--shutdown-grace", "--max-links",
-               "--max-links-per-pt"}
+               "--max-links-per-pt", "--inbox-high", "--inbox-low", "--rcvbuf"}
 
 METRIC_RE = re.compile(r"^\S+\s+(?P<t>\d+\.\d+) METRIC +\[balancer\] balancer: "
                        r"pt=(?P<pt>\d+) links=(?P<links>\d+) load=(?P<load>[\d.]+) stalled=(?P<stalled>\w+) backlog=(?P<backlog>\d+)$")
+# Inbox depths (QueueMonitor) and the IO workers' backpressure pauses.
+QUEUE_RE = re.compile(r"METRIC +\[queues\] queues: queue_depth (?P<rest>.*)$")
+PAUSE_RE = re.compile(r"METRIC +\[pt-\d+\] pt-\d+: reads=paused")
 # Decisions and topology changes: key=value Metric lines.
 EVENT_RE = re.compile(r"^\S+\s+(?P<t>\d+\.\d+) METRIC +\[balancer\] balancer: (?P<kind>decision|topology)=(?P<what>\w+)(?P<rest>.*)$")
 
@@ -137,7 +140,19 @@ def cpu_percent(samples, first, last):
 def parse_node_log(path):
     ticks = {}
     events = []
+    inbox_max = {}
+    pauses = 0
     for line in path.read_text(errors="replace").splitlines():
+        q = QUEUE_RE.search(line)
+        if q:
+            for kv in q["rest"].split():
+                key, _, value = kv.partition("=")
+                if key.endswith("_max"):
+                    inbox_max[key[:-4]] = max(inbox_max.get(key[:-4], 0), int(value))
+            continue
+        if PAUSE_RE.search(line):
+            pauses += 1
+            continue
         m = METRIC_RE.match(line)
         if m:
             t = round(float(m["t"]), 2)
@@ -151,8 +166,8 @@ def parse_node_log(path):
     series = [{"t": t, "pts": len(pts), "workers": pts} for t, pts in sorted(ticks.items())]
     count = lambda what: sum(1 for e in events if e.get("decision") == what)
     return {"ticks": series, "events": events, "moves": count("move"), "spawns": count("spawn"),
-            "retires": count("retire"), "evictions": count("evict"),
-            "max_pts": max((s["pts"] for s in series), default=0)}
+            "retires": count("retire"), "evictions": count("evict"), "holds": count("hold"),
+            "max_pts": max((s["pts"] for s in series), default=0), "inbox_max": inbox_max, "pauses": pauses}
 
 
 def parse_cpus(text):
@@ -266,7 +281,9 @@ def summary_line(out, result):
     return (f"{out}: {gen['active_ready']} peers, {gen['echoed_per_s']} msg/s echoed, "
             f"rtt p50 {gen['rtt']['p50_ms']:.2f} ms p99 {gen['rtt']['p99_ms']:.2f} ms, lost {gen['lost']}, "
             f"node {node['cpu_percent_total']:.0f}% CPU ({top}), pts max {node.get('max_pt_threads', '?')}, "
-            f"moves {bal.get('moves', '?')}, exit {node['exit_code']} after {node['shutdown_ms']} ms")
+            f"moves {bal.get('moves', '?')}, inbox max {max((bal.get('inbox_max') or {0: 0}).values())}, "
+            f"pauses {bal.get('pauses', '?')}, rss {node['max_rss_kb'] // 1024} MB, refused {gen['send_failed']}, "
+            f"exit {node['exit_code']} after {node['shutdown_ms']} ms")
 
 
 def main(argv):

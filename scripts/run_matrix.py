@@ -4,6 +4,7 @@
     run_matrix.py --out results                 # the full matrix (hours; resumable)
     run_matrix.py --out /tmp/smoke --quick      # a few minutes: short runs, small sweeps
     run_matrix.py --out results --scenarios S1,S4 --variants balancer,fixed-4 --reps 3
+    run_matrix.py --out bp --set backpressure --scenarios S1 --values 1024   # backpressure off / on / rcvbuf
     run_matrix.py --out results --dry-run       # list the cells and estimate the time
 
 Every cell is one run_load.run_cell(): an echo node with the variant's options,
@@ -51,6 +52,18 @@ VARIANTS = {
     "balancer": ["--max-pts", "4"],
     "balancer-fast": ["--max-pts", "4", "--balance-max-moves", "32"],
 }
+
+# Inbound backpressure (on by default): off, on, and on with a small receive
+# buffer, which moves the queueing delay out of the kernel. One IO worker, so
+# the comparison is not mixed up with the cost of several, plus the Balancer.
+BACKPRESSURE_VARIANTS = {
+    "bp-off": ["--no-balancer", "--min-pts", "1", "--inbox-high", "0"],
+    "bp-on": ["--no-balancer", "--min-pts", "1"],
+    "bp-rcvbuf": ["--no-balancer", "--min-pts", "1", "--rcvbuf", "65536"],
+    "balancer-rcvbuf": ["--max-pts", "4", "--rcvbuf", "65536"],
+}
+
+VARIANT_SETS = {"default": VARIANTS, "backpressure": BACKPRESSURE_VARIANTS}
 
 # x: the swept parameter; a loadgen option, except max_links (a node option).
 # base: the other loadgen settings. quick: a shorter sweep for --quick.
@@ -148,6 +161,8 @@ def plan(args):
     for scenario in args.scenarios:
         s = SCENARIOS[scenario]
         values = s["quick"] if args.quick else s["values"]
+        if getattr(args, "values", None):
+            values = [v for v in values if str(v) in args.values]
         for value in values:
             for rep in range(1, args.reps + 1):
                 order = list(args.variants)
@@ -165,7 +180,7 @@ def cell_dir(out, c):
 def run_one(args, c, stamp):
     d = cell_dir(args.out, c)
     node_args, loadgen_args = cell_args(c["scenario"], c["value"], args.quick)
-    node_args = VARIANTS[c["variant"]] + node_args
+    node_args = VARIANT_SETS[getattr(args, "set", "default")][c["variant"]] + node_args
     meta = dict(c, node_args=node_args, loadgen_args=loadgen_args, build=stamp, quick=args.quick,
                 started=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
     t0 = time.monotonic()
@@ -190,7 +205,10 @@ def main(argv):
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--build", type=Path, default=REPO / "build-release")
     p.add_argument("--scenarios", default=",".join(SCENARIOS))
-    p.add_argument("--variants", default=",".join(VARIANTS))
+    p.add_argument("--set", default="default", choices=list(VARIANT_SETS),
+                   help="which variants to compare (default: the node configurations; backpressure: off/on/rcvbuf)")
+    p.add_argument("--variants", default=None, help="a subset of the set's variants")
+    p.add_argument("--values", default=None, help="only these swept values, e.g. 1024 or 64,256")
     p.add_argument("--reps", type=int, default=3)
     p.add_argument("--quick", action="store_true", help="2 s runs and short sweeps (a smoke test)")
     p.add_argument("--node-cpus", default="0-3", help="CPUs for the node (default 0-3)")
@@ -200,13 +218,15 @@ def main(argv):
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
     args.scenarios = [s.strip() for s in args.scenarios.split(",") if s.strip()]
-    args.variants = [v.strip() for v in args.variants.split(",") if v.strip()]
+    variants = VARIANT_SETS[args.set]
+    args.variants = [v.strip() for v in (args.variants or ",".join(variants)).split(",") if v.strip()]
+    args.values = [v.strip() for v in args.values.split(",")] if args.values else None
     for s in args.scenarios:
         if s not in SCENARIOS:
             p.error(f"unknown scenario {s} (known: {', '.join(SCENARIOS)})")
     for v in args.variants:
-        if v not in VARIANTS:
-            p.error(f"unknown variant {v} (known: {', '.join(VARIANTS)})")
+        if v not in variants:
+            p.error(f"unknown variant {v} in set {args.set} (known: {', '.join(variants)})")
     available = os.sched_getaffinity(0)
     args.node_cpus = run_load.parse_cpus(args.node_cpus)
     args.loadgen_cpus = run_load.parse_cpus(args.loadgen_cpus)
@@ -235,7 +255,7 @@ def main(argv):
             sys.exit(f"run_matrix.py: {args.out} already has cells from another build "
                      f"(commit {old['build'].get('commit')}); use a new --out or --force-mixed")
     args.out.mkdir(parents=True, exist_ok=True)
-    (args.out / "run.json").write_text(json.dumps(dict(argv=argv, build=stamp, variants=VARIANTS, scenarios=SCENARIOS,
+    (args.out / "run.json").write_text(json.dumps(dict(argv=argv, build=stamp, variants=variants, scenarios=SCENARIOS,
                                                        quick=args.quick, seed=args.seed), indent=1))
 
     started = time.monotonic()

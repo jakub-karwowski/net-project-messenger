@@ -39,6 +39,10 @@ struct AppConfig {
     // inbox_high 0 turns it off.
     std::size_t inbox_high = 16384;
     std::size_t inbox_low = 0;
+    // SO_RCVBUF of every peer connection in bytes (0: the kernel's default,
+    // which autotunes to several MB). Smaller: under backpressure TCP slows
+    // senders sooner, so less of the queueing delay waits in the kernel.
+    int receive_buffer = 0;
     bool help = false;
 };
 

@@ -19,6 +19,8 @@ struct ListenerConfig {
     std::chrono::milliseconds fd_backoff{100};
     // After any other accept() failure.
     std::chrono::milliseconds error_backoff{10};
+    // SO_RCVBUF of every accepted connection (0: the kernel's default).
+    int receive_buffer = 0;
 };
 
 class ListenerWorker {

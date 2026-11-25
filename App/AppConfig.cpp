@@ -47,7 +47,7 @@ std::expected<AppConfig, std::string> parse_args(std::span<const std::string_vie
                                                    "--max-pts", "--shutdown-grace", "--handshake-timeout",
                                                    "--connect-timeout", "--balance-period", "--max-links",
                                                    "--max-links-per-pt", "--balance-max-moves", "--inbox-batch",
-                                                   "--inbox-high", "--inbox-low"};
+                                                   "--inbox-high", "--inbox-low", "--rcvbuf"};
         if (!std::ranges::contains(kWithValue, opt)) { return std::unexpected(std::format("unknown option {}", opt)); }
         const auto v = value();
         if (!v) { return std::unexpected(v.error()); }
@@ -70,6 +70,10 @@ std::expected<AppConfig, std::string> parse_args(std::span<const std::string_vie
             const auto n = number<std::size_t>(*v);
             if (!n || *n > 100'000'000 || (opt == "--inbox-low" && *n == 0)) { return bad(*v); }
             (opt == "--inbox-high" ? c.inbox_high : c.inbox_low) = *n;
+        } else if (opt == "--rcvbuf") {
+            const auto n = number<int>(*v);
+            if (!n || *n < 0 || *n > 256 * 1024 * 1024) { return bad(*v); }
+            c.receive_buffer = *n;
         } else if (opt == "--inbox-batch") {
             const auto n = number<std::size_t>(*v);
             if (!n || *n == 0 || *n > 1'000'000) { return bad(*v); }
@@ -121,6 +125,7 @@ std::string_view usage() noexcept {
            "  --inbox-high N           stop reading from peers while the Store's or Router's inbox holds\n"
            "                           N messages (default 16384; 0 = never)\n"
            "  --inbox-low N            ... until it is back at N (default: half of --inbox-high)\n"
+           "  --rcvbuf BYTES           receive buffer of every peer connection (default: the kernel's)\n"
            "  --shutdown-grace MS      time to flush links on quit (default 1000)\n"
            "  --handshake-timeout MS   (default 5000)\n"
            "  --connect-timeout MS     per dial attempt (default 5000)\n"

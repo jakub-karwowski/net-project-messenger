@@ -141,6 +141,7 @@ int run_node(const AppConfig& cfg) {
     router_cfg.max_links_per_pt = cfg.max_links_per_pt == 0 ? cfg.max_links : cfg.max_links_per_pt;
     router_cfg.io.handshake_timeout = cfg.handshake_timeout;
     router_cfg.io.connect_timeout = cfg.connect_timeout;
+    router_cfg.io.receive_buffer = cfg.receive_buffer;
     RouterWorker router(router_cfg, router_q, store_q, balancer_q, &supervisor, Logger(core, "router"),
                         [&] { listener->stop(); });
     balance::Config balancer_cfg;
@@ -149,7 +150,9 @@ int run_node(const AppConfig& cfg) {
     balancer_cfg.max_pts = cfg.max_pts;
     balancer_cfg.max_moves_per_tick = cfg.balance_max_moves;
     BalancerWorker balancer(balancer_cfg, balancer_q, router_q, Logger(core, "balancer"), /*timer=*/cfg.balancer);
-    ListenerWorker accept(*listener, router_q, Logger(core, "listener"));
+    ListenerConfig listener_cfg;
+    listener_cfg.receive_buffer = cfg.receive_buffer;
+    ListenerWorker accept(*listener, router_q, Logger(core, "listener"), listener_cfg);
 
     const auto begin_shutdown = [&](std::string_view reason) { supervisor.begin_shutdown(reason); };
     const auto progress = [&] { supervisor.progress(); };
