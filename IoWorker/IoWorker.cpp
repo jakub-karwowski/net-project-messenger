@@ -56,13 +56,20 @@ void IoWorker::run() {
     drain_commands();   // whatever was queued before the thread started
 
     while (!done_) {
-        const auto r = stopping_ ? pool_.receive(rx, std::min(stop_deadline_, Clock::now() + config_.shutdown_poll))
-                                 : pool_.receive(rx);
+        // While reads are paused nothing will wake us when the queues drain, so
+        // poll for that.
+        std::optional<Clock::time_point> deadline;
+        if (stopping_) { deadline = std::min(stop_deadline_, Clock::now() + config_.shutdown_poll); }
+        if (reads_paused_) { deadline = std::min(deadline.value_or(Clock::time_point::max()), Clock::now() + config_.resume_poll); }
+        const auto r = deadline ? pool_.receive(rx, *deadline) : pool_.receive(rx);
         if (r) {
             if (r->kind == Pool::ReceiveResult::Kind::Connected) {
                 on_connected(r->connection_id);
             } else {
                 on_bytes(r->connection_id, std::span<const std::byte>(rx).first(r->bytes_read));
+                // Checked per read, not per message: a read is at most
+                // rx_buffer_size bytes, which bounds the overshoot.
+                if (!reads_paused_ && downstream_congested()) { pause_reads(); }
             }
         } else if (r.error().connection_id != 0) {
             on_connection_error(r.error().connection_id, r.error().error);
@@ -77,6 +84,7 @@ void IoWorker::run() {
                                                          to_string(r.error().error)));
             }
         }
+        if (reads_paused_ && !downstream_congested()) { resume_reads(); }
         if (stopping_ && !done_ && (pool_.connection_count() == 0 || Clock::now() >= stop_deadline_)) {
             finish();
         }
@@ -186,6 +194,7 @@ bool IoWorker::handle_frame(std::uint64_t id, LinkState& st, wire::Message frame
                 st.hs = Hs::Established;
                 std::ignore = pool_.set_timeouts(id, established_timeouts());   // fails only for an unknown id
                 send_router(msg::LinkAcked{st.link, *ack, st.dialing, id});
+                on_established(id);
                 return true;
             }
             break;
@@ -235,6 +244,7 @@ void IoWorker::on(msg::Adopt& m) {
     st.hs = hs;
     st.dec = std::move(m.dec);
     add(*id, std::move(st));
+    if (hs == Hs::Established) { on_established(*id); }
     send_router(msg::LinkAdopted{m.link, config_.pt, *id});
     // A decoder handed over by another worker holds at most the start of a
     // frame, but whatever it can already produce is handled now, not after the
@@ -270,6 +280,7 @@ void IoWorker::on(msg::Bind& m) {
     if (!send_frame(*id, st, m.ack)) { return; }
     st.hs = Hs::Established;
     std::ignore = pool_.set_timeouts(*id, established_timeouts());   // fails only for an unknown id
+    on_established(*id);
 }
 
 void IoWorker::on(msg::Release& m) {
@@ -312,6 +323,13 @@ void IoWorker::on(msg::Probe& m) {
     report.seq = m.seq;
     report.at = Clock::now();
     report.cmd_backlog = commands_.size();
+    Clock::duration paused = paused_unreported_;
+    if (reads_paused_) {
+        paused += report.at - paused_since_;
+        paused_since_ = report.at;
+    }
+    paused_unreported_ = {};
+    report.paused_ms = static_cast<std::uint32_t>(std::chrono::ceil<std::chrono::milliseconds>(paused).count());
     report.links.reserve(by_conn_.size() + departed_.size());
     for (auto& [id, st] : by_conn_) {
         const auto stats = pool_.take_stats(id);
@@ -406,6 +424,37 @@ std::optional<std::uint64_t> IoWorker::conn_of(LinkId link) const {
 
 msg::LinkSample IoWorker::sample(const LinkState& st, const Pool::ConnectionStats& stats, bool gone) const {
     return msg::LinkSample{st.link, st.peer, stats.bytes_received, stats.bytes_sent, st.rx_frames, st.tx_frames, gone};
+}
+
+// ------------------------------------------------------------------ backpressure
+
+void IoWorker::pause_reads() {
+    paused_.clear();
+    for (const auto& [id, st] : by_conn_) {
+        if (st.hs == Hs::Established) { paused_.push_back(id); }
+    }
+    pool_.pause_reading(paused_);
+    reads_paused_ = true;
+    paused_since_ = Clock::now();
+    log_.metric("reads=paused links={} store={} router={}", paused_.size(), store_.approx_size(), router_.approx_size());
+}
+
+void IoWorker::resume_reads() {
+    pool_.resume_reading(paused_);
+    const auto now = Clock::now();
+    const auto lasted = now - paused_since_;
+    paused_unreported_ += lasted;
+    log_.metric("reads=resumed links={} after_ms={}", paused_.size(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(lasted).count());
+    paused_.clear();
+    reads_paused_ = false;
+}
+
+void IoWorker::on_established(std::uint64_t id) {
+    if (!reads_paused_) { return; }
+    const std::uint64_t ids[] = {id};
+    pool_.pause_reading(ids);
+    paused_.push_back(id);
 }
 
 void IoWorker::send_router(msg::RouterMsg m) {

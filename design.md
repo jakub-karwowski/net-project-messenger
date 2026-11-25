@@ -1997,10 +1997,10 @@ limits; `TcpConnection::Options::receive_buffer` can cap them per connection.
 
 ### 16.4 IO worker
 
-- **Pause.** Once per receive round that produced `ChatIn`, check
-  whether the Store's or the Router's queue is `congested()` (two atomic
-  loads). If one is, pause every
-  **established** link of this worker.
+- **Pause.** After every read, check whether the Store's or the Router's
+  queue is `congested()` (two atomic loads). If one is, pause every
+  **established** link of this worker. A read is at most `rx_buffer_size`
+  (64 KiB), which bounds the overshoot per worker.
 - **Handshaking links keep reading.** Their frames go to the Router, are small,
   and the handshake timeout bounds them, so peers can still connect.
 - **Resume.** While paused, `receive` runs with a deadline (`resume_poll`, 1 ms)
@@ -2011,11 +2011,14 @@ limits; `TcpConnection::Options::receive_buffer` can cap them per connection.
 - **Each worker decides alone.** All read the same flags, so they pause and
   resume within one round of each other.
 - **A link adopted while paused** is paused at once if it is established.
-- **Fairness.** A read budget per connection per receive round (bytes or
-  frames): a heavy peer cannot take a whole round, and nothing is added to or
-  removed from epoll for it. Rotating EPOLLIN across connections was rejected:
-  `epoll_ctl` churn for as long as the throttling lasts, a wait for every peer
-  including light ones, and turns that are not fair to traffic.
+- **Fairness: the budget already exists.** Each epoll round the pool reads
+  every ready connection once, at most `rx_buffer_size`; one with more data
+  stays readable and waits for the next round, behind the others. So a heavy
+  peer gets one read per round like everybody else, and no separate budget is
+  needed (a test floods one link and times a message on another). Rotating
+  EPOLLIN across connections was rejected: `epoll_ctl` churn for as long as the
+  throttling lasts, a wait for every peer including light ones, and turns that
+  are not fair to traffic.
 - **Sizing `low`.** The Store must not run dry while a worker waits to resume:
   `low` must exceed what the Store drains in one `resume_poll` (about 100
   messages at 100k msg/s).
@@ -2074,7 +2077,7 @@ Frontend receives nothing.
 |---|---|---|
 | 1 ✅ | `QueueDepth` (base of `ThreadQueue`, own cache line): `approx_size()`, `set_watermarks()`, `congested()`. `QueueMonitor`: each inbox's depth and its maximum as a Metric line every 500 ms, on its own thread, started only when those lines are logged (a log file at `metric` or finer), not registered with the Supervisor | `test_flow` 28 checks: `approx_size` matches `size()` through `push`, `emplace`, `pop` (through a compaction), `pop_all` (partial and full), ticks and shutdown, bounded with 4 producers; the flag at both crossings, held between them, set at once on a queue already past `high`, through `pop_all`, off with `high` 0, with 4 producers; monitor lines and their maxima; `stop()`. Clean under TSan |
 | 2 ✅ | `EpollConnectionPool::pause_reading` / `resume_reading` (spans of ids, one lock); a `reading` flag per entry and `interest_of()`, the one place that computes epoll interest; `timer_count()` for diagnostics | `test_pool` +6 tests (124 checks): data stays in the kernel while paused (unknown ids and a double pause are harmless) and is read on resume; the paused wait sleeps (under 30 ms CPU in 150 ms; it spins if EPOLLIN stays on); 768 KiB of queued TX reaches the peer while paused with nothing read; four timeouts of silence while paused raise no `ReadTimedOut`, the count restarts at resume, still one timer; 50 pause/resume cycles leave one read timer; last data and close of a peer that hangs up while paused; release while paused, another pool reads it. Each of four deliberate breakages (no freeze, a timer per resume, EPOLLIN kept, resume keeping the old count) fails a check. Clean under TSan and ASan+UBSan |
-| 3 | IO worker gating and the read budget | a Store queue the test never drains stops the reads and the peer's writes block; a new link's handshake completes while paused; resume below `low` with every message in order; adopt while paused; `paused_ms` in reports; one heavy link cannot starve another |
+| 3 ✅ | IO worker: `pause_reads()` / `resume_reads()` on the Store's and Router's `congested()`, checked after every read; links established while paused (outbound Ack, inbound `Bind`, adopted) are paused at once; `receive` polls every `resume_poll` (1 ms) while paused; `PtReport::paused_ms`; `reads=paused` / `reads=resumed` Metric lines | `test_io_worker` +5 tests (96 checks): 3000 messages against `high` 64: reads stop, the Store's queue stays put while nobody drains it, `paused_ms` reported; draining resumes, every message once and in order, no paused time afterwards; the sender is blocked by TCP while the Store holds under 5000 (over a million without backpressure); a congested Router queue stops reads too; a new link's handshake completes while paused, its chat waits, an adopted established link is paused at once; a light link's message gets through a flood on another link. Breaking it (never pause, never resume, new links not paused) fails checks. Clean under TSan |
 | 4 | Wiring: `main` sets the watermarks on the Store and Router queues; `--inbox-high`, `--inbox-low`; `NodeHarness` | e2e: a flooding peer with a node whose Store is slowed, memory stays bounded |
 | 5 | Balancer hold while workers are paused | policy tests |
 | 6 | Measurement and analysis | the 1024-peer cells, then S1 and S7: memory flat, p99 bounded by the queueing limit, clean shutdowns. loadgen's refused sends (`send_failed`) are the expected result, not a degraded cell: `analyze.py` reports them separately |

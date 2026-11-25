@@ -47,6 +47,9 @@ struct IoConfig {
     std::size_t rx_buffer_size = 64 * 1024;
     // While shutting down, how often to check whether every link has flushed.
     std::chrono::milliseconds shutdown_poll{20};
+    // While reading is paused for backpressure, how often to check whether
+    // the downstream queues have drained.
+    std::chrono::milliseconds resume_poll{1};
 };
 
 class IoWorker {
@@ -126,6 +129,15 @@ private:
     Pool::Timeouts handshake_timeouts() const noexcept { return {config_.handshake_timeout, config_.write_timeout}; }
     Pool::Timeouts established_timeouts() const noexcept { return {std::chrono::milliseconds{0}, config_.write_timeout}; }
 
+    // Backpressure. Established links stop reading while the Store's or the
+    // Router's inbox is congested (see ThreadQueue::set_watermarks): their data
+    // waits in the kernel, and TCP slows the senders down.
+    bool downstream_congested() const noexcept { return store_.congested() || router_.congested(); }
+    void pause_reads();
+    void resume_reads();
+    // A link that became established: paused at once while reads are paused.
+    void on_established(std::uint64_t id);
+
     void send_router(msg::RouterMsg m);
     void send_store(msg::StoreMsg m);
     void send_balancer(msg::BalancerMsg m);
@@ -145,4 +157,9 @@ private:
     bool stopping_ = false;
     Clock::time_point stop_deadline_{};
     bool done_ = false;
+
+    bool reads_paused_ = false;
+    std::vector<std::uint64_t> paused_;       // pool ids paused by pause_reads(); stale ones are skipped
+    Clock::time_point paused_since_{};
+    Clock::duration paused_unreported_{};     // paused time since the last report, before paused_since_
 };

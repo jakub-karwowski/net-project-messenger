@@ -237,6 +237,9 @@ using PtCommand = std::variant<Adopt, Dial, Bind, Release, Close, Probe, Stop>;
 struct PtReport {
     PtId pt = 0; std::uint64_t seq = 0; Clock::time_point at{};
     std::size_t cmd_backlog = 0; std::vector<LinkSample> links;
+    // How long the worker kept its links from reading since its previous
+    // report, because the Store's or Router's inbox was congested.
+    std::uint32_t paused_ms = 0;
 };
 struct TopologyChanged { PtId pt = 0; bool added = false; };
 struct LinkGone { LinkId link = kNoId; };

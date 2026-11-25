@@ -10,6 +10,7 @@
 #include "IoWorker.hpp"
 #include "Worker.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -501,6 +502,202 @@ void test_pool_stop_ends_the_worker() {
     check(stopped.has_value() && h.thread->finished(), "pool.stop(): PtStopped and the thread returns");
 }
 
+// ------------------------------------------------------------------ backpressure
+
+// One write with `n` chat frames from `peer`, bodies "<prefix><index>".
+msg::Bytes chat_burst(PeerId peer, int first, int n, const std::string& prefix = "") {
+    msg::Bytes out;
+    for (int i = first; i < first + n; ++i) {
+        const auto f = frame_bytes(wire::ChatMessage{0, peer, prefix + std::to_string(i)});
+        out.insert(out.end(), f.begin(), f.end());
+    }
+    return out;
+}
+
+// Takes every ChatIn queued for the Store now; returns their bodies.
+std::vector<std::string> take_chats(ThreadQueue<msg::StoreMsg>& store) {
+    std::vector<std::string> out;
+    std::vector<msg::StoreMsg> batch;
+    while (store.approx_size() > 0 && store.pop_all(batch)) {
+        for (auto& m : batch) {
+            if (auto* c = std::get_if<msg::ChatIn>(&m)) { out.push_back(c->msg.body); }
+        }
+    }
+    return out;
+}
+
+// Waits until `pred` holds or `limit` passes.
+template <class F>
+bool eventually(F pred, std::chrono::milliseconds limit = 2s) {
+    for (const auto until = Clock::now() + limit; Clock::now() < until; std::this_thread::sleep_for(1ms)) {
+        if (pred()) { return true; }
+    }
+    return pred();
+}
+
+std::optional<msg::PtReport> probe(Harness& h, std::uint64_t seq) {
+    h.command(msg::Probe{seq});
+    auto m = next_of(h.balancer, 2s);
+    if (!m) { return std::nullopt; }
+    if (auto* r = std::get_if<msg::PtReport>(&*m)) { return std::move(*r); }
+    return std::nullopt;
+}
+
+void test_backpressure_pauses_and_resumes() {
+    Harness h;
+    h.store.set_watermarks(64, 16);
+    auto [conn, remote] = make_pair();
+    wire::Decoder dec;
+    check(h.establish_inbound(60, 9, std::move(conn), remote, dec).has_value(), "link established");
+
+    // Far more than the high watermark, in small writes so they need many reads.
+    constexpr int kTotal = 3000;
+    std::thread writer([&] {
+        for (int i = 0; i < kTotal; i += 100) { std::ignore = write_bytes(remote, chat_burst(9, i, 100)); }
+    });
+    check(eventually([&] { return h.store.congested(); }), "the Store's queue reaches the high watermark");
+    std::this_thread::sleep_for(100ms);   // the worker would keep reading here without backpressure
+    const std::size_t held = h.store.approx_size();
+    check(held < kTotal, "reads stop: the Store holds " + std::to_string(held) + " of " + std::to_string(kTotal));
+    auto report = probe(h, 1);
+    check(report && report->paused_ms > 0, "the report says the worker is paused");
+    auto still = probe(h, 2);
+    std::this_thread::sleep_for(50ms);
+    check(h.store.approx_size() == held, "and stays stopped while nobody drains the Store");
+
+    // Draining below low resumes the reads, and every message arrives once, in order.
+    std::vector<std::string> got;
+    const auto until = Clock::now() + 5s;
+    while (static_cast<int>(got.size()) < kTotal && Clock::now() < until) {
+        auto more = take_chats(h.store);
+        got.insert(got.end(), more.begin(), more.end());
+        std::this_thread::sleep_for(1ms);
+    }
+    writer.join();
+    bool in_order = static_cast<int>(got.size()) == kTotal;
+    for (int i = 0; in_order && i < kTotal; ++i) { in_order = got[i] == std::to_string(i); }
+    check(in_order, "every message once and in order after resuming (" + std::to_string(got.size()) + ")");
+    std::this_thread::sleep_for(20ms);
+    std::ignore = probe(h, 3);   // the pause so far
+    auto after = probe(h, 4);
+    check(after && after->paused_ms == 0, "once resumed, no more paused time is reported");
+    std::ignore = still;
+}
+
+void test_backpressure_blocks_the_sender() {
+    Harness h;
+    h.store.set_watermarks(32, 8);
+    auto [conn, remote] = make_pair();
+    wire::Decoder dec;
+    check(h.establish_inbound(61, 9, std::move(conn), remote, dec).has_value(), "link established");
+    remote.with_send_timeout(200ms);
+    // Keep writing until the kernel refuses: the node's receive buffer and our
+    // send buffer are full, which is TCP slowing us down.
+    const auto chunk = chat_burst(9, 0, 1000);
+    std::size_t sent = 0;
+    bool blocked = false;
+    for (int i = 0; i < 2000 && !blocked; ++i) {
+        const auto r = remote.send(chunk);
+        if (!r) { blocked = true; break; }
+        sent += chunk.size();
+    }
+    check(blocked, "the sender is blocked after " + std::to_string(sent / 1024) + " KiB");
+    check(h.store.approx_size() < 5000, "while the Store holds only " + std::to_string(h.store.approx_size()));
+}
+
+void test_backpressure_on_the_router_queue() {
+    Harness h;
+    h.router.set_watermarks(8, 2);
+    auto [conn, remote] = make_pair();
+    wire::Decoder dec;
+    check(h.establish_inbound(62, 9, std::move(conn), remote, dec).has_value(), "link established");
+    for (int i = 0; i < 10; ++i) { std::ignore = h.router.push(msg::RouterMsg{msg::PtStopped{7}}); }
+    check(h.router.congested(), "the Router's queue is congested");
+    std::ignore = write_bytes(remote, chat_burst(9, 0, 1));
+    check(h.to_store().has_value(), "the read in flight is delivered");
+    std::ignore = write_bytes(remote, chat_burst(9, 1, 1));
+    check(!next_of(h.store, 150ms), "then reads stop");
+    std::vector<msg::RouterMsg> batch;
+    std::ignore = h.router.pop_all(batch);
+    auto chat = h.to_store();
+    check(chat && chat->msg.body == "1", "the Router drained: the waiting message arrives");
+}
+
+void test_backpressure_handshakes_go_on() {
+    Harness h;
+    h.store.set_watermarks(8, 2);
+    auto [conn, remote] = make_pair();
+    wire::Decoder dec;
+    check(h.establish_inbound(63, 9, std::move(conn), remote, dec).has_value(), "first link established");
+    std::ignore = write_bytes(remote, chat_burst(9, 0, 20));
+    check(eventually([&] { return h.store.congested(); }), "the Store's queue is congested");
+    std::this_thread::sleep_for(20ms);
+
+    // A new peer still gets through its handshake while reads are paused...
+    auto [conn2, remote2] = make_pair();
+    wire::Decoder dec2;
+    check(h.establish_inbound(64, 10, std::move(conn2), remote2, dec2).has_value(), "a new link completes its handshake");
+    // ...and, once established, waits like the others.
+    const std::size_t before = h.store.approx_size();
+    std::ignore = write_bytes(remote2, chat_burst(10, 0, 1, "new"));
+    std::this_thread::sleep_for(150ms);
+    check(h.store.approx_size() == before, "its chat waits for the resume");
+
+    // A link moved here established while reads are paused is paused at once.
+    auto [conn3, remote3] = make_pair();
+    std::ignore = write_bytes(remote3, chat_burst(11, 0, 1, "moved"));
+    std::this_thread::sleep_for(20ms);
+    h.command(msg::Adopt{65, 11, msg::Role::Inbound, std::move(conn3), {}, {}, msg::HandshakeState::Established});
+    check(h.to_router<msg::LinkAdopted>().has_value(), "an established link is adopted");
+    std::this_thread::sleep_for(150ms);
+    check(h.store.approx_size() == before, "and its waiting chat is not read");
+
+    std::vector<std::string> got;
+    const auto until = Clock::now() + 3s;
+    auto has = [&](const std::string& body) { return std::ranges::contains(got, body); };
+    while ((!has("new0") || !has("moved0")) && Clock::now() < until) {
+        auto more = take_chats(h.store);
+        got.insert(got.end(), more.begin(), more.end());
+        std::this_thread::sleep_for(1ms);
+    }
+    check(has("new0") && has("moved0"), "after the resume both arrive");
+}
+
+void test_heavy_link_cannot_starve_a_light_one() {
+    Harness h;
+    auto [heavy_conn, heavy] = make_pair();
+    auto [light_conn, light] = make_pair();
+    wire::Decoder d1;
+    wire::Decoder d2;
+    check(h.establish_inbound(66, 9, std::move(heavy_conn), heavy, d1).has_value(), "heavy link established");
+    check(h.establish_inbound(67, 10, std::move(light_conn), light, d2).has_value(), "light link established");
+    std::atomic<bool> stop{false};
+    std::thread flood([&] {
+        const auto chunk = chat_burst(9, 0, 2000);
+        while (!stop) { std::ignore = write_bytes(heavy, chunk); }
+    });
+    std::this_thread::sleep_for(50ms);   // the heavy link always has data waiting
+    std::atomic<bool> seen{false};
+    std::thread reader([&] {
+        std::vector<msg::StoreMsg> batch;
+        while (!seen && h.store.pop_all(batch)) {
+            for (auto& m : batch) {
+                if (auto* c = std::get_if<msg::ChatIn>(&m); c && c->link == 67) { seen = true; }
+            }
+        }
+    });
+    const auto sent = Clock::now();
+    std::ignore = write_bytes(light, chat_burst(10, 0, 1, "light"));
+    const bool arrived = eventually([&] { return seen.load(); }, 2s);
+    const auto took = Clock::now() - sent;
+    stop = true;
+    flood.join();
+    if (!arrived) { h.store.force_shutdown(); }
+    reader.join();
+    check(arrived && took < 200ms, "the light link's message gets through the flood (" +
+                                       std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(took).count()) + " ms)");
+}
+
 }  // namespace
 
 int main() {
@@ -519,6 +716,11 @@ int main() {
     test_stop_flushes_then_stops();
     test_stop_deadline();
     test_pool_stop_ends_the_worker();
+    test_backpressure_pauses_and_resumes();
+    test_backpressure_blocks_the_sender();
+    test_backpressure_on_the_router_queue();
+    test_backpressure_handshakes_go_on();
+    test_heavy_link_cannot_starve_a_light_one();
     std::cout << g_checks - g_failures << "/" << g_checks << " checks passed\n";
     return g_failures == 0 ? 0 : 1;
 }
