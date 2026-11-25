@@ -128,6 +128,7 @@ int run_node(const AppConfig& cfg) {
     router_cfg.min_pts = cfg.min_pts;
     router_cfg.max_pts = cfg.balancer ? cfg.max_pts : cfg.min_pts;
     router_cfg.max_links = cfg.max_links;
+    router_cfg.inbox_batch = cfg.inbox_batch;
     router_cfg.max_links_per_pt = cfg.max_links_per_pt == 0 ? cfg.max_links : cfg.max_links_per_pt;
     router_cfg.io.handshake_timeout = cfg.handshake_timeout;
     router_cfg.io.connect_timeout = cfg.connect_timeout;
@@ -153,14 +154,14 @@ int run_node(const AppConfig& cfg) {
                              Logger(core, "tui"), begin_shutdown, progress);
     } else {
         lines.emplace(STDIN_FILENO, frontend_q, Logger(core, "input"));
-        cli_frontend.emplace(CliOptions{cfg.stay, cfg.echo}, frontend_q, store_q, out, Logger(core, "cli"), begin_shutdown, progress);
+        cli_frontend.emplace(CliOptions{cfg.stay, cfg.echo, cfg.inbox_batch}, frontend_q, store_q, out, Logger(core, "cli"), begin_shutdown, progress);
     }
 
-    WorkerThread store_thread("store", [&] { worker::run_inbox(store, store_q); },
+    WorkerThread store_thread("store", [&] { worker::run_inbox(store, store_q, cfg.inbox_batch); },
                               [&] { store_q.graceful_shutdown(); }, &supervisor);
     WorkerThread router_thread("router", [&] { router.run(); }, [&] { router_q.graceful_shutdown(); }, &supervisor);
     WorkerThread balancer_thread("balancer", [&] {
-            if (cfg.balancer) { worker::run_inbox(balancer, balancer_q); } else { discard_balancer_messages(balancer_q); }
+            if (cfg.balancer) { worker::run_inbox(balancer, balancer_q, cfg.inbox_batch); } else { discard_balancer_messages(balancer_q); }
         },
                                  [&] { balancer_q.graceful_shutdown(); }, &supervisor);
     WorkerThread listener_thread("listener", [&] { accept.run(); }, [&] { listener->stop(); }, &supervisor);

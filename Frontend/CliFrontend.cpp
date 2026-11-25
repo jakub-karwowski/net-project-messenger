@@ -36,7 +36,7 @@ void CliFrontend::start(const wire::Endpoint& listening, std::size_t pts) {
 }
 
 void CliFrontend::run() {
-    worker::run_inbox(*this, inbox_);
+    worker::run_inbox(*this, inbox_, options_.inbox_batch);
 }
 
 void CliFrontend::write(const std::string& line) {

@@ -120,8 +120,9 @@ void test_run_inbox() {
         std::ignore = q.push(Add{1});
         std::ignore = q.push(Finish{});
         std::ignore = q.push(Add{50});
-        worker::run_inbox(s, q);
-        check(s.total == 1 && q.size() == 1, "run_inbox returns after done(), leaving the rest");
+        worker::run_inbox(s, q, 256);
+        // The rest of the batch is dropped, not dispatched.
+        check(s.total == 1 && s.finished, "run_inbox returns after done(), dispatching nothing after it");
     }
     // Ends when the inbox closes; a graceful close still delivers what is queued.
     {
@@ -130,7 +131,7 @@ void test_run_inbox() {
         std::ignore = q.push(Add{});
         std::ignore = q.push(Add{});
         q.graceful_shutdown();
-        worker::run_inbox(c, q);
+        worker::run_inbox(c, q, 256);
         check(c.seen == 2, "run_inbox drains a gracefully closed inbox, then returns");
     }
     // Ticks from a queue timer arrive as ordinary messages.
@@ -138,7 +139,7 @@ void test_run_inbox() {
         Summer s;
         ThreadQueue<Msg> q;
         const auto id = q.every(5ms, Tick{});
-        std::thread t([&] { worker::run_inbox(s, q); });
+        std::thread t([&] { worker::run_inbox(s, q, 256); });
         std::this_thread::sleep_for(50ms);
         q.cancel(id);
         std::ignore = q.push(Finish{});
@@ -156,7 +157,7 @@ void test_thread_name_and_finished() {
         pthread_getname_np(pthread_self(), buf.data(), buf.size());
         name.set_value(buf.data());
         Counter c;
-        worker::run_inbox(c, q);
+        worker::run_inbox(c, q, 256);
     }, [&] { q.graceful_shutdown(); });
     check(got.wait_for(2s) == std::future_status::ready && got.get() == "store-worker-lo",
           "the thread is named after the worker (truncated to 15 bytes)");
@@ -171,7 +172,7 @@ void test_stop_called_once() {
     std::atomic<int> stops{0};
     ThreadQueue<Msg> q;
     {
-        WorkerThread t("once", [&] { Counter c; worker::run_inbox(c, q); },
+        WorkerThread t("once", [&] { Counter c; worker::run_inbox(c, q, 256); },
                        [&] { stops.fetch_add(1); q.graceful_shutdown(); });
         std::vector<std::thread> callers;
         for (int i = 0; i < 8; ++i) { callers.emplace_back([&] { t.request_stop(); }); }
@@ -203,7 +204,7 @@ void test_exception_goes_to_fatal() {
 void test_stop_per_blocker() {
     {
         ThreadQueue<Msg> q;
-        WorkerThread t("inbox", [&] { Counter c; worker::run_inbox(c, q); }, [&] { q.graceful_shutdown(); });
+        WorkerThread t("inbox", [&] { Counter c; worker::run_inbox(c, q, 256); }, [&] { q.graceful_shutdown(); });
         std::this_thread::sleep_for(10ms);
         t.request_stop();
         check(eventually([&] { return t.finished(); }), "inbox worker: graceful_shutdown() ends pop()");

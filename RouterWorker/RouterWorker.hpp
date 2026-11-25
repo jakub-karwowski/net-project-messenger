@@ -38,6 +38,7 @@ struct RouterConfig {
     std::size_t min_pts = 1;               // IO workers started up front
     std::size_t max_pts = 4;
     std::size_t max_links = 1024;          // over this, new links are refused
+    std::size_t inbox_batch = 256;          // most messages taken from the inbox at once
     std::size_t max_links_per_pt = 1024;   // a full worker gets no new links (default: no cap below max_links)
     IoConfig io;                           // template for every IO worker (pt is set per worker)
     EpollConnectionPool::Timeouts pool_timeouts{std::chrono::milliseconds{0}, std::chrono::seconds{5}};

@@ -7,7 +7,7 @@
 //
 // Driven entirely by its inbox (StoreMsg). Writes FrontendMsg to the frontend
 // and RouterMsg to the Router. Single-threaded: run it with
-// worker::run_inbox(store, store_inbox), or worker::drain() in tests.
+// worker::run_inbox(store, store_inbox, max_batch), or worker::drain() in tests.
 //
 // Request contract: every frontend request with req != 0 gets exactly one
 // Reply, sent before any other event the request causes.

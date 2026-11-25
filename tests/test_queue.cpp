@@ -16,6 +16,7 @@
 #include <string>
 #include <thread>
 #include <variant>
+#include <vector>
 
 namespace {
 
@@ -225,6 +226,144 @@ static_assert(CanTick<ThreadQueue<Msg>, Tick>);
 static_assert(!CanTick<ThreadQueue<Msg>, Unrelated>);
 static_assert(!CanTick<ThreadQueue<int>, Tick>);
 
+
+// --- pop_all -------------------------------------------------------------------
+
+std::vector<int> values(const std::vector<Msg>& batch) {
+    std::vector<int> out;
+    for (const Msg& m : batch) { out.push_back(std::holds_alternative<Work>(m) ? std::get<Work>(m).value : -1); }
+    return out;
+}
+
+void test_pop_all_takes_everything() {
+    ThreadQueue<Msg> q;
+    for (int i = 1; i <= 5; ++i) { std::ignore = q.push(Work{i}); }
+    std::vector<Msg> batch;
+    check(q.pop_all(batch) && values(batch) == std::vector<int>{1, 2, 3, 4, 5}, "every queued value, in order");
+    check(q.size() == 0, "and the queue is empty after it");
+    std::ignore = q.push(Work{6});
+    check(q.pop_all(batch) && values(batch) == std::vector<int>{6}, "the next batch replaces the previous one");
+}
+
+void test_pop_all_max() {
+    ThreadQueue<Msg> q;
+    for (int i = 1; i <= 5; ++i) { std::ignore = q.push(Work{i}); }
+    std::vector<Msg> batch;
+    check(q.pop_all(batch, 2) && values(batch) == std::vector<int>{1, 2}, "at most max values");
+    check(is_work(q.try_pop(), 3), "pop() goes on where the batch stopped");
+    check(q.pop_all(batch, 0) && values(batch) == std::vector<int>{4}, "max 0 counts as 1");
+    std::ignore = q.push(Work{6});
+    check(q.pop_all(batch) && values(batch) == std::vector<int>{5, 6}, "the rest, then the newly pushed");
+}
+
+void test_pop_all_reuses_storage() {
+    ThreadQueue<Msg> q;
+    std::vector<Msg> batch;
+    std::ignore = q.push(Work{0});
+    std::ignore = q.pop_all(batch);
+    std::vector<const Msg*> buffers;
+    for (int round = 0; round < 6; ++round) {
+        for (int i = 0; i < 100; ++i) { std::ignore = q.push(Work{i}); }
+        std::ignore = q.pop_all(batch);
+        buffers.push_back(batch.data());
+    }
+    // Two buffers trade places; neither is reallocated once both are big enough.
+    check(buffers[2] == buffers[4] && buffers[3] == buffers[5] && buffers[4] != buffers[5],
+          "the batch and the queue trade the same two buffers");
+}
+
+void test_pop_all_ticks_first() {
+    ThreadQueue<Msg> q;
+    q.every(5ms, Tick{1});
+    q.every(5ms, Tick{2});
+    std::ignore = q.push(Work{7});
+    std::this_thread::sleep_for(15ms);
+    std::vector<Msg> batch;
+    check(q.pop_all(batch, 1) && batch.size() == 3, "both due ticks and one value");
+    check(std::holds_alternative<Tick>(batch[0]) && std::holds_alternative<Tick>(batch[1])
+              && std::get<Work>(batch[2]).value == 7,
+          "ticks before the value, each once although it is late");
+}
+
+void test_pop_all_blocks_until_push() {
+    ThreadQueue<Msg> q;
+    Watchdog dog(q, 2s);
+    std::thread producer([&] {
+        std::this_thread::sleep_for(20ms);
+        std::ignore = q.push(Work{3});
+    });
+    std::vector<Msg> batch;
+    const auto start = Clock::now();
+    check(q.pop_all(batch) && values(batch) == std::vector<int>{3}, "a blocked pop_all() gets the pushed value");
+    check(Clock::now() - start >= 15ms, "and it waited for it");
+    producer.join();
+}
+
+void test_pop_all_shutdown() {
+    ThreadQueue<Msg> q;
+    std::ignore = q.push(Work{1});
+    std::ignore = q.push(Work{2});
+    q.graceful_shutdown();
+    std::vector<Msg> batch;
+    check(q.pop_all(batch) && values(batch) == std::vector<int>{1, 2}, "graceful: what is queued");
+    check(!q.pop_all(batch) && batch.empty(), "then false, with an empty batch");
+
+    ThreadQueue<Msg> f;
+    std::ignore = f.push(Work{1});
+    f.force_shutdown();
+    batch.assign(1, Work{9});
+    check(!f.pop_all(batch) && batch.empty(), "forced: false at once, and the old batch is cleared");
+
+    ThreadQueue<Msg> w;
+    Watchdog dog(w, 2s);
+    std::thread stopper([&] {
+        std::this_thread::sleep_for(20ms);
+        w.graceful_shutdown();
+    });
+    check(!w.pop_all(batch), "a shutdown wakes a blocked pop_all()");
+    stopper.join();
+}
+
+void test_pop_all_with_pop() {
+    // pop() leaves a taken prefix that pop_all() and compaction must skip.
+    ThreadQueue<Msg> q;
+    for (int i = 0; i < 200; ++i) { std::ignore = q.push(Work{i}); }
+    bool in_order = true;
+    for (int i = 0; i < 150; ++i) { in_order = in_order && is_work(q.try_pop(), i); }
+    check(in_order && q.size() == 50, "pop() through a compaction");
+    std::ignore = q.push(Work{200});
+    std::vector<Msg> batch;
+    std::vector<int> expected;
+    for (int i = 150; i <= 200; ++i) { expected.push_back(i); }
+    check(q.pop_all(batch) && values(batch) == expected, "pop_all() takes the rest after a partial pop()");
+}
+
+void test_pop_all_many_producers() {
+    ThreadQueue<Msg> q;
+    constexpr int kProducers = 4;
+    constexpr int kEach = 20000;
+    std::vector<std::thread> producers;
+    for (int p = 0; p < kProducers; ++p) {
+        producers.emplace_back([&q, p] {
+            for (int i = 0; i < kEach; ++i) { std::ignore = q.push(Work{p * kEach + i}); }
+        });
+    }
+    std::vector<int> next(kProducers, 0);
+    bool ordered = true;
+    int received = 0;
+    std::vector<Msg> batch;
+    while (received < kProducers * kEach && q.pop_all(batch, 100)) {
+        for (const Msg& m : batch) {
+            const int v = std::get<Work>(m).value;
+            ordered = ordered && v % kEach == next[v / kEach]++;
+            ++received;
+        }
+    }
+    for (auto& t : producers) { t.join(); }
+    check(received == kProducers * kEach, "every value from every producer");
+    check(ordered, "each producer's values in its own order");
+}
+
 }  // namespace
 
 int main() {
@@ -241,6 +380,14 @@ int main() {
     run("timer: added while pop() waits", test_timer_added_while_waiting);
     run("timer: no ticks after shutdown", test_no_ticks_after_shutdown);
     run("timer: move-only inbox", test_move_only_inbox);
+    run("pop_all: takes everything", test_pop_all_takes_everything);
+    run("pop_all: at most max", test_pop_all_max);
+    run("pop_all: reuses storage", test_pop_all_reuses_storage);
+    run("pop_all: ticks first", test_pop_all_ticks_first);
+    run("pop_all: blocks until a push", test_pop_all_blocks_until_push);
+    run("pop_all: shutdown", test_pop_all_shutdown);
+    run("pop_all: after a partial pop()", test_pop_all_with_pop);
+    run("pop_all: many producers", test_pop_all_many_producers);
 
     std::cout << (g_checks - g_failures) << '/' << g_checks << " checks passed\n";
     return g_failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

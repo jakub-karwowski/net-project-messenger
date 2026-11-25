@@ -35,7 +35,7 @@ RouterWorker::~RouterWorker() {
 }
 
 void RouterWorker::run() {
-    worker::run_inbox(*this, inbox_);
+    worker::run_inbox(*this, inbox_, config_.inbox_batch);
     // Rule for workers that own threads: stop and join them before returning.
     for (auto& [id, pt] : pts_) { pt.thread->request_stop(); }
     for (auto& [id, pt] : pts_) { pt.thread->join(); }

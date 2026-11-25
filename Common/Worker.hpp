@@ -4,7 +4,8 @@
 //
 //   dispatch(w, msg)      std::visit onto w.on(X&); a missing handler for any
 //                         alternative is a compile error that names it.
-//   run_inbox(w, inbox)   pop + dispatch until the inbox closes or w.done().
+//   run_inbox(w, inbox, max_batch)
+//                         take batches + dispatch until the inbox closes or w.done().
 //   drain(w, inbox)       the same without blocking, for single-threaded tests.
 //   WorkerThread          owns one std::thread: names it, catches whatever
 //                         escapes the body and reports it as fatal, stops it
@@ -20,6 +21,7 @@
 #include <string_view>
 #include <thread>
 #include <variant>
+#include <vector>
 
 // Where a WorkerThread reports a body that ended with an exception.
 //
@@ -73,12 +75,20 @@ concept ReportsDone = requires(const W& w) { { w.done() } -> std::convertible_to
 // The thread body of every inbox-driven worker. Ends when the inbox closes
 // (pop() returns nullopt) or, for workers that define done(), right after the
 // message that made done() true.
+//
+// Messages are taken in batches of up to `max_batch` (at least 1): one lock and
+// at most one wake-up per batch. A due tick is seen once per batch, so the cap
+// bounds how late it can be. Whatever is left of a batch when done() turns
+// true is dropped, like whatever is still queued.
 template <class W, class T>
-void run_inbox(W& w, ThreadQueue<T>& inbox) {
-    while (auto m = inbox.pop()) {
-        dispatch(w, *m);
-        if constexpr (ReportsDone<W>) {
-            if (w.done()) { return; }
+void run_inbox(W& w, ThreadQueue<T>& inbox, std::size_t max_batch) {
+    std::vector<T> batch;
+    while (inbox.pop_all(batch, max_batch)) {
+        for (T& m : batch) {
+            dispatch(w, m);
+            if constexpr (ReportsDone<W>) {
+                if (w.done()) { return; }
+            }
         }
     }
 }

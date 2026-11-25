@@ -33,6 +33,7 @@ struct AppConfig {
     std::chrono::milliseconds connect_timeout{5000};
     std::chrono::milliseconds balance_period{500};
     std::size_t balance_max_moves = 2;       // links the Balancer may move per tick
+    std::size_t inbox_batch = 256;           // most messages a worker takes from its inbox at once
     bool help = false;
 };
 

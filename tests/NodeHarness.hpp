@@ -79,7 +79,7 @@ struct Node {
         store.emplace(sc, frontend, router_q, db, Logger{});
         router.emplace(rc, router_q, store_q, balancer_q, nullptr, Logger{}, [this] { listener.stop(); });
         accept.emplace(listener, router_q, Logger{});
-        store_thread = std::make_unique<WorkerThread>("store", [this] { worker::run_inbox(*store, store_q); },
+        store_thread = std::make_unique<WorkerThread>("store", [this, batch = rc.inbox_batch] { worker::run_inbox(*store, store_q, batch); },
                                                       [this] { store_q.graceful_shutdown(); });
         router_thread = std::make_unique<WorkerThread>("router", [this] { router->run(); },
                                                        [this] { router_q.graceful_shutdown(); });
@@ -87,7 +87,7 @@ struct Node {
                                                          [this] { listener.stop(); });
         if (bc) {
             balancer.emplace(*bc, balancer_q, router_q, Logger{});
-            balancer_thread = std::make_unique<WorkerThread>("balancer", [this] { worker::run_inbox(*balancer, balancer_q); },
+            balancer_thread = std::make_unique<WorkerThread>("balancer", [this, batch = rc.inbox_batch] { worker::run_inbox(*balancer, balancer_q, batch); },
                                                              [this] { balancer_q.graceful_shutdown(); });
         }
     }

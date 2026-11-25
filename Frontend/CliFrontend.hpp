@@ -27,6 +27,7 @@ struct CliOptions {
     // Load-test target: every received message goes straight back to its
     // sender, nothing is stored or printed per message or per peer.
     bool echo = false;
+    std::size_t inbox_batch = 256;   // most messages taken from the inbox at once
 };
 
 class CliFrontend {

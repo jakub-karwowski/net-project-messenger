@@ -79,7 +79,7 @@ struct Child {
         log_thread = std::make_unique<WorkerThread>(
             "logger", [this] { writer.run(); }, [this] { core.queue().graceful_shutdown(); }, &supervisor);
         worker_thread = std::make_unique<WorkerThread>(
-            "store", [this] { worker::run_inbox(worker, inbox); },
+            "store", [this] { worker::run_inbox(worker, inbox, 256); },
             [this] { released = true; inbox.graceful_shutdown(); }, &supervisor);
         supervisor.register_queue([this] { inbox.force_shutdown(); });
         supervisor.register_log_queue([this] { core.queue().graceful_shutdown(); });

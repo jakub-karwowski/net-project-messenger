@@ -46,7 +46,7 @@ std::expected<AppConfig, std::string> parse_args(std::span<const std::string_vie
         constexpr std::string_view kWithValue[] = {"--listen", "--advertise", "--log", "--log-level", "--min-pts",
                                                    "--max-pts", "--shutdown-grace", "--handshake-timeout",
                                                    "--connect-timeout", "--balance-period", "--max-links",
-                                                   "--max-links-per-pt", "--balance-max-moves"};
+                                                   "--max-links-per-pt", "--balance-max-moves", "--inbox-batch"};
         if (!std::ranges::contains(kWithValue, opt)) { return std::unexpected(std::format("unknown option {}", opt)); }
         const auto v = value();
         if (!v) { return std::unexpected(v.error()); }
@@ -65,6 +65,10 @@ std::expected<AppConfig, std::string> parse_args(std::span<const std::string_vie
             const auto n = number<std::size_t>(*v);
             if (!n || *n > 100'000) { return bad(*v); }
             c.balance_max_moves = *n;
+        } else if (opt == "--inbox-batch") {
+            const auto n = number<std::size_t>(*v);
+            if (!n || *n == 0 || *n > 1'000'000) { return bad(*v); }
+            c.inbox_batch = *n;
         } else if (opt == "--max-links" || opt == "--max-links-per-pt") {
             const auto n = number<std::size_t>(*v);
             if (!n || *n == 0 || *n > 1'000'000) { return bad(*v); }
@@ -105,6 +109,7 @@ std::string_view usage() noexcept {
            "  --log PATH               write a log file (default: no log)\n"
            "  --log-level LEVEL        debug, info, metric, warn, error, fatal, off (default info)\n"
            "  --min-pts N / --max-pts N  IO worker threads (default 1 / 4)\n"
+           "  --inbox-batch N          most messages a worker takes from its inbox at once (default 256)\n"
            "  --shutdown-grace MS      time to flush links on quit (default 1000)\n"
            "  --handshake-timeout MS   (default 5000)\n"
            "  --connect-timeout MS     per dial attempt (default 5000)\n"

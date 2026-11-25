@@ -7,9 +7,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <iterator>
+#include <limits>
 #include <mutex>
 #include <optional>
-#include <queue>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -24,9 +25,13 @@
 // message. Because a tick is built when it is due rather than queued in advance,
 // a consumer that falls behind gets one tick, never a backlog of them.
 //
+// Batches: pop_all() hands the consumer everything queued in one go, under one
+// lock, so a busy consumer pays for the lock and the wake-up once per batch
+// rather than once per value.
+//
 // Shutdown: after graceful_shutdown() pop() still returns what is queued, then
 // nullopt; after force_shutdown() it returns nullopt at once. No ticks are
-// produced once either has been called.
+// produced once either has been called. pop_all() follows the same rules.
 template <typename T>
 class ThreadQueue {
     public:
@@ -44,7 +49,7 @@ class ThreadQueue {
             {
                 std::scoped_lock lock(mutex_);
                 if (state_ != QueueState::Open) { return false; }
-                queue_.push(std::move(value));
+                queue_.push_back(std::move(value));
             }
             condition_.notify_one();
             return true;
@@ -54,7 +59,7 @@ class ThreadQueue {
             {
                 std::scoped_lock lock(mutex_);
                 if (state_ != QueueState::Open) { return false; }
-                queue_.emplace(std::forward<Args>(args)...);
+                queue_.emplace_back(std::forward<Args>(args)...);
             }
             condition_.notify_one();
             return true;
@@ -75,6 +80,46 @@ class ThreadQueue {
                 }
                 // Woken by a push, a new timer, a shutdown, a deadline, or
                 // spuriously: the top of the loop sorts out which.
+            }
+        }
+
+        // Blocks like pop(), then replaces `out` with the due ticks followed by up to
+        // `max` (at least 1) queued values, in order. Returns false, with `out`
+        // empty, when pop() would return nullopt.
+        //
+        // `out` is cleared before the lock is taken, so the values it held are
+        // destroyed outside it. When the whole queue fits, `out` and the queue swap
+        // storage: passing the same vector every time, the two keep trading the
+        // same buffers and a steady consumer allocates nothing.
+        [[nodiscard]] bool pop_all(std::vector<T>& out, std::size_t max = std::numeric_limits<size_t>::max()) {
+            out.clear();
+            max = std::max<std::size_t>(max, 1);
+            std::unique_lock<std::mutex> lock(mutex_);
+            for (;;) {
+                if (state_ == QueueState::ForceShutdown) { return false; }
+                if (state_ == QueueState::Open) {
+                    // Each tick taken is rescheduled past now, so this ends.
+                    while (auto tick = take_due_tick_locked(Clock::now())) { out.push_back(std::move(*tick)); }
+                }
+                const std::size_t queued = queue_.size() - head_;
+                if (queued != 0) {
+                    if (out.empty() && head_ == 0 && queued <= max) {
+                        std::swap(out, queue_);
+                    } else {
+                        const auto first = queue_.begin() + static_cast<std::ptrdiff_t>(head_);
+                        const auto count = static_cast<std::ptrdiff_t>(std::min(queued, max));
+                        std::ranges::move(first, first + count, std::back_inserter(out));
+                        head_ += static_cast<std::size_t>(count);
+                        compact_locked();
+                    }
+                }
+                if (!out.empty()) { return true; }
+                if (state_ != QueueState::Open) { return false; }
+                if (timers_.empty()) {
+                    condition_.wait(lock);
+                } else {
+                    condition_.wait_until(lock, earliest_due_locked());
+                }
             }
         }
 
@@ -122,7 +167,7 @@ class ThreadQueue {
         // metrics, not hot paths).
         [[nodiscard]] std::size_t size() const {
             std::scoped_lock lock(mutex_);
-            return queue_.size();
+            return queue_.size() - head_;
         }
         void graceful_shutdown() noexcept { shutdown(ThreadQueue::QueueState::GracefulShutdown); }
         void force_shutdown() noexcept { shutdown( ThreadQueue::QueueState::ForceShutdown); }
@@ -139,7 +184,10 @@ class ThreadQueue {
             TimerId id;
         };
 
-        std::queue<T> queue_;
+        // Values from head_ on are queued; those before it were taken by pop() and
+        // are erased by compact_locked().
+        std::vector<T> queue_;
+        std::size_t head_ = 0;
         std::vector<Timer> timers_;   // a few per queue: a linear scan beats a heap
         mutable std::mutex mutex_;
         std::condition_variable condition_;
@@ -153,10 +201,23 @@ class ThreadQueue {
             if (state_ == QueueState::Open) {
                 if (auto tick = take_due_tick_locked(now)) { return tick; }
             }
-            if (queue_.empty()) { return std::nullopt; }
-            T value = std::move(queue_.front());
-            queue_.pop();
+            if (head_ == queue_.size()) { return std::nullopt; }
+            T value = std::move(queue_[head_++]);
+            compact_locked();
             return value;
+        }
+
+        // Keeps the taken prefix from growing without bound: dropped at once when
+        // nothing is left after it, and moved out once it is most of the vector
+        // (an amortised O(1) cost per value).
+        void compact_locked() {
+            if (head_ == queue_.size()) {
+                queue_.clear();
+                head_ = 0;
+            } else if (head_ >= 64 && head_ * 2 >= queue_.size()) {
+                queue_.erase(queue_.begin(), queue_.begin() + static_cast<std::ptrdiff_t>(head_));
+                head_ = 0;
+            }
         }
 
         // The most overdue timer's tick, rescheduled for its next period.
