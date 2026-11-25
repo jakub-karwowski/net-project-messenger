@@ -12,6 +12,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -33,25 +34,51 @@
 // Shutdown: after graceful_shutdown() pop() still returns what is queued, then
 // nullopt; after force_shutdown() it returns nullopt at once. No ticks are
 // produced once either has been called. pop_all() follows the same rules.
-// How many values a queue holds, readable from any thread without the queue's
-// lock: for producers that throttle on a consumer's backlog (FlowGate) and for
-// monitoring. The queue publishes the exact count after every change, under its
-// lock; a reader sees a recent value, which is all a watermark needs.
+// How full a queue is, readable from any thread without the queue's lock: for
+// producers that throttle on a consumer's backlog, and for monitoring. The
+// queue publishes its exact count after every change, under its lock; a reader
+// sees a recent value.
+//
+// Watermarks (optional): with set_watermarks(high, low), congested() turns on
+// when the queue reaches `high` and off only once it is back at `low`. The
+// switch happens under the queue's lock, at the crossing itself, so every
+// reader sees the same answer, and a queue hovering around one value does not
+// flip it on every message.
 class QueueDepth {
     public:
         [[nodiscard]] std::size_t approx_size() const noexcept { return depth_.load(std::memory_order_relaxed); }
+        [[nodiscard]] bool congested() const noexcept { return congested_.load(std::memory_order_relaxed); }
 
     protected:
         QueueDepth() = default;
         ~QueueDepth() = default;
         QueueDepth(const QueueDepth&) = delete;
         QueueDepth& operator=(const QueueDepth&) = delete;
-        void publish_depth(std::size_t n) noexcept { depth_.store(n, std::memory_order_relaxed); }
+
+        // Both require the queue's lock.
+        void publish_depth(std::size_t n) noexcept {
+            depth_.store(n, std::memory_order_relaxed);
+            if (high_ == 0) { return; }
+            if (n >= high_) {
+                congested_.store(true, std::memory_order_relaxed);
+            } else if (n <= low_) {
+                congested_.store(false, std::memory_order_relaxed);
+            }
+        }
+        void set_depth_watermarks(std::size_t high, std::size_t low) noexcept {
+            high_ = high;
+            low_ = low;
+            const std::size_t n = depth_.load(std::memory_order_relaxed);
+            congested_.store(high_ != 0 && n >= high_, std::memory_order_relaxed);
+        }
 
     private:
-        // A cache line of its own: every push and pop writes it, and readers on
-        // other cores should not pull the queue's other members along with it.
+        // A cache line of their own: every push and pop writes them, and readers
+        // on other cores should not pull the queue's other members along.
         alignas(64) std::atomic<std::size_t> depth_{0};
+        std::atomic<bool> congested_{false};
+        std::size_t high_ = 0;   // 0: no watermarks
+        std::size_t low_ = 0;
 };
 
 template <typename T>
@@ -186,6 +213,16 @@ class ThreadQueue : public QueueDepth {
             static_assert(std::is_nothrow_move_assignable_v<Timer>);
             std::scoped_lock lock(mutex_);
             std::erase_if(timers_, [id](const Timer& timer) { return timer.id == id; });
+        }
+
+        // Turns on congested() (see QueueDepth). Requires low < high; high 0
+        // turns the watermarks off. Safe from any thread.
+        void set_watermarks(std::size_t high, std::size_t low) {
+            if (high != 0 && low >= high) {
+                throw std::invalid_argument("ThreadQueue: the low watermark must be below the high one");
+            }
+            std::scoped_lock lock(mutex_);
+            set_depth_watermarks(high, low);
         }
 
         // Current number of queued values, not counting ticks. Takes the lock;

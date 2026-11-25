@@ -33,7 +33,7 @@ says why.
 | D10 | Render reads keys, interprets commands and draws | **Frontend = input thread + `CommandProcessor` + view.** Two frontends share the command layer: the TUI (Keyboard + `TuiView`) and a headless **agent CLI** (`LineReader` + `JsonlWriter`) with no keyboard listener and no rendering (§14) | Command handling becomes a pure, testable layer. The CLI lets scripts and agents drive real nodes end to end, without a TTY. |
 | D12 | (first version of this design) The Store encodes every frame and walks a peer's endpoints one dial at a time | **The Store hands down values and intent only.** `RouteDial` carries the ordered endpoint list and a `wire::ConnectInfo`; `BindLink` a `wire::ConnectInfoAck`; `RouteSend` a `wire::ChatMessage`. The thread that writes to the connection encodes: Pt-i for the handshake, the Router for chat. Pt-i tries the endpoints in turn within one link and reports one outcome | The Store stays at the level of identities and conversations; byte formats and connection attempts (timeouts, ordering, retries) live with the code that owns the sockets. Ids are still decided by the Store, as values. |
 | D13 | (first version of this design) The Store filters `PeerDown`s of links it no longer uses | **The Router reports peers, not links.** `PeerUp` / `DialDone` name the link now in use; `PeerDown` means the peer has no live link and no dial in progress. A link the Router drops as a duplicate (`Superseded`, `RejectLink`) is never reported | With duplicate links (reconnect, simultaneous dial) the Store cannot tell from link ids alone which one survives: keeping our dial and dropping the inbound link, then the dial failing, left it waiting forever. The Router is the one that decides, so it is the one that reports. |
-| D14 | (first version of this design) Every queue unbounded, no inbound backpressure | **IO workers stop reading when the Store's or Router's inbox passes a high watermark**, and resume below a low one. Reading is paused per connection inside the pool, so writes, timers and handshakes go on. The UI is not on the gate: a slow UI is handled between the Store and the Frontend (§16) | Under overload the backlog grew without bound: 420–464 MB and 16 s round trips in a 20 s run at 1024 peers, and forced shutdowns. Stopping reads lets TCP slow the senders down instead. |
+| D14 | (first version of this design) Every queue unbounded, no inbound backpressure | **IO workers stop reading when the Store's or Router's inbox passes a high watermark**, and resume below a low one. Reading is paused per connection inside the pool, so writes, timers and handshakes go on. The UI's inbox is not watched: a slow UI is handled between the Store and the Frontend (§16) | Under overload the backlog grew without bound: 420–464 MB and 16 s round trips in a 20 s run at 1024 peers, and forced shutdowns. Stopping reads lets TCP slow the senders down instead. |
 | D11 | Requests from the UI are fire-and-forget | Every frontend request carries a **`ReqId`**; the Store answers each with exactly one `Reply` | An agent has to know which `conv` its `/dial` created and whether a command failed, without guessing from later events. |
 
 Everything else (thread set, ownership of PeerTable/ConvStore/ConnTable/LoadLog,
@@ -1919,13 +1919,14 @@ socket ─▶ Pt-i ─ChatIn─▶ Store inbox ─▶ Store ─RouteSend─▶ R
                                               └─MsgAppended─▶ Frontend inbox ─▶ TUI / CLI
 ```
 
-- **The Store's and the Router's inboxes.** Both stages must handle every
-  message, so when either falls behind the only safe answer is to read less from
-  the network. The Store's queue alone is not enough: the Router's inbox is
-  filled by the Store (one `RouteSend` per echoed or sent message), so when the
-  Router is the slowest stage the Store's queue stays short while the Router's
-  grows. In the 1024-peer runs the Router was the busier thread (about 60% of a
-  core against 33–50% for the Store).
+- **The Store's inbox.** Every received message passes through it, so when the
+  Store falls behind the only safe answer is to read less from the network.
+- **The Router's inbox, for echo.** Received chat never reaches the Router: its
+  `RouteSend`s are the messages this node sends, at the rate its user types
+  (times the members of a group). In echo mode (the load-test target) every
+  received message becomes a `RouteSend`, and that is where the 1024-peer
+  backlog built up (§16.1). Watching it costs one atomic load and keeps the
+  benchmark's overload cells bounded.
 - **Not the Frontend's inbox.** The UI is a view of the Store's history; a slow
   terminal or a slow agent must not slow the network down. It is handled between
   the Store and the Frontend (§16.6).
@@ -1936,16 +1937,24 @@ socket ─▶ Pt-i ─ChatIn─▶ Store inbox ─▶ Store ─RouteSend─▶ R
   commands, `PeerUp` / `PeerDown` and subscription changes, so the UI would
   freeze during overload.
 
-**`FlowGate`** (`Common/`). `main` registers the queues to watch; the IO workers
-get a reference and do not know which queues are behind it.
-- `over_high()`: any watched queue at or above `high`;
-- `under_low()`: every watched queue at or below `low`.
+**The queue owns its watermarks** (`QueueDepth`, the base of every
+`ThreadQueue`):
+- `approx_size()`: a relaxed atomic counter, published under the queue's lock
+  after every push, pop and `pop_all`, read without the lock. `size()` takes the
+  mutex, which would add exactly the contention the inbox batches removed.
+- `set_watermarks(high, low)`, once, by `main`; then `congested()`, a relaxed
+  atomic flag. A push that reaches `high` sets it, a pop or `pop_all` that
+  brings the queue down to `low` clears it, both under the lock the queue
+  already holds. The hysteresis is computed once, at the crossings, so every
+  reader sees the same answer.
+- Both atomics sit on a cache line of their own: every push and pop writes
+  them.
 
-**`ThreadQueue::approx_size()`**: a relaxed atomic counter, updated under the
-queue's lock on every push, pop and `pop_all`, read without the lock, on its own
-cache line (every push and pop writes it). `size()` takes the mutex, which would
-add exactly the contention the inbox batches removed. The value is approximate;
-the gap between the watermarks absorbs that.
+The IO workers already hold the Store's and the Router's queues, so they check
+`store.congested() || router.congested()` directly; no other object is
+involved. (A first version had a separate `FlowGate` holding a list of queues
+and the two numbers, with each worker comparing depths itself; it had one user,
+and the workers could briefly disagree.)
 
 ### 16.3 Pausing reads in the pool
 
@@ -1980,16 +1989,17 @@ limits; `TcpConnection::Options::receive_buffer` can cap them per connection.
 ### 16.4 IO worker
 
 - **Pause.** Once per receive round that produced `ChatIn`, check
-  `gate.over_high()` (a few atomic loads). If it is true, pause every
+  whether the Store's or the Router's queue is `congested()` (two atomic
+  loads). If one is, pause every
   **established** link of this worker.
 - **Handshaking links keep reading.** Their frames go to the Router, are small,
   and the handshake timeout bounds them, so peers can still connect.
 - **Resume.** While paused, `receive` runs with a deadline (`resume_poll`, 1 ms)
-  instead of blocking; on every return the worker checks `gate.under_low()` and
-  resumes its paused links. About 1000 wake-ups per second, only while paused.
+  instead of blocking; on every return the worker checks that neither queue is
+  `congested()` any more and resumes its paused links. About 1000 wake-ups per second, only while paused.
   A wake-up from the consumer instead would give `ThreadQueue` callbacks and the
   Store knowledge of the IO workers.
-- **Each worker decides alone.** All read the same depths, so they pause and
+- **Each worker decides alone.** All read the same flags, so they pause and
   resume within one round of each other.
 - **A link adopted while paused** is paused at once if it is established.
 - **Fairness.** A read budget per connection per receive round (bytes or
@@ -2005,7 +2015,7 @@ limits; `TcpConnection::Options::receive_buffer` can cap them per connection.
 
 A paused worker reads less, so its links' rates fall. Taken at face value the
 Balancer would see quiet workers and could retire one or move links onto it,
-but while the gate is closed the bottleneck is downstream, and adding, removing
+but while the queues are congested the bottleneck is downstream, and adding, removing
 or moving workers cannot help.
 
 - `PtReport` gets **`paused_ms`**, the time paused since the last report.
@@ -2053,10 +2063,10 @@ Frontend receives nothing.
 
 | Step | Deliverable | Tests |
 |---|---|---|
-| 1 ✅ | `ThreadQueue::approx_size` (a `QueueDepth` base, own cache line), `FlowGate`, `QueueMonitor` (each inbox's depth and its maximum, a Metric line every 500 ms, on its own thread, not registered with the Supervisor) `test_flow` 24 checks: `approx_size` matches `size()` through `push`, `emplace`, `pop` (through a compaction), `pop_all` (partial and full), ticks and shutdown, and stays bounded with 4 producers; gate hysteresis over two queues; monitor lines and their maxima; `stop()`. Clean under TSan |
+| 1 ✅ | `QueueDepth` (base of `ThreadQueue`, own cache line): `approx_size()`, `set_watermarks()`, `congested()`. `QueueMonitor`: each inbox's depth and its maximum as a Metric line every 500 ms, on its own thread, started only when those lines are logged (a log file at `metric` or finer), not registered with the Supervisor | `test_flow` 28 checks: `approx_size` matches `size()` through `push`, `emplace`, `pop` (through a compaction), `pop_all` (partial and full), ticks and shutdown, bounded with 4 producers; the flag at both crossings, held between them, set at once on a queue already past `high`, through `pop_all`, off with `high` 0, with 4 producers; monitor lines and their maxima; `stop()`. Clean under TSan |
 | 2 | Pool read pausing | data stays in the kernel while paused and arrives in order on resume; writes flow while paused; no read timeout while paused and the timer restarts on resume; `ready_` skips paused; release of a paused connection |
 | 3 | IO worker gating and the read budget | a Store queue the test never drains stops the reads and the peer's writes block; a new link's handshake completes while paused; resume below `low` with every message in order; adopt while paused; `paused_ms` in reports; one heavy link cannot starve another |
-| 4 | Wiring: `main` registers the Store and Router queues; `--inbox-high`, `--inbox-low`; `NodeHarness` | e2e: a flooding peer with a node whose Store is slowed, memory stays bounded |
+| 4 | Wiring: `main` sets the watermarks on the Store and Router queues; `--inbox-high`, `--inbox-low`; `NodeHarness` | e2e: a flooding peer with a node whose Store is slowed, memory stays bounded |
 | 5 | Balancer hold while workers are paused | policy tests |
 | 6 | Measurement and analysis | the 1024-peer cells, then S1 and S7: memory flat, p99 bounded by the queueing limit, clean shutdowns. loadgen's refused sends (`send_failed`) are the expected result, not a degraded cell: `analyze.py` reports them separately |
 | 7 | Store → Frontend coalescing (§16.6) | its own step |

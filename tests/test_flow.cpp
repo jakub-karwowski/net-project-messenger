@@ -1,12 +1,12 @@
 // test_flow.cpp - the pieces of inbound backpressure that need no network:
-// QueueDepth (ThreadQueue::approx_size), FlowGate and QueueMonitor.
+// QueueDepth (ThreadQueue::approx_size and the watermarks) and QueueMonitor.
 //
 // Plain assertions, no framework.
 
-#include "FlowGate.hpp"
 #include "QueueMonitor.hpp"
 #include "ThreadQueue.hpp"
 
+#include <atomic>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -99,36 +99,57 @@ void test_depth_with_many_producers() {
     check(depth_is(q, 0), "zero once everything is taken");
 }
 
-void test_gate() {
-    std::cout << "FlowGate\n";
+void test_watermarks() {
+    std::cout << "watermarks\n";
     bool threw = false;
-    try { FlowGate bad(10, 10); } catch (const std::invalid_argument&) { threw = true; }
+    try { ThreadQueue<Msg> bad; bad.set_watermarks(10, 10); } catch (const std::invalid_argument&) { threw = true; }
     check(threw, "low must be below high");
 
-    FlowGate empty(10, 5);
-    check(!empty.over_high() && empty.under_low(), "no queues: always open");
+    ThreadQueue<Msg> q;
+    auto fill = [&q](int n) { for (int i = 0; i < n; ++i) { std::ignore = q.push(Work{i}); } };
+    auto take = [&q](int n) { for (int i = 0; i < n; ++i) { std::ignore = q.try_pop(); } };
+    fill(20);
+    check(!q.congested(), "no watermarks: never congested");
 
-    ThreadQueue<Msg> a;
-    ThreadQueue<Msg> b;
-    FlowGate gate(10, 5);
-    gate.watch(a);
-    gate.watch(b);
-    auto fill = [](ThreadQueue<Msg>& q, int n) { for (int i = 0; i < n; ++i) { std::ignore = q.push(Work{i}); } };
-    auto take = [](ThreadQueue<Msg>& q, int n) { for (int i = 0; i < n; ++i) { std::ignore = q.try_pop(); } };
+    q.set_watermarks(10, 5);
+    check(q.congested(), "set on a queue already past high: congested at once");
+    take(10);
+    check(q.congested(), "between the marks it stays congested");
+    take(5);
+    check(!q.congested(), "back at low: clear");
+    fill(4);
+    check(!q.congested(), "between the marks it stays clear");
+    fill(1);
+    check(q.congested(), "at high: congested");
+    std::vector<Msg> batch;
+    std::ignore = q.pop_all(batch, 4);
+    check(q.congested(), "a pop_all that stays above low leaves it");
+    std::ignore = q.pop_all(batch);
+    check(!q.congested(), "a pop_all down to empty clears it");
+    std::ignore = q.emplace(Work{1});
+    q.set_watermarks(0, 0);
+    fill(50);
+    check(!q.congested(), "high 0 turns the watermarks off");
+}
 
-    fill(a, 9);
-    check(!gate.over_high() && !gate.under_low(), "between the marks: neither");
-    fill(a, 1);
-    check(gate.over_high(), "one queue at high closes it");
-    take(a, 5);
-    check(!gate.over_high() && gate.under_low(), "back at low: open again");
-    fill(b, 6);
-    check(!gate.under_low(), "every queue must be at low, not just one");
-    fill(b, 4);
-    check(gate.over_high(), "the other queue at high closes it too");
-    take(b, 10);
-    take(a, 5);
-    check(!gate.over_high() && gate.under_low(), "both empty");
+void test_watermarks_with_many_producers() {
+    std::cout << "watermarks with many producers\n";
+    ThreadQueue<Msg> q;
+    q.set_watermarks(1000, 100);
+    std::atomic<bool> go{false};
+    std::vector<std::thread> producers;
+    for (int p = 0; p < 4; ++p) {
+        producers.emplace_back([&] {
+            while (!go.load()) {}
+            for (int i = 0; i < 5000; ++i) { std::ignore = q.push(Work{i}); }
+        });
+    }
+    go = true;
+    for (auto& t : producers) { t.join(); }
+    check(q.congested() && q.approx_size() == 20000, "20000 queued: congested");
+    std::vector<Msg> batch;
+    while (q.approx_size() > 100) { std::ignore = q.pop_all(batch, 37); }
+    check(!q.congested(), "drained to low: clear");
 }
 
 void test_monitor_lines() {
@@ -169,7 +190,8 @@ int main() {
     test_ticks_are_not_counted();
     test_depth_after_shutdown();
     test_depth_with_many_producers();
-    test_gate();
+    test_watermarks();
+    test_watermarks_with_many_producers();
     test_monitor_lines();
     test_monitor_thread();
     std::cout << (g_checks - g_failures) << '/' << g_checks << " checks passed\n";
