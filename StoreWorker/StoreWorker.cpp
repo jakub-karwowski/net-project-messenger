@@ -226,11 +226,10 @@ void StoreWorker::on(msg::ChatIn& m) {
         }
     }
 
-    // A message can overtake the PeerUp/DialDone of its own link (it travels on
-    // a different queue). A link that delivers a message is up.
-    if (peer->link_state == Peer::Link::Dialing || peer->link_state == Peer::Link::Handshaking) {
-        mark_up(*peer, m.link);
-    }
+    // Accepted whatever the peer's link state, which only link events change. A
+    // message travels on a different queue from them: it can overtake the
+    // PeerUp of its own link, or arrive after the PeerDown of an old one, and
+    // neither says anything about the link the peer has now.
     if (created) { emit_state(conv->id); }
 
     const msg::Subscription& sub = subs_.get(conv->id);

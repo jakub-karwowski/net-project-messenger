@@ -520,11 +520,33 @@ void test_chat_overtakes_peer_up() {
     f.clear();
     f.feed(msg::ChatIn{peer, 4, wire::ChatMessage{0, peer, "early"}});
     auto ev = f.events();
-    auto* state = first_of<msg::ConvState>(ev);
-    check(state && state->status == ConvStatus::Connected, "chat before PeerUp: the peer counts as up");
+    const ConvId conv = f.store->convs().order().back();
+    check(f.store->convs().find(conv)->msgs.size() == 1, "chat before PeerUp is stored");
+    check(f.store->peers().find(peer)->link_state == Peer::Link::Handshaking, "but the peer is not up yet");
+    for (const auto* s : all_of<msg::ConvState>(ev)) {
+        check(s->status != ConvStatus::Connected, "and no event says it is");
+    }
     f.feed(msg::PeerUp{peer, 4});
-    auto late = f.events();
-    check(all_of<msg::ConvState>(late).empty(), "the late PeerUp changes nothing");
+    auto up = f.events();
+    const auto states = all_of<msg::ConvState>(up);
+    check(!states.empty() && states.back()->status == ConvStatus::Connected, "PeerUp makes it connected");
+}
+
+void test_late_chat_after_peer_down() {
+    // A message from the old link arrives while the peer is being re-dialled.
+    Fixture f;
+    auto [conv, peer] = f.connect_out(kPeerA, 777, 5);
+    f.feed(msg::PeerDown{peer, 5, msg::LinkDownReason::PeerClosed});
+    f.feed(msg::ReconnectReq{1, conv});
+    f.clear();
+    f.feed(msg::ChatIn{peer, 5, wire::ChatMessage{0, peer, "last words"}});
+    check(f.store->convs().find(conv)->msgs.size() == 1, "the late message is stored");
+    check(f.store->peers().find(peer)->link_state == Peer::Link::Dialing, "the dial in progress is untouched");
+    f.clear();
+    f.feed(msg::PeerDown{peer, kNoId, msg::LinkDownReason::SocketError, SocketError::ConnectionRefused});
+    auto ev = f.events();
+    const auto states = all_of<msg::ConvState>(ev);
+    check(!states.empty() && states.back()->status == ConvStatus::Failed, "and its failure is reported");
 }
 
 void test_echo() {
@@ -676,6 +698,7 @@ int main() {
     test_receive_and_subscriptions();
     test_receive_drops();
     test_chat_overtakes_peer_up();
+    test_late_chat_after_peer_down();
     test_echo();
     test_default_subscription();
     test_close();
