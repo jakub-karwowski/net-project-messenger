@@ -771,7 +771,7 @@ void EpollConnectionPool::connection_remove(uint64_t connection_id) noexcept {
         // EPOLLIN is dropped: nobody reads it any more, and level-triggered
         // EPOLLIN on unread data would spin the loop.
         it->second.status = Entry::Status::Closing;
-        if (set_interest_locked(it->second, connection_id, EPOLLOUT)) { return; }
+        if (update_interest_locked(it->second, connection_id)) { return; }
     }
     drop_locked(it);
 }
@@ -822,8 +822,7 @@ std::expected<void, SocketError> EpollConnectionPool::send(uint64_t connection_i
 
     // The kernel took only part of it. From here a failure drops the connection:
     // some bytes are already on the wire, so refusing the rest would corrupt the stream.
-    if (!entry.append_tx(tx_buffer.subspan(*written))
-        || !set_interest_locked(entry, connection_id, EPOLLIN | EPOLLOUT)) {
+    if (!entry.append_tx(tx_buffer.subspan(*written)) || !update_interest_locked(entry, connection_id)) {
         fail_locked(it, SocketError::Unknown);
         return std::unexpected(SocketError::Unknown);
     }
@@ -849,6 +848,11 @@ EpollConnectionPool::ReceiveOutcome EpollConnectionPool::receive(std::span<std::
 size_t EpollConnectionPool::connection_count() const noexcept {
     std::lock_guard<std::mutex> lock(connections_mutex_);
     return connections_.size();
+}
+
+size_t EpollConnectionPool::timer_count() const noexcept {
+    std::lock_guard<std::mutex> lock(connections_mutex_);
+    return timers_.size();
 }
 
 EpollConnectionPool::ReceiveOutcome EpollConnectionPool::receive_until(std::span<std::byte> rx_buffer,
@@ -937,6 +941,7 @@ void EpollConnectionPool::handle_event_locked(uint64_t token, uint32_t events) n
     // recv() reports what EPOLLHUP/EPOLLERR mean (0 bytes or the error), so
     // they go through the ready queue like data.
     if (events & (EPOLLIN | EPOLLHUP | EPOLLERR)) {
+        if (events & (EPOLLHUP | EPOLLERR)) { it->second.hung_up = true; }
         try {
             ready_.push_back(token);
         } catch (...) {
@@ -963,7 +968,7 @@ bool EpollConnectionPool::flush_locked(EntryIt it) noexcept {
         drop_locked(it);
         return false;
     }
-    if (!set_interest_locked(entry, it->first, EPOLLIN)) {
+    if (!update_interest_locked(entry, it->first)) {
         fail_locked(it, SocketError::Unknown);
         return false;
     }
@@ -996,6 +1001,15 @@ void EpollConnectionPool::expire_timers_locked(Clock::time_point now) noexcept {
         // needs one (the write timer still bounds the flush). set_timeouts()
         // retires a timer by bumping the generation.
         if (entry.status != Entry::Status::Open || entry.rx_generation != node.generation) { continue; }
+        // Paused: nothing can arrive, so silence proves nothing. The timer keeps
+        // itself alive a timeout at a time; resume_reading() restarts the count.
+        if (!entry.reading) {
+            if (!push_timer_locked({now + entry.timeouts.read, node.entry_id, TimerNode::Kind::Read,
+                                    entry.rx_generation}, false)) {
+                fail_locked(it, SocketError::Unknown);
+            }
+            continue;
+        }
         const auto due = entry.last_rx + entry.timeouts.read;
         if (due <= now) {
             fail_locked(it, SocketError::ReadTimedOut);
@@ -1018,6 +1032,9 @@ std::optional<EpollConnectionPool::ReceiveOutcome>
 EpollConnectionPool::read_ready_locked(uint64_t id, std::span<std::byte> rx_buffer) noexcept {
     const auto it = connections_.find(id);
     if (it == connections_.end() || it->second.status != Entry::Status::Open) { return std::nullopt; }
+    // Left in the kernel until resume_reading(), unless the connection is dying:
+    // level-triggered EPOLLHUP would otherwise be reported again and again.
+    if (!it->second.reading && !it->second.hung_up) { return std::nullopt; }
 
     // MSG_DONTWAIT: readiness can be spurious, and a blocking fd would stall the loop.
     const auto read = it->second.connection.receive_once(rx_buffer, MSG_DONTWAIT);
@@ -1037,6 +1054,47 @@ EpollConnectionPool::read_ready_locked(uint64_t id, std::span<std::byte> rx_buff
     const SocketError err = read.error();   // dead socket
     drop_locked(it);
     return std::unexpected(ReceiveError{id, err});
+}
+
+uint32_t EpollConnectionPool::interest_of(const Entry& entry) noexcept {
+    switch (entry.status) {
+        case Entry::Status::Connecting:
+        case Entry::Status::Closing: return EPOLLOUT;
+        case Entry::Status::Open: break;
+    }
+    return (entry.reading ? EPOLLIN : 0u) | (entry.pending_tx().empty() ? 0u : EPOLLOUT);
+}
+
+bool EpollConnectionPool::update_interest_locked(const Entry& entry, uint64_t id) noexcept {
+    return set_interest_locked(entry, id, interest_of(entry));
+}
+
+void EpollConnectionPool::pause_reading(std::span<const uint64_t> connection_ids) noexcept {
+    std::lock_guard<std::mutex> lock(connections_mutex_);
+    for (const uint64_t id : connection_ids) {
+        const auto it = connections_.find(id);
+        if (it == connections_.end() || !it->second.reading) { continue; }
+        it->second.reading = false;
+        if (!update_interest_locked(it->second, id)) { fail_locked(it, SocketError::Unknown); }
+    }
+}
+
+void EpollConnectionPool::resume_reading(std::span<const uint64_t> connection_ids) noexcept {
+    std::lock_guard<std::mutex> lock(connections_mutex_);
+    const auto now = Clock::now();
+    for (const uint64_t id : connection_ids) {
+        const auto it = connections_.find(id);
+        if (it == connections_.end() || it->second.reading) { continue; }
+        Entry& entry = it->second;
+        entry.reading = true;
+        if (!update_interest_locked(entry, id)) {
+            fail_locked(it, SocketError::Unknown);
+            continue;
+        }
+        // The silence while paused does not count. The connection's one read
+        // timer is still queued; it re-checks last_rx when it comes due.
+        entry.last_rx = now;
+    }
 }
 
 bool EpollConnectionPool::set_interest_locked(const Entry& entry, uint64_t id, uint32_t events) noexcept {
@@ -1079,7 +1137,7 @@ void EpollConnectionPool::finish_connect_locked(EntryIt it) noexcept {
     // stale with the status change; the read timeout starts counting now.
     entry.status = Entry::Status::Open;
     entry.last_rx = Clock::now();
-    if (!set_interest_locked(entry, it->first, EPOLLIN) || !arm_read_timer_locked(it, false)) {
+    if (!update_interest_locked(entry, it->first) || !arm_read_timer_locked(it, false)) {
         fail_locked(it, SocketError::Unknown);
         return;
     }

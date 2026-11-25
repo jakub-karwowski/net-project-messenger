@@ -9,6 +9,7 @@
 
 #include <array>
 #include <atomic>
+#include <ctime>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -522,6 +523,173 @@ void test_receive_deadline() {
     check(r && id && r->connection_id == *id && r->bytes_read == 1, "data before the deadline is reported, got " + describe(r));
 }
 
+// --- read pausing (backpressure) -------------------------------------------
+
+// CPU time used by the calling thread.
+std::chrono::nanoseconds thread_cpu() {
+    timespec ts{};
+    ::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return std::chrono::seconds{ts.tv_sec} + std::chrono::nanoseconds{ts.tv_nsec};
+}
+
+void test_pause_keeps_data_in_the_kernel() {
+    auto pair = make_pair();
+    Pool pool;
+    const auto id = pool.connection_add(std::move(pair.pooled));
+    check(id.has_value(), "add");
+    if (!id) { return; }
+    const uint64_t ids[] = {*id, 999};   // an unknown id is skipped
+    pool.pause_reading(ids);
+    pool.pause_reading(ids);              // and pausing twice is harmless
+    check(pair.peer.send(as_bytes("abc")).has_value(), "peer sends while paused");
+
+    std::array<std::byte, 64> buf{};
+    Watchdog dog(pool, 3s);
+    const auto cpu_before = thread_cpu();
+    auto r = pool.receive(buf, Clock::now() + 150ms);
+    const auto cpu = thread_cpu() - cpu_before;
+    check(is_error(r, 0, SocketError::WouldBlock), "nothing is read while paused, got " + describe(r));
+    // Unread data on a level-triggered socket would be reported again and again
+    // if it were still watched for reading: the wait would spin.
+    check(cpu < 30ms, "the paused wait sleeps rather than spins (" +
+                          std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(cpu).count()) + " ms CPU)");
+    pool.resume_reading(ids);
+    r = pool.receive(buf, Clock::now() + 2s);
+    check(r && r->connection_id == *id && as_string(std::span(buf).first(r->bytes_read)) == "abc",
+          "resumed: the data was waiting, got " + describe(r));
+}
+
+void test_pause_lets_writes_flow() {
+    auto pair = make_pair();
+    Pool pool;
+    const auto id = pool.connection_add(std::move(pair.pooled));
+    check(id.has_value(), "add");
+    if (!id) { return; }
+    const uint64_t ids[] = {*id};
+    pool.pause_reading(ids);
+    check(pair.peer.send(as_bytes("unread")).has_value(), "peer sends while paused");
+
+    // More than the socket buffers hold: the rest waits in the TX buffer and
+    // only the pool's EPOLLOUT handling can move it.
+    const std::string big(768 * 1024, 'z');
+    check(pool.send(*id, as_bytes(big)).has_value(), "queue 768 KiB");
+
+    std::atomic<bool> data_seen{false};
+    std::thread loop([&] {
+        std::array<std::byte, 4096> buf{};
+        for (;;) {
+            const auto r = pool.receive(buf);
+            if (!r && r.error().connection_id == 0) { return; }   // stopped
+            if (r && r->connection_id == *id && r->bytes_read > 0) { data_seen = true; }
+        }
+    });
+    pair.peer.with_receive_timeout(2s);
+    std::size_t got = 0;
+    std::array<std::byte, 65536> in{};
+    while (got < big.size()) {
+        const auto n = pair.peer.receive(in);
+        if (!n) { break; }
+        got += *n;
+    }
+    pool.stop();
+    loop.join();
+    check(got == big.size(), "every queued byte reached the peer while paused (" + std::to_string(got) + ")");
+    check(!data_seen, "and nothing was read meanwhile");
+}
+
+void test_pause_freezes_the_read_timeout() {
+    auto pair = make_pair();
+    Pool pool;
+    const auto id = pool.connection_add(std::move(pair.pooled), Pool::Timeouts{.read = 100ms, .write = 5s});
+    check(id.has_value(), "add with a 100 ms read timeout");
+    if (!id) { return; }
+    const uint64_t ids[] = {*id};
+    pool.pause_reading(ids);
+
+    std::array<std::byte, 64> buf{};
+    Watchdog dog(pool, 3s);
+    auto r = pool.receive(buf, Clock::now() + 400ms);
+    check(is_error(r, 0, SocketError::WouldBlock), "four timeouts of silence while paused: no ReadTimedOut, got " + describe(r));
+    check(pool.timer_count() == 1, "the read timer kept itself alive, once (" + std::to_string(pool.timer_count()) + ")");
+    const auto resumed = Clock::now();
+    pool.resume_reading(ids);
+    r = pool.receive(buf, Clock::now() + 2s);
+    const auto after = Clock::now() - resumed;
+    check(is_error(r, *id, SocketError::ReadTimedOut), "resumed: the timeout counts again, got " + describe(r));
+    check(after >= 90ms && after < 1s, "from the resume, not from before the pause");
+}
+
+void test_pause_cycles_keep_one_read_timer() {
+    auto pair = make_pair();
+    Pool pool;
+    const auto added = Clock::now();
+    const auto id = pool.connection_add(std::move(pair.pooled), Pool::Timeouts{.read = 200ms, .write = 5s});
+    check(id.has_value(), "add with a 200 ms read timeout");
+    if (!id) { return; }
+    std::this_thread::sleep_for(150ms);
+    const uint64_t ids[] = {*id};
+    for (int i = 0; i < 50; ++i) {   // many cycles, each must leave no live timer behind
+        pool.pause_reading(ids);
+        pool.resume_reading(ids);
+    }
+    check(pool.timer_count() == 1, "still one read timer after 50 cycles, not one per cycle (" +
+                                       std::to_string(pool.timer_count()) + " queued)");
+    std::array<std::byte, 64> buf{};
+    Watchdog dog(pool, 3s);
+    const auto r = pool.receive(buf, Clock::now() + 2s);
+    const auto since = Clock::now() - added;
+    check(is_error(r, *id, SocketError::ReadTimedOut), "the timeout still fires, got " + describe(r));
+    check(since >= 330ms, "200 ms after the last resume, not at the original deadline");
+}
+
+void test_hang_up_while_paused() {
+    auto pair = make_pair();
+    Pool pool;
+    const auto id = pool.connection_add(std::move(pair.pooled));
+    check(id.has_value(), "add");
+    if (!id) { return; }
+    const uint64_t ids[] = {*id};
+    pool.pause_reading(ids);
+    check(pair.peer.send(as_bytes("bye")).has_value(), "peer sends its last words");
+    std::ignore = pair.peer.shutdown(TcpConnection::Shutdown::Both);
+    { TcpConnection gone = std::move(pair.peer); }
+
+    std::array<std::byte, 64> buf{};
+    Watchdog dog(pool, 3s);
+    // A plain close shows only as readable, so it waits; a reset or a full
+    // hang-up is reported. Either way nothing spins and the data is not lost.
+    auto r = pool.receive(buf, Clock::now() + 200ms);
+    if (is_error(r, 0, SocketError::WouldBlock)) {
+        pool.resume_reading(ids);
+        r = pool.receive(buf, Clock::now() + 2s);
+    }
+    check(r && as_string(std::span(buf).first(r->bytes_read)) == "bye", "the last data is delivered, got " + describe(r));
+    r = pool.receive(buf, Clock::now() + 2s);
+    check(is_error(r, *id, SocketError::ConnectionClosed), "then the close, got " + describe(r));
+}
+
+void test_release_while_paused() {
+    auto pair = make_pair();
+    Pool a;
+    Pool b;
+    const auto id = a.connection_add(std::move(pair.pooled));
+    check(id.has_value(), "add to A");
+    if (!id) { return; }
+    const uint64_t ids[] = {*id};
+    a.pause_reading(ids);
+    check(pair.peer.send(as_bytes("moved")).has_value(), "peer sends while paused on A");
+    std::this_thread::sleep_for(20ms);
+    auto released = a.connection_release(*id);
+    check(released.has_value(), "release from A while paused");
+    if (!released) { return; }
+    const auto id_b = b.connection_add(std::move(released->connection));
+    std::array<std::byte, 64> buf{};
+    Watchdog dog(b, 3s);
+    const auto r = b.receive(buf, Clock::now() + 2s);
+    check(id_b && r && r->connection_id == *id_b && as_string(std::span(buf).first(r->bytes_read)) == "moved",
+          "B reads it, data intact, got " + describe(r));
+}
+
 void test_connection_count() {
     Pool pool(Pool::Timeouts{0ms, 5s}, 64 * 1024);
     check(pool.connection_count() == 0, "an empty pool holds no connections");
@@ -583,6 +751,12 @@ int main() {
     run("stop beats interrupt (regression)", test_stop_still_wins);
     run("receive with a deadline", test_receive_deadline);
     run("connection_count", test_connection_count);
+    run("pause: data stays in the kernel", test_pause_keeps_data_in_the_kernel);
+    run("pause: writes still flow", test_pause_lets_writes_flow);
+    run("pause: no read timeout while paused", test_pause_freezes_the_read_timeout);
+    run("pause: cycles keep one read timer", test_pause_cycles_keep_one_read_timer);
+    run("pause: a hang-up while paused", test_hang_up_while_paused);
+    run("pause: release while paused", test_release_while_paused);
 
     std::cout << (g_checks - g_failures) << '/' << g_checks << " checks passed\n";
     return g_failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

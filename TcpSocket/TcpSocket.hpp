@@ -359,6 +359,10 @@ class EpollConnectionPool {
         // connections still flushing after connection_remove().
         size_t connection_count() const noexcept;
 
+        // How many timers are queued, live or stale (a stale one is discarded
+        // when its deadline comes). For tests and diagnostics.
+        size_t timer_count() const noexcept;
+
         // Queues the whole of tx_buffer or nothing: fails with BufferFull when it does
         // not fit in the connection's free buffer space, ConnectionNotFound for an
         // unknown id, ConnectionClosed when the connection is being removed. A
@@ -418,6 +422,18 @@ class EpollConnectionPool {
         // resets the counters. Fails with ConnectionNotFound for an unknown id.
         std::expected<ConnectionStats, SocketError> take_stats(uint64_t connection_id) noexcept;
 
+        // Stops reading these connections, for backpressure: their incoming data
+        // stays in the kernel, whose receive buffer fills until TCP makes the
+        // sender wait. Everything else goes on: queued data is still sent, errors
+        // are still reported, timers still run, except the read timeout, which
+        // does not count while reading is paused. A connection that hangs up or
+        // fails while paused is still read, so its last data and its end are
+        // reported. Unknown ids are skipped; pausing twice is harmless. A
+        // connection released while paused joins another pool reading again.
+        void pause_reading(std::span<const uint64_t> connection_ids) noexcept;
+        // Reads them again. The read timeout restarts counting now.
+        void resume_reading(std::span<const uint64_t> connection_ids) noexcept;
+
         // Graceful removal: send() refuses new data at once, queued data is still
         // flushed (bounded by the write timeout), then the connection is closed.
         // No-op for an unknown id; receive() reports nothing more for this id.
@@ -453,6 +469,8 @@ class EpollConnectionPool {
             // generation matches, so replacing the read timeout retires the old timer.
             uint64_t rx_generation = 0;
             ConnectionStats stats;
+            bool reading = true;   // false: paused by pause_reading(), no EPOLLIN
+            bool hung_up = false;  // epoll reported EPOLLHUP / EPOLLERR: read it even when paused
 
             Entry(TcpConnection&& connection, Timeouts timeouts, Clock::time_point now) noexcept;
 
@@ -523,6 +541,11 @@ class EpollConnectionPool {
         // (spurious readiness, or the connection is gone or closing).
         std::optional<ReceiveOutcome> read_ready_locked(uint64_t id, std::span<std::byte> rx_buffer) noexcept;
         bool set_interest_locked(const Entry& entry, uint64_t id, uint32_t events) noexcept;
+        // The epoll interest the entry's state calls for: EPOLLOUT while connecting
+        // or closing; while open, EPOLLIN unless reading is paused, plus EPOLLOUT
+        // while TX is queued. Everything but connection_add() sets it through here.
+        static uint32_t interest_of(const Entry& entry) noexcept;
+        bool update_interest_locked(const Entry& entry, uint64_t id) noexcept;
         void drop_locked(EntryIt it) noexcept;
         // Queues an error notice (none when Closing) and drops the connection.
         void fail_locked(EntryIt it, SocketError error) noexcept;

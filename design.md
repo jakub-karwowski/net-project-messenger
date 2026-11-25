@@ -1972,11 +1972,20 @@ reading is paused per connection, inside the pool:
   in the kernel, so the overshoot is the read in progress.
 - **Writes go on.** EPOLLOUT stays armed while TX is pending.
 - **The read timeout is frozen.** A paused connection receives nothing, so
-  without this every paused peer would be dropped as `ReadTimedOut`. A read
-  timer that expires on a paused connection re-arms instead of failing; resume
-  sets `last_rx = now`.
-- **Hang-ups.** EPOLLERR and EPOLLHUP are always reported, so a reset is seen at
-  once; a plain FIN only shows as readable, so it is seen on resume.
+  without this every paused peer would be dropped as `ReadTimedOut`. The
+  connection keeps its one read timer: when it comes due on a paused connection
+  it re-queues itself a timeout later instead of failing, and resume only sets
+  `last_rx = now` (the timer re-checks it when due). Arming a fresh timer on
+  each resume, with a generation bump to retire the old one, was the first
+  version: the retired nodes stay in the heap until their deadlines, up to
+  cycles/s × links × read timeout of them (about 30k at 6 cycles/s, 1024 links
+  and 5 s), and without the bump they would never leave.
+- **Hang-ups.** EPOLLERR and EPOLLHUP are always reported, whatever the
+  interest. A connection that reports one is read even while paused (it would
+  otherwise be reported again on every wait), so its last data and its end are
+  delivered. A plain FIN only shows as readable, so it is seen on resume.
+- **Moves.** A connection released while paused joins its next pool reading;
+  the adopting IO worker pauses it again if it must.
 - **Cost.** One `epoll_ctl` per connection per pause and per resume. Under
   sustained overload the queue swings between the watermarks about
   `store_rate / (high − low)` times per second (50k / 8k ≈ 6): about 12k
@@ -2064,7 +2073,7 @@ Frontend receives nothing.
 | Step | Deliverable | Tests |
 |---|---|---|
 | 1 ✅ | `QueueDepth` (base of `ThreadQueue`, own cache line): `approx_size()`, `set_watermarks()`, `congested()`. `QueueMonitor`: each inbox's depth and its maximum as a Metric line every 500 ms, on its own thread, started only when those lines are logged (a log file at `metric` or finer), not registered with the Supervisor | `test_flow` 28 checks: `approx_size` matches `size()` through `push`, `emplace`, `pop` (through a compaction), `pop_all` (partial and full), ticks and shutdown, bounded with 4 producers; the flag at both crossings, held between them, set at once on a queue already past `high`, through `pop_all`, off with `high` 0, with 4 producers; monitor lines and their maxima; `stop()`. Clean under TSan |
-| 2 | Pool read pausing | data stays in the kernel while paused and arrives in order on resume; writes flow while paused; no read timeout while paused and the timer restarts on resume; `ready_` skips paused; release of a paused connection |
+| 2 ✅ | `EpollConnectionPool::pause_reading` / `resume_reading` (spans of ids, one lock); a `reading` flag per entry and `interest_of()`, the one place that computes epoll interest; `timer_count()` for diagnostics | `test_pool` +6 tests (124 checks): data stays in the kernel while paused (unknown ids and a double pause are harmless) and is read on resume; the paused wait sleeps (under 30 ms CPU in 150 ms; it spins if EPOLLIN stays on); 768 KiB of queued TX reaches the peer while paused with nothing read; four timeouts of silence while paused raise no `ReadTimedOut`, the count restarts at resume, still one timer; 50 pause/resume cycles leave one read timer; last data and close of a peer that hangs up while paused; release while paused, another pool reads it. Each of four deliberate breakages (no freeze, a timer per resume, EPOLLIN kept, resume keeping the old count) fails a check. Clean under TSan and ASan+UBSan |
 | 3 | IO worker gating and the read budget | a Store queue the test never drains stops the reads and the peer's writes block; a new link's handshake completes while paused; resume below `low` with every message in order; adopt while paused; `paused_ms` in reports; one heavy link cannot starve another |
 | 4 | Wiring: `main` sets the watermarks on the Store and Router queues; `--inbox-high`, `--inbox-low`; `NodeHarness` | e2e: a flooding peer with a node whose Store is slowed, memory stays bounded |
 | 5 | Balancer hold while workers are paused | policy tests |
