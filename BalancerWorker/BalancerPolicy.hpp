@@ -27,6 +27,14 @@
 // A stalled worker is neither a source nor a target of anything: a thread that
 // does not answer probes cannot release links either. Stalling is detected,
 // not cured.
+//
+// Hold. While any worker reports that it paused reading (backpressure: the
+// Store's or Router's inbox is congested), the bottleneck is downstream of the
+// workers, and their rates show what they were allowed to read, not what their
+// peers send. No scale out, no scale in and no moves then: more, fewer or
+// rearranged workers cannot help, and the low rates would read as idle
+// workers. The scale-in streak is frozen. Placement of new links and eviction
+// go on: neither changes the workers.
 
 #include "Ids.hpp"
 #include "Messages.hpp"
@@ -82,6 +90,8 @@ struct PtLoad {
     int missed = 0;
     bool stalled = false;
     std::size_t cmd_backlog = 0;
+    std::uint32_t paused_ms = 0;             // reads paused during the last tick (backpressure)
+    std::uint32_t paused_pending_ms = 0;     // reported since, folded in by end_tick
 };
 
 struct State {
@@ -101,6 +111,7 @@ struct Decisions {
     std::vector<msg::MoveLink> moves;
     std::vector<LinkId> evict;
     int low_ticks = 0;                       // the counter's next value
+    bool hold = false;                       // a worker paused reading: no spawn, retire or moves
 };
 
 // ---- folding facts into the state

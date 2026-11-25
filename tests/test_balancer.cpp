@@ -246,6 +246,72 @@ void test_eviction() {
     check(balance::decide(s, c, t0 + 60s).evict.empty(), "max_links 0: never");
 }
 
+// A report from `pt` saying it paused reading for `paused_ms`, folded in by a tick.
+void paused_tick(balance::State& s, const balance::Config& c, std::initializer_list<PtId> pts, std::uint32_t paused_ms,
+                 Clock::time_point at) {
+    for (const PtId pt : pts) { balance::on_report(s, msg::PtReport{pt, 1, at, 0, {}, paused_ms}); }
+    // end_tick recomputes link rates from the (empty) reports; keep the loads.
+    const auto links = s.links;
+    balance::end_tick(s, c, 1s, at);
+    s.links = links;
+}
+
+void test_hold_on_backpressure() {
+    const auto c = config();
+
+    // Overloaded workers that would scale out, but one reports a pause.
+    auto busy = with_pts({0, 1});
+    put_link(busy, 1, 0, 0.9);
+    put_link(busy, 2, 1, 0.9);
+    paused_tick(busy, c, {1}, 40, t0);
+    check(busy.pts.at(1).paused_ms == 40 && busy.pts.at(0).paused_ms == 0, "end_tick folds in the paused time");
+    auto d = balance::decide(busy, c, t0);
+    check(d.hold && !d.spawn, "a paused worker: hold, no scale out");
+    paused_tick(busy, c, {}, 0, t0 + 1s);
+    d = balance::decide(busy, c, t0 + 1s);
+    check(!d.hold && d.spawn, "a tick without pauses: scale out again");
+
+    // Imbalanced workers that would rebalance.
+    auto skewed = with_pts({0, 1});
+    put_link(skewed, 1, 0, 0.5);
+    put_link(skewed, 2, 0, 0.3);
+    paused_tick(skewed, c, {0}, 5, t0);
+    d = balance::decide(skewed, c, t0);
+    check(d.hold && d.moves.empty(), "a paused worker: no moves");
+
+    // Quiet workers on their way to scale in: the streak is frozen, not reset.
+    auto idle = with_pts({0, 1, 2});
+    put_link(idle, 1, 0, 0.05);
+    put_link(idle, 2, 1, 0.01);
+    put_link(idle, 3, 2, 0.02);
+    for (int tick = 1; tick < c.scale_in_ticks; ++tick) { balance::commit(idle, balance::decide(idle, c, t0), t0); }
+    const int streak = idle.low_ticks;
+    paused_tick(idle, c, {2}, 3, t0);
+    d = balance::decide(idle, c, t0);
+    check(d.hold && !d.retire && d.low_ticks == streak, "a paused worker: no retire, the streak frozen at " + std::to_string(streak));
+    balance::commit(idle, d, t0);
+    paused_tick(idle, c, {}, 0, t0 + 1s);
+    d = balance::decide(idle, c, t0 + 1s);
+    check(!d.hold && d.retire.has_value(), "the next quiet tick completes the streak and retires");
+
+    // Placement and eviction go on.
+    auto placed = with_pts({0, 1});
+    put_link(placed, 1, 0, 0.6);
+    paused_tick(placed, c, {0}, 10, t0);
+    d = balance::decide(placed, c, t0);
+    check(d.hold && d.policy.has_value(), "the placement policy is still computed");
+    auto ec = c;
+    ec.max_links = 1;
+    auto crowded = with_pts({0});
+    put_link(crowded, 1, 0, 0.0);
+    put_link(crowded, 2, 0, 0.0);
+    crowded.links.at(1).last_active = t0 - 2 * ec.idle_evict_after;
+    crowded.links.at(2).last_active = t0;
+    paused_tick(crowded, ec, {0}, 10, t0);
+    d = balance::decide(crowded, ec, t0);
+    check(d.hold && d.evict.size() == 1 && d.evict[0] == 1, "eviction still applies");
+}
+
 void test_worker_with_manual_ticks() {
     ThreadQueue<msg::BalancerMsg> inbox;
     ThreadQueue<msg::RouterMsg> router;
@@ -291,6 +357,7 @@ int main() {
     test_scale_out_and_in();
     test_rebalance();
     test_eviction();
+    test_hold_on_backpressure();
     test_worker_with_manual_ticks();
     std::cout << g_checks - g_failures << "/" << g_checks << " checks passed\n";
     return g_failures == 0 ? 0 : 1;

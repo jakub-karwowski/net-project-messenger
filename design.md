@@ -2046,9 +2046,13 @@ or moving workers cannot help.
 
 - `PtReport` gets **`paused_ms`**, the time paused since the last report.
   Paused workers still answer probes, so stall detection is unaffected.
-- While any worker reports `paused_ms > 0` the Balancer **holds**: no spawn, no
-  retire, no moves. It keeps updating its load estimates and logs
-  `decision=hold reason=backpressure`.
+- While any worker paused during the last tick (`paused_ms > 0`, summed over
+  the reports `end_tick` folds in) the Balancer **holds**: no spawn, no retire,
+  no moves. The scale-in streak is frozen, neither advanced nor reset, so a
+  short pause in the middle of a quiet period does not restart the count. It
+  keeps updating its load estimates, the placement policy for new links and
+  eviction (neither changes the workers), and logs
+  `decision=hold reason=backpressure paused_pts=N`.
 - **The Balancer does not decide admission.** It acts on 500 ms ticks, while
   the backlog grows by about 70k messages per second under overload; each
   decision would also take a report, a command and a pool call. Admission is
@@ -2093,6 +2097,6 @@ Frontend receives nothing.
 | 2 ✅ | `EpollConnectionPool::pause_reading` / `resume_reading` (spans of ids, one lock); a `reading` flag per entry and `interest_of()`, the one place that computes epoll interest; `timer_count()` for diagnostics | `test_pool` +6 tests (124 checks): data stays in the kernel while paused (unknown ids and a double pause are harmless) and is read on resume; the paused wait sleeps (under 30 ms CPU in 150 ms; it spins if EPOLLIN stays on); 768 KiB of queued TX reaches the peer while paused with nothing read; four timeouts of silence while paused raise no `ReadTimedOut`, the count restarts at resume, still one timer; 50 pause/resume cycles leave one read timer; last data and close of a peer that hangs up while paused; release while paused, another pool reads it. Each of four deliberate breakages (no freeze, a timer per resume, EPOLLIN kept, resume keeping the old count) fails a check. Clean under TSan and ASan+UBSan |
 | 3 ✅ | IO worker: `pause_reads()` / `resume_reads()` on the Store's and Router's `congested()`, checked after every read; links established while paused (outbound Ack, inbound `Bind`, adopted) are paused at once; `receive` polls every `resume_poll` (1 ms) while paused; `PtReport::paused_ms`; `reads=paused` / `reads=resumed` Metric lines | `test_io_worker` +5 tests (96 checks): 3000 messages against `high` 64: reads stop, the Store's queue stays put while nobody drains it, `paused_ms` reported; draining resumes, every message once and in order, no paused time afterwards; the sender is blocked by TCP while the Store holds under 5000 (over a million without backpressure); a congested Router queue stops reads too; a new link's handshake completes while paused, its chat waits, an adopted established link is paused at once; a light link's message gets through a flood on another link. Breaking it (never pause, never resume, new links not paused) fails checks. Clean under TSan |
 | 4 ✅ | `--inbox-high N` (default 16384, 0 = off) and `--inbox-low N` (default half; must be below high); `main` sets both watermarks on the Store's and Router's inboxes; `NodeHarness::Node(rc, bc, inbox_high)` | `test_router` +1 (38 checks): two in-process nodes, B congests at 2 messages, 2000 messages arrive complete and in order through repeated pauses, B's report shows it paused, the link works both ways after. `test_loadgen` +1 (30 checks): a real `node --echo` flooded by 32 peers: deepest inbox about 2000 with `--inbox-high 2000` (bound 2 × high + one read) and over 5 × high without; no peer dropped; the node with backpressure exits 0. Clean under TSan |
-| 5 | Balancer hold while workers are paused | policy tests |
+| 5 ✅ | `PtLoad::paused_ms` (per tick), `Decisions::hold`; `decide()` skips scaling and rebalancing while held; the hold Metric line | `test_balancer` +1 test (69 checks): a paused worker stops a scale out, a rebalance and a retire; the streak is frozen and the next quiet tick completes it; the policy and eviction still apply; the next tick without pauses decides normally. Breaking it (no hold on scaling, no hold on moves, a hold that resets the streak) fails checks. Clean under TSan |
 | 6 | Measurement and analysis; a node option capping `SO_RCVBUF` on accepted sockets | the 1024-peer cells, then S1 and S7, with and without backpressure and with a capped receive buffer: memory flat, clean shutdowns, and the round trip with the kernel's share of the queueing removed. loadgen's refused sends (`send_failed`) are the expected result, not a degraded cell: `analyze.py` reports them separately |
 | 7 | Store → Frontend coalescing (§16.6) | its own step |

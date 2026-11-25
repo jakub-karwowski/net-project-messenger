@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <utility>
 
 namespace balance {
 
@@ -55,6 +56,7 @@ void on_report(State& s, const msg::PtReport& r) {
         it->second.reported_this_tick = true;
         it->second.last_report = r.at;
         it->second.cmd_backlog = r.cmd_backlog;
+        it->second.paused_pending_ms += r.paused_ms;
     }
     for (const auto& sample : r.links) {
         auto [it, inserted] = s.links.try_emplace(sample.link);
@@ -100,6 +102,7 @@ void end_tick(State& s, const Config& c, std::chrono::duration<double> elapsed, 
         pt.missed = pt.reported_this_tick ? 0 : pt.missed + 1;
         pt.stalled = pt.missed >= c.k_missed;
         pt.reported_this_tick = false;
+        pt.paused_ms = std::exchange(pt.paused_pending_ms, 0);
     }
 }
 
@@ -172,28 +175,33 @@ Decisions decide(const State& s, const Config& c, Clock::time_point now) {
         d.policy = msg::SetPolicy{weighted_sequence(weights, c.policy_len), s.policy_epoch + 1};
     }
 
+    // Backpressure: the workers' rates show what they were allowed to read.
+    d.hold = std::ranges::any_of(s.pts, [](const auto& e) { return e.second.paused_ms > 0; });
+
     // Scaling, by the mean load of the usable workers.
-    const double mean = std::accumulate(usable.begin(), usable.end(), 0.0,
-                                        [&](double sum, PtId pt) { return sum + loads[pt]; })
-                      / static_cast<double>(usable.size());
-    const bool can_spawn = s.pts.size() < c.max_pts && !s.spawn_pending;
-    if (mean > c.hi_watermark * c.capacity && can_spawn) {
-        d.spawn = true;
-        d.low_ticks = 0;
-    } else if (mean < c.lo_watermark * c.capacity && s.pts.size() > c.min_pts && usable.size() > 1 && !s.retiring) {
-        d.low_ticks = s.low_ticks + 1;
-        if (d.low_ticks >= c.scale_in_ticks) {
-            d.retire = *std::ranges::min_element(usable, {}, [&](PtId pt) { return loads[pt]; });
+    if (!d.hold) {
+        const double mean = std::accumulate(usable.begin(), usable.end(), 0.0,
+                                            [&](double sum, PtId pt) { return sum + loads[pt]; })
+                          / static_cast<double>(usable.size());
+        const bool can_spawn = s.pts.size() < c.max_pts && !s.spawn_pending;
+        if (mean > c.hi_watermark * c.capacity && can_spawn) {
+            d.spawn = true;
+            d.low_ticks = 0;
+        } else if (mean < c.lo_watermark * c.capacity && s.pts.size() > c.min_pts && usable.size() > 1 && !s.retiring) {
+            d.low_ticks = s.low_ticks + 1;
+            if (d.low_ticks >= c.scale_in_ticks) {
+                d.retire = *std::ranges::min_element(usable, {}, [&](PtId pt) { return loads[pt]; });
+                d.low_ticks = 0;
+            }
+        } else {
             d.low_ticks = 0;
         }
-    } else {
-        d.low_ticks = 0;
     }
 
     // Rebalance between usable workers (a worker being retired empties itself).
     std::vector<PtId> pool = usable;
     if (d.retire) { std::erase(pool, *d.retire); }
-    if (pool.size() >= 2) {
+    if (!d.hold && pool.size() >= 2) {
         auto hot = *std::ranges::max_element(pool, {}, [&](PtId pt) { return loads[pt]; });
         auto cold = *std::ranges::min_element(pool, {}, [&](PtId pt) { return loads[pt]; });
         if (loads[hot] - loads[cold] > c.imbalance_threshold) {

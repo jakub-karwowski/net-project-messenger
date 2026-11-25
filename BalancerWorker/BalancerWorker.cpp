@@ -1,5 +1,6 @@
 #include "BalancerWorker.hpp"
 
+#include <algorithm>
 #include <tuple>
 #include <utility>
 
@@ -55,6 +56,10 @@ void BalancerWorker::on(msg::BalancerTick&) {
     auto decisions = balance::decide(state_, config_, now);
     // Decisions are measurement data: Metric lines, key=value, logged before
     // commit() so a move still names the pt it leaves.
+    if (decisions.hold) {
+        const auto paused = std::ranges::count_if(state_.pts, [](const auto& e) { return e.second.paused_ms > 0; });
+        log_.metric("decision=hold reason=backpressure paused_pts={}", paused);
+    }
     if (decisions.spawn) { log_.metric("decision=spawn pts={}", state_.pts.size()); }
     if (decisions.retire) { log_.metric("decision=retire pt={}", *decisions.retire); }
     for (const auto& move : decisions.moves) {
