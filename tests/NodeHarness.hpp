@@ -72,7 +72,13 @@ struct Node {
     std::unique_ptr<WorkerThread> balancer_thread;
     ReqId next_req = 1;
 
-    explicit Node(RouterConfig rc = {}, std::optional<balance::Config> bc = std::nullopt) {
+    // inbox_high > 0: backpressure on the Store's and Router's inboxes, low at
+    // half of it, as the node sets it up.
+    explicit Node(RouterConfig rc = {}, std::optional<balance::Config> bc = std::nullopt, std::size_t inbox_high = 0) {
+        if (inbox_high > 0) {
+            store_q.set_watermarks(inbox_high, inbox_high / 2);
+            router_q.set_watermarks(inbox_high, inbox_high / 2);
+        }
         StoreConfig sc;
         sc.advertised = {endpoint()};
         sc.default_subscription = Sub{Sub::Inbound::Forward, Sub::Outbound::Notify, Sub::Lifecycle::Notify};

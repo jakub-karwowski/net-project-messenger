@@ -46,7 +46,8 @@ std::expected<AppConfig, std::string> parse_args(std::span<const std::string_vie
         constexpr std::string_view kWithValue[] = {"--listen", "--advertise", "--log", "--log-level", "--min-pts",
                                                    "--max-pts", "--shutdown-grace", "--handshake-timeout",
                                                    "--connect-timeout", "--balance-period", "--max-links",
-                                                   "--max-links-per-pt", "--balance-max-moves", "--inbox-batch"};
+                                                   "--max-links-per-pt", "--balance-max-moves", "--inbox-batch",
+                                                   "--inbox-high", "--inbox-low"};
         if (!std::ranges::contains(kWithValue, opt)) { return std::unexpected(std::format("unknown option {}", opt)); }
         const auto v = value();
         if (!v) { return std::unexpected(v.error()); }
@@ -65,6 +66,10 @@ std::expected<AppConfig, std::string> parse_args(std::span<const std::string_vie
             const auto n = number<std::size_t>(*v);
             if (!n || *n > 100'000) { return bad(*v); }
             c.balance_max_moves = *n;
+        } else if (opt == "--inbox-high" || opt == "--inbox-low") {
+            const auto n = number<std::size_t>(*v);
+            if (!n || *n > 100'000'000 || (opt == "--inbox-low" && *n == 0)) { return bad(*v); }
+            (opt == "--inbox-high" ? c.inbox_high : c.inbox_low) = *n;
         } else if (opt == "--inbox-batch") {
             const auto n = number<std::size_t>(*v);
             if (!n || *n == 0 || *n > 1'000'000) { return bad(*v); }
@@ -92,6 +97,9 @@ std::expected<AppConfig, std::string> parse_args(std::span<const std::string_vie
     }
     if (c.max_pts < c.min_pts) { return std::unexpected(std::string("--max-pts is below --min-pts")); }
     if (c.echo && c.frontend != AppConfig::Frontend::Cli) { return std::unexpected(std::string("--echo needs --cli")); }
+    if (c.inbox_high > 0 && c.inbox_low >= c.inbox_high) {
+        return std::unexpected(std::string("--inbox-low must be below --inbox-high"));
+    }
     return c;
 }
 
@@ -110,6 +118,9 @@ std::string_view usage() noexcept {
            "  --log-level LEVEL        debug, info, metric, warn, error, fatal, off (default info)\n"
            "  --min-pts N / --max-pts N  IO worker threads (default 1 / 4)\n"
            "  --inbox-batch N          most messages a worker takes from its inbox at once (default 256)\n"
+           "  --inbox-high N           stop reading from peers while the Store's or Router's inbox holds\n"
+           "                           N messages (default 16384; 0 = never)\n"
+           "  --inbox-low N            ... until it is back at N (default: half of --inbox-high)\n"
            "  --shutdown-grace MS      time to flush links on quit (default 1000)\n"
            "  --handshake-timeout MS   (default 5000)\n"
            "  --connect-timeout MS     per dial attempt (default 5000)\n"

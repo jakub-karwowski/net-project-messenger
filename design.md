@@ -1995,6 +1995,20 @@ reading is paused per connection, inside the pool:
 The backlog moves into the kernel's socket buffers, bounded by its TCP memory
 limits; `TcpConnection::Options::receive_buffer` can cap them per connection.
 
+**Memory is bounded, latency is not yet.** Measured in step 4 (`test_loadgen`,
+32 peers offering 640k msg/s to a Debug node): the node's deepest inbox was
+1983–2224 messages with `--inbox-high 2000`, against 240k–447k without
+backpressure (one of those nodes was forced at shutdown). But loadgen's sends
+were never refused: the kernel's buffers, which autotune to several MB per
+connection on loopback, absorbed the excess, and no message sent in the 2 s
+measurement came back within its 0.5 s grace. The queueing delay moved from
+the node's memory into the kernel. Two consequences:
+- Between our own nodes the sender's side is bounded too: once its kernel send
+  buffer is full the sending node's pool TX buffer fills (1 MiB), and further
+  sends fail with `BufferFull`, which the user sees as a failed message.
+- To bound latency at the receiver, cap `SO_RCVBUF` on accepted sockets (a node
+  option, measured in step 6). A smaller buffer makes TCP push back sooner.
+
 ### 16.4 IO worker
 
 - **Pause.** After every read, check whether the Store's or the Router's
@@ -2078,7 +2092,7 @@ Frontend receives nothing.
 | 1 ✅ | `QueueDepth` (base of `ThreadQueue`, own cache line): `approx_size()`, `set_watermarks()`, `congested()`. `QueueMonitor`: each inbox's depth and its maximum as a Metric line every 500 ms, on its own thread, started only when those lines are logged (a log file at `metric` or finer), not registered with the Supervisor | `test_flow` 28 checks: `approx_size` matches `size()` through `push`, `emplace`, `pop` (through a compaction), `pop_all` (partial and full), ticks and shutdown, bounded with 4 producers; the flag at both crossings, held between them, set at once on a queue already past `high`, through `pop_all`, off with `high` 0, with 4 producers; monitor lines and their maxima; `stop()`. Clean under TSan |
 | 2 ✅ | `EpollConnectionPool::pause_reading` / `resume_reading` (spans of ids, one lock); a `reading` flag per entry and `interest_of()`, the one place that computes epoll interest; `timer_count()` for diagnostics | `test_pool` +6 tests (124 checks): data stays in the kernel while paused (unknown ids and a double pause are harmless) and is read on resume; the paused wait sleeps (under 30 ms CPU in 150 ms; it spins if EPOLLIN stays on); 768 KiB of queued TX reaches the peer while paused with nothing read; four timeouts of silence while paused raise no `ReadTimedOut`, the count restarts at resume, still one timer; 50 pause/resume cycles leave one read timer; last data and close of a peer that hangs up while paused; release while paused, another pool reads it. Each of four deliberate breakages (no freeze, a timer per resume, EPOLLIN kept, resume keeping the old count) fails a check. Clean under TSan and ASan+UBSan |
 | 3 ✅ | IO worker: `pause_reads()` / `resume_reads()` on the Store's and Router's `congested()`, checked after every read; links established while paused (outbound Ack, inbound `Bind`, adopted) are paused at once; `receive` polls every `resume_poll` (1 ms) while paused; `PtReport::paused_ms`; `reads=paused` / `reads=resumed` Metric lines | `test_io_worker` +5 tests (96 checks): 3000 messages against `high` 64: reads stop, the Store's queue stays put while nobody drains it, `paused_ms` reported; draining resumes, every message once and in order, no paused time afterwards; the sender is blocked by TCP while the Store holds under 5000 (over a million without backpressure); a congested Router queue stops reads too; a new link's handshake completes while paused, its chat waits, an adopted established link is paused at once; a light link's message gets through a flood on another link. Breaking it (never pause, never resume, new links not paused) fails checks. Clean under TSan |
-| 4 | Wiring: `main` sets the watermarks on the Store and Router queues; `--inbox-high`, `--inbox-low`; `NodeHarness` | e2e: a flooding peer with a node whose Store is slowed, memory stays bounded |
+| 4 ✅ | `--inbox-high N` (default 16384, 0 = off) and `--inbox-low N` (default half; must be below high); `main` sets both watermarks on the Store's and Router's inboxes; `NodeHarness::Node(rc, bc, inbox_high)` | `test_router` +1 (38 checks): two in-process nodes, B congests at 2 messages, 2000 messages arrive complete and in order through repeated pauses, B's report shows it paused, the link works both ways after. `test_loadgen` +1 (30 checks): a real `node --echo` flooded by 32 peers: deepest inbox about 2000 with `--inbox-high 2000` (bound 2 × high + one read) and over 5 × high without; no peer dropped; the node with backpressure exits 0. Clean under TSan |
 | 5 | Balancer hold while workers are paused | policy tests |
-| 6 | Measurement and analysis | the 1024-peer cells, then S1 and S7: memory flat, p99 bounded by the queueing limit, clean shutdowns. loadgen's refused sends (`send_failed`) are the expected result, not a degraded cell: `analyze.py` reports them separately |
+| 6 | Measurement and analysis; a node option capping `SO_RCVBUF` on accepted sockets | the 1024-peer cells, then S1 and S7, with and without backpressure and with a capped receive buffer: memory flat, clean shutdowns, and the round trip with the kernel's share of the queueing removed. loadgen's refused sends (`send_failed`) are the expected result, not a degraded cell: `analyze.py` reports them separately |
 | 7 | Store → Frontend coalescing (§16.6) | its own step |

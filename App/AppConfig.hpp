@@ -34,6 +34,11 @@ struct AppConfig {
     std::chrono::milliseconds balance_period{500};
     std::size_t balance_max_moves = 2;       // links the Balancer may move per tick
     std::size_t inbox_batch = 256;           // most messages a worker takes from its inbox at once
+    // Backpressure: IO workers stop reading while the Store's or Router's inbox
+    // holds inbox_high messages, until it is back at inbox_low (0: high / 2).
+    // inbox_high 0 turns it off.
+    std::size_t inbox_high = 16384;
+    std::size_t inbox_low = 0;
     bool help = false;
 };
 

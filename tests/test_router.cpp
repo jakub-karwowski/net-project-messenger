@@ -165,6 +165,28 @@ void test_move_keeps_the_stream() {
     check(chat(a, ca, b, cb, "outbound after the move"), "outbound traffic works on the new worker");
 }
 
+void test_backpressure_keeps_the_stream() {
+    // B's inboxes congest at 2 messages: its IO worker pauses and resumes over
+    // and over while A streams to it. Nothing may be lost or reordered.
+    Node a;
+    Node b({}, std::nullopt, 2);
+    auto [ca, cb] = connect(a, b);
+    constexpr int kMessages = 2000;
+    for (int i = 0; i < kMessages; ++i) { a.request(msg::SendText{0, ca, "m" + std::to_string(i)}); }
+    int in_order = 0;
+    for (int i = 0; i < kMessages; ++i) {
+        if (!b.message(cb, "m" + std::to_string(i))) { break; }
+        ++in_order;
+    }
+    check(in_order == kMessages, "every message arrives, in order, through the pauses ("
+                                     + std::to_string(in_order) + "/" + std::to_string(kMessages) + ")");
+    std::ignore = b.router_q.push(msg::ProbeAll{1});
+    auto report = wait_for<msg::PtReport>(b.balancer_q, [](const msg::PtReport&) { return true; });
+    check(report && report->paused_ms > 0, "B's IO worker did pause (" +
+                                              std::to_string(report ? report->paused_ms : 0) + " ms)");
+    check(chat(b, cb, a, ca, "and back"), "the link still works both ways");
+}
+
 void test_quit() {
     // A's listening socket stays open until its Node is destroyed (in the app,
     // until the process exits), so B's connection is still accepted by the
@@ -200,6 +222,7 @@ int main() {
     test_simultaneous_reconnect_converges();
     test_dial_refused();
     test_move_keeps_the_stream();
+    test_backpressure_keeps_the_stream();
     test_quit();
     std::cout << g_checks - g_failures << "/" << g_checks << " checks passed\n";
     return g_failures == 0 ? 0 : 1;

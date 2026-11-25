@@ -118,6 +118,14 @@ int run_node(const AppConfig& cfg) {
     ThreadQueue<msg::StoreMsg> store_q;
     ThreadQueue<msg::RouterMsg> router_q;
     ThreadQueue<msg::BalancerMsg> balancer_q;
+    // Backpressure: the IO workers stop reading while either is congested.
+    // Received chat fills the Store's inbox; the Router's fills only when the
+    // node sends as much as it receives (--echo).
+    if (cfg.inbox_high > 0) {
+        const std::size_t low = cfg.inbox_low > 0 ? cfg.inbox_low : cfg.inbox_high / 2;
+        store_q.set_watermarks(cfg.inbox_high, low);
+        router_q.set_watermarks(cfg.inbox_high, low);
+    }
 
     StoreConfig store_cfg;
     store_cfg.advertised = advertised(cfg, port);
