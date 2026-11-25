@@ -63,7 +63,12 @@ BACKPRESSURE_VARIANTS = {
     "balancer-rcvbuf": ["--max-pts", "4", "--rcvbuf", "65536"],
 }
 
-VARIANT_SETS = {"default": VARIANTS, "backpressure": BACKPRESSURE_VARIANTS}
+# The high watermark (low at half): the queueing delay under load is about
+# high / throughput, so a lower mark should lower the round trip.
+WATERMARK_VARIANTS = {f"wm-{n}": ["--no-balancer", "--min-pts", "1", "--inbox-high", str(n)]
+                      for n in (256, 1024, 4096, 16384)}
+
+VARIANT_SETS = {"default": VARIANTS, "backpressure": BACKPRESSURE_VARIANTS, "watermark": WATERMARK_VARIANTS}
 
 # x: the swept parameter; a loadgen option, except max_links (a node option).
 # base: the other loadgen settings. quick: a shorter sweep for --quick.
@@ -206,7 +211,8 @@ def main(argv):
     p.add_argument("--build", type=Path, default=REPO / "build-release")
     p.add_argument("--scenarios", default=",".join(SCENARIOS))
     p.add_argument("--set", default="default", choices=list(VARIANT_SETS),
-                   help="which variants to compare (default: the node configurations; backpressure: off/on/rcvbuf)")
+                   help="which variants to compare (default: the node configurations; backpressure: off/on/rcvbuf; "
+                        "watermark: --inbox-high 256..16384)")
     p.add_argument("--variants", default=None, help="a subset of the set's variants")
     p.add_argument("--values", default=None, help="only these swept values, e.g. 1024 or 64,256")
     p.add_argument("--reps", type=int, default=3)

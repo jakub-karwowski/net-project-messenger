@@ -173,6 +173,8 @@ def test_backpressure_set():
     cells = run_matrix.plan(A)
     check(len(cells) == 4 and all(c["value"] == 1024 for c in cells), "--values keeps only the swept values asked for")
     check(run_matrix.VARIANT_SETS["backpressure"]["bp-off"][-2:] == ["--inbox-high", "0"], "bp-off turns backpressure off")
+    check(list(run_matrix.WATERMARK_VARIANTS) == ["wm-256", "wm-1024", "wm-4096", "wm-16384"]
+          and run_matrix.WATERMARK_VARIANTS["wm-1024"][-1] == "1024", "the watermark sweep, in order")
 
 
 def test_parse_node_log():
