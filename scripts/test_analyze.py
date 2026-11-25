@@ -175,6 +175,24 @@ def test_backpressure_set():
     check(run_matrix.VARIANT_SETS["backpressure"]["bp-off"][-2:] == ["--inbox-high", "0"], "bp-off turns backpressure off")
 
 
+def test_parse_node_log():
+    import run_load
+    lines = [
+        "2026-11-25T10:00:00.000Z      0.500000 METRIC [queues] queues: queue_depth store=3 store_max=900 router=1 router_max=16500 frontend=0 frontend_max=0",
+        "2026-11-25T10:00:00.100Z      0.600000 METRIC [pt-0] pt-0: reads=paused links=1024 store=16384 router=2",
+        "2026-11-25T10:00:00.200Z      0.700000 METRIC [balancer] balancer: decision=hold reason=backpressure paused_pts=1",
+        "2026-11-25T10:00:00.300Z      0.800000 METRIC [balancer] balancer: decision=move link=7 from=0 to=1",
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "node.log"
+        path.write_text("\n".join(lines) + "\n")
+        log = run_load.parse_node_log(path)
+    check(log["inbox_max"] == dict(store=900, router=16500, frontend=0), "inbox maxima from the queue_depth lines")
+    check(log["pauses"] == 1 and log["holds"] == 1 and log["moves"] == 1, "pauses, holds and moves counted")
+    hold = next(e for e in log["events"] if e.get("decision") == "hold")
+    check(hold["reason"] == "backpressure" and hold["paused_pts"] == 1, "a word value stays a string, numbers are numbers")
+
+
 def main():
     print("test_analyze")
     test_quartiles()
@@ -182,6 +200,7 @@ def main():
     test_aggregate_and_report()
     test_plan()
     test_backpressure_set()
+    test_parse_node_log()
     print(f"{checks - failures}/{checks} checks passed")
     return 0 if failures == 0 else 1
 

@@ -162,7 +162,8 @@ def parse_node_log(path):
         e = EVENT_RE.match(line)
         if e:
             fields = dict(kv.split("=", 1) for kv in e["rest"].split())
-            events.append({"t": float(e["t"]), e["kind"]: e["what"], **{k: int(v) for k, v in fields.items()}})
+            events.append({"t": float(e["t"]), e["kind"]: e["what"],
+                           **{k: int(v) if v.lstrip("-").isdigit() else v for k, v in fields.items()}})
     series = [{"t": t, "pts": len(pts), "workers": pts} for t, pts in sorted(ticks.items())]
     count = lambda what: sum(1 for e in events if e.get("decision") == what)
     return {"ticks": series, "events": events, "moves": count("move"), "spawns": count("spawn"),
