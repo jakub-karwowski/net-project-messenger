@@ -101,6 +101,9 @@ private:
         std::uint64_t rx_frames = 0;
         std::uint64_t tx_frames = 0;
         int bad_frames = 0;
+        // read_seq_ at this link's latest read with data (0: never read); the
+        // resume order after a backpressure pause.
+        std::uint64_t last_read = 0;
     };
 
     // How close_link() takes a connection out of the pool.
@@ -164,4 +167,5 @@ private:
     std::vector<std::uint64_t> paused_;       // pool ids paused by pause_reads(); stale ones are skipped
     Clock::time_point paused_since_{};
     Clock::duration paused_unreported_{};     // paused time since the last report, before paused_since_
+    std::uint64_t read_seq_ = 0;              // counts reads with data, for LinkState::last_read
 };

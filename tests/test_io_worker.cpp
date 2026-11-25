@@ -17,6 +17,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <thread>
@@ -698,6 +699,62 @@ void test_heavy_link_cannot_starve_a_light_one() {
                                        std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(took).count()) + " ms)");
 }
 
+void test_backpressure_serves_every_link() {
+    // A cycle reads about one connection: reads of at most 4 KiB (about 40
+    // messages) against a high watermark of 16, drained every 2 ms. In a
+    // fixed resume order the first connection would win every cycle.
+    IoConfig c;
+    c.rx_buffer_size = 4096;
+    Harness h(c);
+    h.store.set_watermarks(16, 8);
+    constexpr int kLinks = 32;
+    std::vector<TcpConnection> remotes;
+    std::vector<wire::Decoder> decs(kLinks);
+    for (int l = 0; l < kLinks; ++l) {
+        auto [conn, remote] = make_pair();
+        remotes.push_back(std::move(remote));
+        check(h.establish_inbound(100 + l, 200 + l, std::move(conn), remotes.back(), decs[l]).has_value(),
+              "link " + std::to_string(l) + " established");
+    }
+    // Each link has far more queued than the window can take.
+    std::vector<std::thread> writers;
+    for (int l = 0; l < kLinks; ++l) {
+        writers.emplace_back([&, l] { std::ignore = write_bytes(remotes[l], chat_burst(200 + l, 0, 3000)); });
+    }
+    std::vector<int> got(kLinks, 0);
+    auto drain = [&] {
+        std::vector<msg::StoreMsg> batch;
+        while (h.store.approx_size() > 0 && h.store.pop_all(batch)) {
+            for (auto& m : batch) {
+                if (auto* chat = std::get_if<msg::ChatIn>(&m); chat && chat->link >= 100 && chat->link < 100 + kLinks) {
+                    ++got[chat->link - 100];
+                }
+            }
+        }
+    };
+    std::this_thread::sleep_for(50ms);   // every link has data waiting
+    drain();
+    std::ranges::fill(got, 0);
+    for (const auto until = Clock::now() + 500ms; Clock::now() < until;) {
+        std::this_thread::sleep_for(2ms);
+        drain();
+    }
+    const double mean = std::accumulate(got.begin(), got.end(), 0.0) / kLinks;
+    const int least = *std::ranges::min_element(got);
+    check(mean > 0 && least >= 0.3 * mean, "every link gets its turn: the least served got " + std::to_string(least)
+                                               + " messages, the mean is " + std::to_string(static_cast<int>(mean)));
+
+    // Let everything through so the writers can finish.
+    h.store.set_watermarks(0, 0);
+    int total = 0;
+    for (const auto until = Clock::now() + 10s; total < kLinks * 3000 && Clock::now() < until;) {
+        drain();
+        total = std::accumulate(got.begin(), got.end(), 0);
+        std::this_thread::sleep_for(1ms);
+    }
+    for (auto& w : writers) { w.join(); }
+}
+
 }  // namespace
 
 int main() {
@@ -721,6 +778,7 @@ int main() {
     test_backpressure_on_the_router_queue();
     test_backpressure_handshakes_go_on();
     test_heavy_link_cannot_starve_a_light_one();
+    test_backpressure_serves_every_link();
     std::cout << g_checks - g_failures << "/" << g_checks << " checks passed\n";
     return g_failures == 0 ? 0 : 1;
 }

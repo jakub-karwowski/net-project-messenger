@@ -2025,11 +2025,24 @@ the node's memory into the kernel. Two consequences:
 - **Each worker decides alone.** All read the same flags, so they pause and
   resume within one round of each other.
 - **A link adopted while paused** is paused at once if it is established.
-- **Fairness: the budget already exists.** Each epoll round the pool reads
-  every ready connection once, at most `rx_buffer_size`; one with more data
-  stays readable and waits for the next round, behind the others. So a heavy
-  peer gets one read per round like everybody else, and no separate budget is
-  needed (a test floods one link and times a message on another). Rotating
+- **Fairness while reading: the budget already exists.** Each epoll round the
+  pool reads every ready connection once, at most `rx_buffer_size`; one with
+  more data stays readable and waits for the next round, behind the others
+  (level-triggered epoll moves each reported connection to the back of its
+  ready list). So a heavy peer gets one read per round like everybody else (a
+  test floods one link and times a message on another).
+- **Fairness across pauses: least recently read first.** A pause empties the
+  kernel's ready list, and on resume it lists readable connections in the
+  order reading is switched back on. In a fixed order, a short cycle (a low
+  watermark) reads only the first connections before the queues fill again,
+  and the rest starve: the watermark sweep (§16.9) showed a p99 of 18–20 s at
+  `--inbox-high` 4096 and below. Every read stamps its link with a sequence
+  number, and `resume_reads()` sorts the paused links by it, oldest first, so
+  whoever was cut off last time goes first now. One sort of at most the
+  worker's links per resume, small next to the `epoll_ctl` calls the resume
+  makes. A test reads about one connection per cycle (4 KiB reads against a
+  watermark of 16) over 32 links: every link gets at least 30% of the mean;
+  without the sort the least served gets nothing. Rotating
   EPOLLIN across connections was rejected: `epoll_ctl` churn for as long as the
   throttling lasts, a wait for every peer including light ones, and turns that
   are not fair to traffic.
