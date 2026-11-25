@@ -13,7 +13,7 @@ says why.
 |---|---|---|
 | Conversations | Direct only: one conversation per peer, one TCP link per peer | Group conversations (§12.1). Ad-hoc routing/relaying is out of scope. |
 | Persistence | None: history and ids live in memory | Persistent peers, ids and history behind a Store-only interface (§12.2) |
-| Inbound backpressure | Unbounded queues | Not planned |
+| Inbound backpressure | Watermarks on the Store and Router inboxes; IO workers stop reading (§16) | Store → Frontend coalescing (§16.6); per-link caps set by the Balancer |
 
 ---
 
@@ -33,6 +33,7 @@ says why.
 | D10 | Render reads keys, interprets commands and draws | **Frontend = input thread + `CommandProcessor` + view.** Two frontends share the command layer: the TUI (Keyboard + `TuiView`) and a headless **agent CLI** (`LineReader` + `JsonlWriter`) with no keyboard listener and no rendering (§14) | Command handling becomes a pure, testable layer. The CLI lets scripts and agents drive real nodes end to end, without a TTY. |
 | D12 | (first version of this design) The Store encodes every frame and walks a peer's endpoints one dial at a time | **The Store hands down values and intent only.** `RouteDial` carries the ordered endpoint list and a `wire::ConnectInfo`; `BindLink` a `wire::ConnectInfoAck`; `RouteSend` a `wire::ChatMessage`. The thread that writes to the connection encodes: Pt-i for the handshake, the Router for chat. Pt-i tries the endpoints in turn within one link and reports one outcome | The Store stays at the level of identities and conversations; byte formats and connection attempts (timeouts, ordering, retries) live with the code that owns the sockets. Ids are still decided by the Store, as values. |
 | D13 | (first version of this design) The Store filters `PeerDown`s of links it no longer uses | **The Router reports peers, not links.** `PeerUp` / `DialDone` name the link now in use; `PeerDown` means the peer has no live link and no dial in progress. A link the Router drops as a duplicate (`Superseded`, `RejectLink`) is never reported | With duplicate links (reconnect, simultaneous dial) the Store cannot tell from link ids alone which one survives: keeping our dial and dropping the inbound link, then the dial failing, left it waiting forever. The Router is the one that decides, so it is the one that reports. |
+| D14 | (first version of this design) Every queue unbounded, no inbound backpressure | **IO workers stop reading when the Store's or Router's inbox passes a high watermark**, and resume below a low one. Reading is paused per connection inside the pool, so writes, timers and handshakes go on. The UI is not on the gate: a slow UI is handled between the Store and the Frontend (§16) | Under overload the backlog grew without bound: 420–464 MB and 16 s round trips in a 20 s run at 1024 peers, and forced shutdowns. Stopping reads lets TCP slow the senders down instead. |
 | D11 | Requests from the UI are fire-and-forget | Every frontend request carries a **`ReqId`**; the Store answers each with exactly one `Reply` | An agent has to know which `conv` its `/dial` created and whether a command failed, without guessing from later events. |
 
 Everything else (thread set, ownership of PeerTable/ConvStore/ConnTable/LoadLog,
@@ -82,8 +83,10 @@ the scenario list) stays as in project.md.
 **Queue rules.**
 - Every queue is unbounded, so a `push` never blocks. That keeps the
   Store↔Router and Router↔Pt-i cycles deadlock-free.
-- The only backpressure is the pool's TX buffer limit. `BufferFull` surfaces as a
-  failed send in the UI.
+- Backpressure is applied where data enters, not by blocking pushes: the pool's
+  TX buffer limit (`BufferFull` surfaces as a failed send in the UI), and IO
+  workers that stop reading while the Store's or Router's inbox is too deep
+  (§16).
 - A `push` that returns `false` means the target is shutting down. The sender
   drops the message and logs it at debug level.
 
@@ -1791,9 +1794,9 @@ summary. It needs only the Python standard library and uses `build-release/`.
    `max_moves_per_tick` per tick. At the default 2 moves per tick, 512 links
    would take minutes. `--balance-max-moves 32` spreads them over 4 pts in a few
    seconds (96/128/160/128).
-3. **There is no backpressure on inbound traffic** (a scope decision at the top
-   of this document). When the node is overloaded its queues grow without bound,
-   latency follows, and memory with it.
+3. **There is no backpressure on inbound traffic** (at the time a scope
+   decision at the top of this document). When the node is overloaded its queues
+   grow without bound, latency follows, and memory with it. §16 designs it.
 
 ### 15.5 Scenario matrix (`scripts/run_matrix.py`, `scripts/analyze.py`)
 
@@ -1867,3 +1870,193 @@ colours fixed per variant.
 Not yet done: S6, and figures for the LaTeX report (`summary.csv` is the input
 for them).
 
+---
+
+## 16. Inbound backpressure (D14)
+
+### 16.1 Why
+
+In the scenario matrix every 1024-peer cell (about 102k msg/s offered) was
+overloaded: about 30k msg/s got through, the rest queued.
+
+| | 1024 peers, 20 s run |
+|---|---|
+| Node memory | 420–464 MB (4–7 MB below overload); about 1.4M queued messages at ~320 B each |
+| Round trip | about 16 s |
+| Shutdown | 16 of 24 cells forced (exit 3): the backlog could not drain within the grace |
+
+At that rate an 8 GB machine runs out of memory in about 6 minutes, and the
+out-of-memory killer then takes every peer down at once. Unbounded queues also:
+- keep control messages (link events, frontend commands, Balancer moves) behind
+  the whole backlog in each FIFO inbox;
+- spend the node's capacity on messages that are seconds old;
+- let one fast or hostile peer fill memory alone;
+- defeat TCP's own flow control, because the IO workers always read.
+
+**Where the backlog is** (the `queue_depth` Metric lines of step 1, one run each
+at 1024 peers on CPUs 0–3): all of it is in the Router's inbox. The Store's
+queue stays at a few hundred messages at most, while the Router's grows by
+60–75k messages per second:
+
+| | Store inbox | Router inbox (after ~20 s) | Throughput | Node memory |
+|---|---|---|---|---|
+| `fixed-1` | 2–127 | 1.5M | 39k msg/s | 732 MB |
+| `fixed-4` | 0–282 | 1.8M | 17k msg/s | 719 MB |
+
+The Router is the bottleneck in both, and with four IO workers it moves less
+than half as many messages: its `pool.send` competes with each worker's reads
+for that pool's mutex. That is the next thing to profile; backpressure bounds
+the backlog but does not raise the ceiling.
+
+What is bounded already: the pool's TX buffer per connection (1 MB, then
+`BufferFull`; write timeout), frame size (`kMaxChatBodySize`), and connections
+(`max_links`, `max_links_per_pt`). The gap is the inbound data path.
+
+### 16.2 What is watched
+
+```
+socket ─▶ Pt-i ─ChatIn─▶ Store inbox ─▶ Store ─RouteSend─▶ Router inbox ─▶ Router ─▶ pool.send
+                                              └─MsgAppended─▶ Frontend inbox ─▶ TUI / CLI
+```
+
+- **The Store's and the Router's inboxes.** Both stages must handle every
+  message, so when either falls behind the only safe answer is to read less from
+  the network. The Store's queue alone is not enough: the Router's inbox is
+  filled by the Store (one `RouteSend` per echoed or sent message), so when the
+  Router is the slowest stage the Store's queue stays short while the Router's
+  grows. In the 1024-peer runs the Router was the busier thread (about 60% of a
+  core against 33–50% for the Store).
+- **Not the Frontend's inbox.** The UI is a view of the Store's history; a slow
+  terminal or a slow agent must not slow the network down. It is handled between
+  the Store and the Frontend (§16.6).
+- **Not the Listener.** Connections are capped by `max_links` and arrive at a
+  low rate compared with messages.
+- **Not by chaining** (the Store stops taking from its inbox while the Router's
+  is full). The Store's inbox is one FIFO: a paused Store would also stop
+  commands, `PeerUp` / `PeerDown` and subscription changes, so the UI would
+  freeze during overload.
+
+**`FlowGate`** (`Common/`). `main` registers the queues to watch; the IO workers
+get a reference and do not know which queues are behind it.
+- `over_high()`: any watched queue at or above `high`;
+- `under_low()`: every watched queue at or below `low`.
+
+**`ThreadQueue::approx_size()`**: a relaxed atomic counter, updated under the
+queue's lock on every push, pop and `pop_all`, read without the lock, on its own
+cache line (every push and pop writes it). `size()` takes the mutex, which would
+add exactly the contention the inbox batches removed. The value is approximate;
+the gap between the watermarks absorbs that.
+
+### 16.3 Pausing reads in the pool
+
+The IO worker cannot simply stop calling `receive()`: the same loop flushes
+queued TX (the replies), runs timers, completes dials and drains commands. So
+reading is paused per connection, inside the pool:
+
+- **API.** `pause_reading(span<id>)` / `resume_reading(span<id>)`, one lock for
+  the whole set.
+- **Interest.** A `reading` flag per `Entry`; while it is false, EPOLLIN is not
+  in the connection's epoll interest. `set_interest_locked` is the one place
+  that computes interest, from the status, pending TX and `reading`. epoll is
+  level-triggered, so merely skipping reads would spin.
+- **`ready_` skips paused connections**: data already reported readable stays
+  in the kernel, so the overshoot is the read in progress.
+- **Writes go on.** EPOLLOUT stays armed while TX is pending.
+- **The read timeout is frozen.** A paused connection receives nothing, so
+  without this every paused peer would be dropped as `ReadTimedOut`. A read
+  timer that expires on a paused connection re-arms instead of failing; resume
+  sets `last_rx = now`.
+- **Hang-ups.** EPOLLERR and EPOLLHUP are always reported, so a reset is seen at
+  once; a plain FIN only shows as readable, so it is seen on resume.
+- **Cost.** One `epoll_ctl` per connection per pause and per resume. Under
+  sustained overload the queue swings between the watermarks about
+  `store_rate / (high − low)` times per second (50k / 8k ≈ 6): about 12k
+  `epoll_ctl` per second per worker with 1024 links, under 1% of a core. A
+  two-level epoll (one syscall per pause) would need a restructured pool.
+
+The backlog moves into the kernel's socket buffers, bounded by its TCP memory
+limits; `TcpConnection::Options::receive_buffer` can cap them per connection.
+
+### 16.4 IO worker
+
+- **Pause.** Once per receive round that produced `ChatIn`, check
+  `gate.over_high()` (a few atomic loads). If it is true, pause every
+  **established** link of this worker.
+- **Handshaking links keep reading.** Their frames go to the Router, are small,
+  and the handshake timeout bounds them, so peers can still connect.
+- **Resume.** While paused, `receive` runs with a deadline (`resume_poll`, 1 ms)
+  instead of blocking; on every return the worker checks `gate.under_low()` and
+  resumes its paused links. About 1000 wake-ups per second, only while paused.
+  A wake-up from the consumer instead would give `ThreadQueue` callbacks and the
+  Store knowledge of the IO workers.
+- **Each worker decides alone.** All read the same depths, so they pause and
+  resume within one round of each other.
+- **A link adopted while paused** is paused at once if it is established.
+- **Fairness.** A read budget per connection per receive round (bytes or
+  frames): a heavy peer cannot take a whole round, and nothing is added to or
+  removed from epoll for it. Rotating EPOLLIN across connections was rejected:
+  `epoll_ctl` churn for as long as the throttling lasts, a wait for every peer
+  including light ones, and turns that are not fair to traffic.
+- **Sizing `low`.** The Store must not run dry while a worker waits to resume:
+  `low` must exceed what the Store drains in one `resume_poll` (about 100
+  messages at 100k msg/s).
+
+### 16.5 The Balancer
+
+A paused worker reads less, so its links' rates fall. Taken at face value the
+Balancer would see quiet workers and could retire one or move links onto it,
+but while the gate is closed the bottleneck is downstream, and adding, removing
+or moving workers cannot help.
+
+- `PtReport` gets **`paused_ms`**, the time paused since the last report.
+  Paused workers still answer probes, so stall detection is unaffected.
+- While any worker reports `paused_ms > 0` the Balancer **holds**: no spawn, no
+  retire, no moves. It keeps updating its load estimates and logs
+  `decision=hold reason=backpressure`.
+- **The Balancer does not decide admission.** It acts on 500 ms ticks, while
+  the backlog grows by about 70k messages per second under overload; each
+  decision would also take a report, a command and a pool call. Admission is
+  local and fast (the IO workers); placement is global and slow (the Balancer).
+  The Balancer can later set policy for the fast loop: cap or evict a link that
+  takes far more than its share, or tune the watermarks and budgets.
+
+### 16.6 Store → Frontend (later)
+
+The Store pushes into the Frontend's inbox, so it can watch that queue and
+degrade by itself:
+- **Normal:** one `MsgAppended` per message.
+- **Over `high`:** no per-message events. Each affected conversation is marked
+  dirty with its newest message number, and a timer runs on the Store's own
+  inbox (`ThreadQueue::every`). The timer is needed: without it the summaries
+  would wait for the next message, and the last ones would never be announced
+  if traffic stopped.
+- **On a tick below `low`:** one "conversation X has messages up to N" per dirty
+  conversation, then back to normal and the timer is cancelled. The summaries go
+  out before any per-message event, so the Frontend never sees N+5 before
+  learning of N+1..N+4.
+- **Needs** a command to read a conversation's messages after a given number,
+  and a CLI event for the summary: a change to the CLI contract, documented in
+  the JSONL output. Agents that need every message read the history by cursor
+  and see larger batches, never gaps.
+
+The Frontend's queue is then bounded by the number of conversations. It only
+matters with heavy inbound traffic and a slow UI at once; in echo mode the
+Frontend receives nothing.
+
+### 16.7 Configuration
+
+- `--inbox-high N`, default 16384 messages: at the Store's 50–100k msg/s, at
+  most about 0.2–0.3 s of queueing, and about 5 MB per watched queue.
+- `--inbox-low N`, default `high / 2`.
+
+### 16.8 Steps
+
+| Step | Deliverable | Tests |
+|---|---|---|
+| 1 ✅ | `ThreadQueue::approx_size` (a `QueueDepth` base, own cache line), `FlowGate`, `QueueMonitor` (each inbox's depth and its maximum, a Metric line every 500 ms, on its own thread, not registered with the Supervisor) `test_flow` 24 checks: `approx_size` matches `size()` through `push`, `emplace`, `pop` (through a compaction), `pop_all` (partial and full), ticks and shutdown, and stays bounded with 4 producers; gate hysteresis over two queues; monitor lines and their maxima; `stop()`. Clean under TSan |
+| 2 | Pool read pausing | data stays in the kernel while paused and arrives in order on resume; writes flow while paused; no read timeout while paused and the timer restarts on resume; `ready_` skips paused; release of a paused connection |
+| 3 | IO worker gating and the read budget | a Store queue the test never drains stops the reads and the peer's writes block; a new link's handshake completes while paused; resume below `low` with every message in order; adopt while paused; `paused_ms` in reports; one heavy link cannot starve another |
+| 4 | Wiring: `main` registers the Store and Router queues; `--inbox-high`, `--inbox-low`; `NodeHarness` | e2e: a flooding peer with a node whose Store is slowed, memory stays bounded |
+| 5 | Balancer hold while workers are paused | policy tests |
+| 6 | Measurement and analysis | the 1024-peer cells, then S1 and S7: memory flat, p99 bounded by the queueing limit, clean shutdowns. loadgen's refused sends (`send_failed`) are the expected result, not a degraded cell: `analyze.py` reports them separately |
+| 7 | Store → Frontend coalescing (§16.6) | its own step |

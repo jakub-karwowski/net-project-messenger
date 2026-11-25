@@ -10,6 +10,10 @@ add_executable(test_queue test_queue.cpp)
 target_link_libraries(test_queue PRIVATE Common)
 add_test(NAME test_queue COMMAND test_queue)
 
+add_executable(test_flow test_flow.cpp)
+target_link_libraries(test_flow PRIVATE Common)
+add_test(NAME test_flow COMMAND test_flow)
+
 add_executable(test_terminal_ui test_terminal_ui.cpp)
 target_link_libraries(test_terminal_ui PRIVATE TerminalUI)
 add_test(NAME test_terminal_ui COMMAND test_terminal_ui)

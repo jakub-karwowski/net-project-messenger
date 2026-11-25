@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <concepts>
 #include <condition_variable>
@@ -32,8 +33,29 @@
 // Shutdown: after graceful_shutdown() pop() still returns what is queued, then
 // nullopt; after force_shutdown() it returns nullopt at once. No ticks are
 // produced once either has been called. pop_all() follows the same rules.
+// How many values a queue holds, readable from any thread without the queue's
+// lock: for producers that throttle on a consumer's backlog (FlowGate) and for
+// monitoring. The queue publishes the exact count after every change, under its
+// lock; a reader sees a recent value, which is all a watermark needs.
+class QueueDepth {
+    public:
+        [[nodiscard]] std::size_t approx_size() const noexcept { return depth_.load(std::memory_order_relaxed); }
+
+    protected:
+        QueueDepth() = default;
+        ~QueueDepth() = default;
+        QueueDepth(const QueueDepth&) = delete;
+        QueueDepth& operator=(const QueueDepth&) = delete;
+        void publish_depth(std::size_t n) noexcept { depth_.store(n, std::memory_order_relaxed); }
+
+    private:
+        // A cache line of its own: every push and pop writes it, and readers on
+        // other cores should not pull the queue's other members along with it.
+        alignas(64) std::atomic<std::size_t> depth_{0};
+};
+
 template <typename T>
-class ThreadQueue {
+class ThreadQueue : public QueueDepth {
     public:
         using Clock = std::chrono::steady_clock;
         using TimerId = std::uint64_t;
@@ -50,6 +72,7 @@ class ThreadQueue {
                 std::scoped_lock lock(mutex_);
                 if (state_ != QueueState::Open) { return false; }
                 queue_.push_back(std::move(value));
+                publish_depth_locked();
             }
             condition_.notify_one();
             return true;
@@ -60,6 +83,7 @@ class ThreadQueue {
                 std::scoped_lock lock(mutex_);
                 if (state_ != QueueState::Open) { return false; }
                 queue_.emplace_back(std::forward<Args>(args)...);
+                publish_depth_locked();
             }
             condition_.notify_one();
             return true;
@@ -112,6 +136,7 @@ class ThreadQueue {
                         head_ += static_cast<std::size_t>(count);
                         compact_locked();
                     }
+                    publish_depth_locked();
                 }
                 if (!out.empty()) { return true; }
                 if (state_ != QueueState::Open) { return false; }
@@ -163,8 +188,8 @@ class ThreadQueue {
             std::erase_if(timers_, [id](const Timer& timer) { return timer.id == id; });
         }
 
-        // Current number of queued values, not counting ticks (takes the lock; for
-        // metrics, not hot paths).
+        // Current number of queued values, not counting ticks. Takes the lock;
+        // approx_size() does not.
         [[nodiscard]] std::size_t size() const {
             std::scoped_lock lock(mutex_);
             return queue_.size() - head_;
@@ -204,8 +229,11 @@ class ThreadQueue {
             if (head_ == queue_.size()) { return std::nullopt; }
             T value = std::move(queue_[head_++]);
             compact_locked();
+            publish_depth_locked();
             return value;
         }
+
+        void publish_depth_locked() noexcept { publish_depth(queue_.size() - head_); }
 
         // Keeps the taken prefix from growing without bound: dropped at once when
         // nothing is left after it, and moved out once it is most of the vector

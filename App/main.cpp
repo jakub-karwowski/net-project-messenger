@@ -18,6 +18,7 @@
 #include "ListenerWorker.hpp"
 #include "Logger.hpp"
 #include "Messages.hpp"
+#include "QueueMonitor.hpp"
 #include "RouterWorker.hpp"
 #include "StoreWorker.hpp"
 #include "Supervisor.hpp"
@@ -165,6 +166,15 @@ int run_node(const AppConfig& cfg) {
         },
                                  [&] { balancer_q.graceful_shutdown(); }, &supervisor);
     WorkerThread listener_thread("listener", [&] { accept.run(); }, [&] { listener->stop(); }, &supervisor);
+    // Inbox depths as Metric lines, to see where a backlog builds up. Not
+    // registered with the Supervisor: it has nothing to finish, so it must
+    // never be what a shutdown waits for.
+    QueueMonitor monitor(Logger(core, "queues"));
+    monitor.watch("store", store_q);
+    monitor.watch("router", router_q);
+    monitor.watch("frontend", frontend_q);
+    monitor.watch("balancer", balancer_q);
+    WorkerThread monitor_thread("queues", [&] { monitor.run(); }, [&] { monitor.stop(); }, &supervisor);
     WorkerThread input_thread("input", [&] { if (tui) { keyboard->run(); } else { lines->run(); } },
                               [&] { if (tui) { keyboard->stop(); } else { lines->stop(); } }, &supervisor);
 
@@ -192,7 +202,8 @@ int run_node(const AppConfig& cfg) {
 
     // Reverse start order. The Store and Router have finished by now (their
     // loops end with the shutdown); the stops matter after an emergency.
-    for (WorkerThread* t : {&input_thread, &listener_thread, &balancer_thread, &router_thread, &store_thread}) {
+    for (WorkerThread* t : {&input_thread, &monitor_thread, &listener_thread, &balancer_thread, &router_thread,
+                            &store_thread}) {
         t->request_stop();
         t->join();
     }
