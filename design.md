@@ -2137,7 +2137,7 @@ same receive buffer). Medians:
   backlog's own cost.
 - **The remaining latency is the watermark.** The Router's inbox sits at its
   high mark: about 16k messages at 100k msg/s is about 160 ms of queueing, the
-  measured p50. A lower `--inbox-high` should lower it; not yet swept.
+  measured p50. See the sweep below.
 - **TCP absorbs the pauses.** About 10 pauses per second, no refused send and no
   lost message in any backpressure cell.
 - **The receive buffer cap changes nothing here**: the node keeps up, so nothing
@@ -2153,3 +2153,28 @@ same receive buffer). Medians:
   workers were paused for a real share of the tick) is the refinement if a
   helpful scale-out is ever blocked. In echo mode the Router saturates first; in
   normal use it receives no inbound traffic, so holds come only from the Store.
+
+**Watermark sweep** (`run_matrix.py --set watermark --scenarios S1 --values
+1024`: one IO worker, `--inbox-high` 256 to 16384, low at half; 3 repetitions,
+all valid). Before and after the least-recently-read resume order (§16.4,
+commit `914f918`):
+
+| `--inbox-high` | Before: echoed, lost | Before: p50 / p99 | After: echoed, lost | After: p50 / p99 | Pauses (after) |
+|---|---|---|---|---|---|
+| 256 | 81k msg/s, 421k | 20 ms / 20.4 s | 102.4k, 0 | 147 ms / 386 ms | 6704 |
+| 1024 | 101k msg/s, 24k | 34 ms / 20.4 s | 102.4k, 0 | 51 ms / 111 ms | 2176 |
+| 4096 | 102.4k, 0 | 62 ms / 18.8 s | 102.4k, 0 | 69 ms / 124 ms | 750 |
+| 16384 | 102.4k, 0 | 172 ms / 277 ms | 102.4k, 0 | 172 ms / 239 ms | 206 |
+
+- **Before the fix, low watermarks starved peers**: the p50 fell with the
+  watermark while a fixed resume order left the connections at the back unread
+  until the load stopped (p99 ≈ the length of the run; the "lost" messages and
+  the lower throughput at 256 were those peers' messages). After it, every
+  watermark carries the whole load and nothing is lost.
+- **The latency is not only the node's queue.** At 1024 the inbox holds about
+  10 ms of messages, yet the p50 is 51 ms: the rest waits in the kernel's socket
+  buffers while reads are paused. At 256 pauses come so often (about 250 per
+  second) that more of the backlog waits there (p50 147 ms). A capped
+  `--rcvbuf` may now matter at the low watermarks; not yet measured.
+- **1024–4096 is the sweet spot here**: about a third of the default's
+  latency, the same throughput, 10–13 MB.
