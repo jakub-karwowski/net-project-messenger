@@ -1071,7 +1071,7 @@ EpollConnectionPool::read_ready_locked(uint64_t id, std::span<std::byte> rx_buff
 
 uint32_t EpollConnectionPool::interest_of(const Entry& entry) noexcept {
     switch (entry.status) {
-        case Entry::Status::Connecting:
+        case Entry::Status::Connecting: return EPOLLOUT;
         case Entry::Status::Closing: return EPOLLOUT;
         case Entry::Status::Open: break;
     }
