@@ -1,5 +1,5 @@
 // test_terminal_ui.cpp - TerminalUI rendering, captured before the cell-based
-// rewrite (design.md §13).
+// rewrite.
 //
 // Two kinds of assertion:
 //   check(...)      current behaviour that the rewrite must keep;
@@ -423,7 +423,7 @@ void test_input_model_edits_respect_glyphs() {
     check(std::get<0>(model.get_content()) == "x", "removing all its bytes removes it");
 }
 
-// --- known bugs (design.md §13.1) --------------------------------------------------
+// --- known bugs -----------------------------------------------------------------------
 
 // 1. Wrapping counts colour escape bytes as visible columns.
 void bug_wrap_counts_escapes() {

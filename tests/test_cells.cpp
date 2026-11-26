@@ -1,4 +1,4 @@
-// test_cells.cpp - the building blocks of cell-based rendering (design.md §13):
+// test_cells.cpp - the building blocks of cell-based rendering:
 // UTF-8 decoding and glyphs (Unicode.hpp), styles and SGR (Style.hpp), and the
 // FrameBuffer cell operations (put, row_text).
 //

@@ -1,4 +1,4 @@
-// test_layout.cpp - StyledText and TextLayout (design.md §13.2, step 2):
+// test_layout.cpp - StyledText and TextLayout:
 // shaping text into glyphs once, wrapping it, and mapping source offsets to
 // (line, column).
 //
