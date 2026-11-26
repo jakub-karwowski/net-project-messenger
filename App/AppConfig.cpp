@@ -123,7 +123,7 @@ std::string_view usage() noexcept {
            "  --min-pts N / --max-pts N  IO worker threads (default 1 / 4)\n"
            "  --inbox-batch N          most messages a worker takes from its inbox at once (default 256)\n"
            "  --inbox-high N           stop reading from peers while the Store's or Router's inbox holds\n"
-           "                           N messages (default 16384; 0 = never)\n"
+           "                           N messages (default 4096; 0 = never)\n"
            "  --inbox-low N            ... until it is back at N (default: half of --inbox-high)\n"
            "  --rcvbuf BYTES           receive buffer of every peer connection (default: the kernel's)\n"
            "  --shutdown-grace MS      time to flush links on quit (default 1000)\n"

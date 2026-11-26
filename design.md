@@ -2098,8 +2098,10 @@ Frontend receives nothing.
 
 ### 16.7 Configuration
 
-- `--inbox-high N`, default 16384 messages: at the Store's 50–100k msg/s, at
-  most about 0.2–0.3 s of queueing, and about 5 MB per watched queue.
+- `--inbox-high N`, default 4096 messages (16384 until the watermark sweep in
+  16.9): at the Store's 50–100k msg/s, at most about 40–80 ms of queueing in
+  the node and a few MB per watched queue. Lower marks pause so often that the
+  backlog moves into the kernel's socket buffers instead (see 16.9).
 - `--inbox-low N`, default `high / 2`.
 
 ### 16.8 Steps
@@ -2118,7 +2120,7 @@ Frontend receives nothing.
 
 `run_matrix.py --set backpressure --scenarios S1,S7`: 108 cells, 3
 repetitions, all valid. Variants: `bp-off` (one IO worker, `--inbox-high 0`),
-`bp-on` (one IO worker, default 16384), `bp-rcvbuf` (as `bp-on` with
+`bp-on` (one IO worker, the default then, 16384), `bp-rcvbuf` (as `bp-on` with
 `--rcvbuf 65536`), `balancer-rcvbuf` (the Balancer, up to 4 workers, with the
 same receive buffer). Medians:
 
@@ -2176,5 +2178,6 @@ commit `914f918`):
   buffers while reads are paused. At 256 pauses come so often (about 250 per
   second) that more of the backlog waits there (p50 147 ms). A capped
   `--rcvbuf` may now matter at the low watermarks; not yet measured.
-- **1024–4096 is the sweet spot here**: about a third of the default's
-  latency, the same throughput, 10–13 MB.
+- **1024–4096 is the sweet spot here**: about a third of the latency at
+  16384, the same throughput, 10–13 MB. The default is now 4096: close to the
+  best latency, a third of the pauses at 1024, and more room for bursts.

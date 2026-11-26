@@ -37,7 +37,7 @@ struct AppConfig {
     // Backpressure: IO workers stop reading while the Store's or Router's inbox
     // holds inbox_high messages, until it is back at inbox_low (0: high / 2).
     // inbox_high 0 turns it off.
-    std::size_t inbox_high = 16384;
+    std::size_t inbox_high = 4096;
     std::size_t inbox_low = 0;
     // SO_RCVBUF of every peer connection in bytes (0: the kernel's default,
     // which autotunes to several MB). Smaller: under backpressure TCP slows
