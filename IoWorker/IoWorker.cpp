@@ -449,14 +449,20 @@ void IoWorker::resume_reads() {
     // reads only the first few before the queues fill again: in a fixed order
     // the ones at the back would never get a turn. Sorted by their last read,
     // whoever was cut off last time goes first now.
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> order;   // (last_read, pool id)
+    struct Paused {
+        std::uint64_t last_read;
+        std::uint64_t id;   // the connection's pool id
+    };
+    std::vector<Paused> order;
     order.reserve(paused_.size());
     for (const std::uint64_t id : paused_) {
-        if (const auto it = by_conn_.find(id); it != by_conn_.end()) { order.emplace_back(it->second.last_read, id); }
+        if (const auto it = by_conn_.find(id); it != by_conn_.end()) {
+            order.push_back({.last_read = it->second.last_read, .id = id});
+        }
     }
-    std::ranges::sort(order);
+    std::ranges::sort(order, {}, &Paused::last_read);
     paused_.clear();
-    std::ranges::transform(order, std::back_inserter(paused_), [](const auto& e) { return e.second; });
+    std::ranges::transform(order, std::back_inserter(paused_), &Paused::id);
     pool_.resume_reading(paused_);
     const auto now = Clock::now();
     const auto lasted = now - paused_since_;
