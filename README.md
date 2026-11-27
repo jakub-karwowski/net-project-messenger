@@ -7,5 +7,5 @@ Made with [Claude](https://claude.com/claude-code).
 ## Build
 
 ```sh
-./build.sh
+./build.sh node
 ```
